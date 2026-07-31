@@ -1,0 +1,1900 @@
+<!DOCTYPE html>
+<!--
+  119b generic kiosk renderer (ADR 0004). One data-driven screen painter that
+  can render EVERY screen from GET /catalog, keyed by the routed `screen` id in
+  GET /state. Replaces the 119a single hard-coded screen 06.
+
+  The look is ported verbatim from the DesignSync wireframe
+  (docs/kiosk/design_source/*.dc.html, distilled in docs/kiosk/design_spec.md):
+  a neutral MONOCHROME theme (near-black accent, light-gray buttons, white
+  surface), colour only for the PASS/REVIEW verdict full-screens. The wireframe
+  is authored on a fixed 1920x1080 canvas, so the panel below is a real
+  1920x1080 stage transform-scaled to fit the touchscreen -- every px is the
+  design's own value, so proportions match the mock exactly at any resolution.
+
+  Contract (frozen, issue 119):
+    * GET /catalog -> { "screens": { "<id>": {headline, sub, sub2?, variant, bg,
+      progress_bar, status_bar, buttons[], special} } }. Pure static data;
+      fetched once at boot and cached. A copy is embedded below as the offline
+      fallback so the renderer still works before the /catalog route is up.
+    * GET /state?engaged=..&finish_blocks_guard=..&finish_slides_guard=..
+      &view_results_guard=.. ->
+      the live snapshot incl. `screen` (= router select_screen output). The
+      four query flags are CLIENT-OWNED; the relay echoes them so the router
+      stays a pure function.
+    * POST /command {name, args[]} -> dispatch a verb.
+
+  The deck-slideshow runtime is gone: screen selection is event-driven, never
+  slide navigation. Layout is chosen by each entry's `variant`; the renderer
+  never hard-codes a page per screen.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LJI Block Check Kiosk</title>
+<style>
+  :root {
+    /* Wireframe theme defaults (monochrome direction). */
+    --font: 'Segoe UI', system-ui, sans-serif;   /* body / UI */
+    --lab-font: system-ui, 'Segoe UI', sans-serif; /* headlines */
+    /* buttonRadius enum default is 16 (NOT the mock's 999px pill). Buttons use
+       the 16px rounded corner. Progress bars use a distinctly smaller bevel so
+       they read as more rectangular than the buttons (Zeke override). */
+    --radius: 16px;      /* button corner radius */
+    --radius-bar: 4px;   /* progress-bar bevel (smaller than buttons) */
+    --fit: 1;                 /* 1920x1080 -> viewport scale (set in JS) */
+
+    /* surfaces */
+    --surface: #ffffff;
+    --bezel: #000000;
+
+    /* text */
+    --text: #111111;
+    --text-body: #222222;
+    --text-status: #333333;
+    --text-muted: #555555;
+    --text-faint: #666666;
+    --text-disabled: #999999;
+
+    /* accent + buttons */
+    --accent: #111111;
+    --btn-bg: #e8e8e8;
+    --btn-border: #bbbbbb;
+
+    /* verdict / status colours */
+    --pass: #20b15a;
+    --review: #c93535;
+    --warning: #f2c14e;   /* amber non-blocking banner (design_spec §22) */
+    --on-color: #ffffff;
+    --status-on-color: rgba(255, 255, 255, 0.82);
+
+    --bar-border: #222222;
+    --bar-fill: #111111;
+
+    /* Results screen (#232, ADR 0010 open-retrieval results). A small, screen-
+       local token set ported verbatim from the finished redesign mock so the
+       grouped results table matches it pixel-for-pixel on the 1920x1080 stage
+       WITHOUT re-tinting the shared verdict colours other screens use (the
+       full-screen PASS green is the brighter --pass; the results PASS capsule
+       is the mock's deeper --rt-pass). --rt-cols is the ONE shared column grid
+       the sticky header and every row grid line up against (fixed/fr, never
+       auto, so the two independent grids stay aligned). */
+    --rt-line: #ececec;
+    --rt-line-strong: #dcdcdc;
+    --rt-body: #2f2f2f;
+    --rt-muted: #6b6b6b;
+    --rt-faint: #9a9a9a;
+    --rt-pass: #16834a;
+    --rt-review: #c93535;
+    /* #248: ERROR (system/artifact failure, amber) and PENDING (still
+       scoring, gray) join PASS/REVIEW as the four operator-visible row
+       states (CONTEXT.md "Hybrid Result State"). --rt-unknown is not one of
+       the four -- it is the loud, distinct fallback for a state this table
+       does not recognize, replacing the old silent REVIEW/red default.
+       #248-fix: --rt-error was #a35b00, a dark bronze (hue ~34°) that reads
+       as brown rather than amber even though it clears 4.5:1 contrast
+       against white text. #9a6700 (hue ~40°, GitHub Primer's accessible
+       "attention" amber token -- the same white-on-solid-badge use case as
+       this table's loud states) reads as genuine amber and still clears
+       4.5:1 against white. */
+    --rt-error: #9a6700;
+    --rt-pending: #6b6b6b;
+    --rt-unknown: #7b2fb5;
+    --rt-seam: #f4f4f4;
+    --rt-seam-border: #e0e0e0;
+    --rt-cols: 56px 170px 260px 170px 1fr;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; }
+  body { font-family: var(--font); overflow: hidden; }
+
+  /* Letterbox: the black stage is centred; scaling fills the touchscreen. */
+  .viewport {
+    position: fixed; inset: 0; background: #000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .stage {
+    width: 1920px; height: 1080px; flex: none;
+    transform: scale(var(--fit)); transform-origin: center center;
+    border: 17px solid var(--bezel); background: #000; position: relative;
+  }
+  .panel {
+    position: absolute; inset: 0; border-radius: 20px; overflow: hidden;
+    background: var(--surface); font-family: var(--font);
+    transition: background 120ms linear;
+  }
+  /* Full-colour verdict backgrounds (catalog `bg`). */
+  .panel.bg-pass-full { background: var(--pass); }
+  .panel.bg-review-full { background: var(--review); }
+  .panel.bg-pass-full .headline, .panel.bg-review-full .headline,
+  .panel.bg-pass-full .sub, .panel.bg-review-full .sub,
+  .panel.bg-pass-full .sub2, .panel.bg-review-full .sub2 { color: var(--on-color); }
+  .panel.bg-pass-full .status-bar,
+  .panel.bg-review-full .status-bar { color: var(--status-on-color); }
+
+  /* status line (capture screens) */
+  .status-bar {
+    position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
+    white-space: nowrap; font-size: 32px; letter-spacing: 0.05em;
+    font-weight: 700; color: var(--text-status); text-transform: uppercase;
+    z-index: 5;
+  }
+
+  /* centred content zone shared by the headline-style screens */
+  .content {
+    position: absolute; left: 10%; right: 10%; top: 14%; bottom: 14%;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center;
+  }
+  .headline {
+    font-family: var(--lab-font); font-size: 120px; font-weight: 800;
+    line-height: 1.02; letter-spacing: 0.01em; text-transform: uppercase;
+    margin: 0; color: var(--text);
+  }
+  .panel.variant-chooser .headline { font-size: 92px; white-space: nowrap; }
+  /* Design 02 (dc.html §02): headline pinned at the top:18% inset, START NEW
+     SESSION in the bottom:60px footer. With the WO line dropped, float RESUME
+     to the true MIDPOINT between the headline and the footer button: headline
+     is flex-start (top), RESUME takes `margin:auto 0` so equal free space sits
+     above and below it. Content bottom is set to the footer button's top edge
+     (~144px = footer bottom:60px + btn-sm height) so the two gaps -- headline
+     ->RESUME and RESUME->START NEW -- are equal. */
+  .panel.variant-chooser .content {
+    top: 18%; bottom: 144px; justify-content: flex-start;
+  }
+  .panel.variant-chooser #chooser-primary { margin: auto 0; }
+  /* Screens 13/14: keep the base word ("Capturing"/"Verifying") optically
+     centred and let the trailing ellipsis overflow to the right without
+     shifting the centred baseline (design 13/14 use an absolute "…" span). 13
+     and 14 therefore share the exact same placement for a smooth 13->14. */
+  .headline.centered-base { display: inline-block; position: relative; }
+  .headline .ellipsis-tail { position: absolute; left: 100%; margin-left: 0.15em; }
+  .sub { margin-top: 44px; font-size: 58px; font-weight: 700; color: var(--text-body); }
+  .sub.sub-sm { font-size: 38px; letter-spacing: 0.02em; }
+  .sub2 { margin-top: 30px; font-size: 44px; font-weight: 600; color: var(--text-body); }
+
+  /* rectangular small-bevel progress bar (screens 05 + processing) */
+  .progress {
+    width: 42%; height: 38px; margin-top: 56px; position: relative;
+    border: 4px solid var(--bar-border); border-radius: var(--radius-bar);
+    background: transparent; overflow: hidden;
+  }
+  .progress .fill {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 42%;
+    background: var(--bar-fill); border-radius: calc(var(--radius-bar) - 2px);
+    animation: indet 1.5s ease-in-out infinite;
+  }
+  @keyframes indet {
+    0%   { transform: translateX(-120%); }
+    100% { transform: translateX(360%); }
+  }
+
+  /* session-complete counts grid (screen 21) */
+  .counts {
+    display: grid; grid-template-columns: auto auto; gap: 16px 48px;
+    font-size: 70px; font-weight: 800; margin-top: 56px; text-align: left;
+    color: var(--text);
+  }
+  .debug-box {
+    margin-top: 50px; font-size: 34px; color: var(--text-muted);
+    border: 1px dashed var(--text-disabled); padding: 18px 30px;
+    border-radius: 16px;
+  }
+  /* ---- results screen (#232) ------------------------------------------
+     Ported from the redesign mock. The table variant repurposes the shared
+     .content zone into a full-bleed, left-aligned scroll column: the "Results"
+     title + session line live INSIDE the scroll area (#results-table) so they
+     scroll away, the column header stays pinned, and GO BACK stays in the
+     footer. Rows group by work order; a chevron expands each row's evidence
+     dropdown (the reason + the reserved thumbnail/metadata seam). */
+  .panel.variant-table .content {
+    left: 0; right: 0; top: 0; bottom: 160px;
+    padding: 52px 72px 0;
+    align-items: stretch; justify-content: flex-start; text-align: left;
+  }
+  /* The in-scroll .rt-title supersedes the shared headline for this screen. */
+  .panel.variant-table .headline { display: none; }
+  .panel.variant-table .footer {
+    bottom: 40px; left: 72px; right: 72px;
+    justify-content: flex-end;
+    border-top: 2px solid var(--rt-line-strong);
+  }
+
+  /* #results-table is the mock's scroll list: title + session line + sticky
+     column header + per-work-order sections. */
+  .results-table {
+    display: none; flex: 1 1 auto; overflow-y: auto;
+    margin: 0 -12px; padding: 0 12px 40px;
+    text-align: left; color: var(--text);
+  }
+  .results-table::-webkit-scrollbar { width: 12px; }
+  .results-table::-webkit-scrollbar-thumb {
+    background: #cfcfcf; border-radius: 8px; border: 3px solid var(--surface);
+  }
+  .results-empty { font-size: 36px; color: var(--rt-muted); text-align: center; }
+
+  /* title + session line scroll away with the list */
+  .rt-head { padding: 0 4px 24px; }
+  .rt-title {
+    font-size: 66px; font-weight: 800; letter-spacing: .01em;
+    text-transform: uppercase; margin: 0; line-height: 1; color: var(--text);
+  }
+  .rt-sub {
+    margin: 16px 0 0; font-size: 26px; color: var(--rt-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .rt-sub b { color: var(--rt-body); font-weight: 600; }
+
+  /* column header, aligned to --rt-cols (not sticky) */
+  .rt-colhead {
+    background: var(--surface);
+    display: grid; grid-template-columns: var(--rt-cols); column-gap: 20px;
+    align-items: center; padding: 10px 0 13px;
+    border-top: 2px solid var(--rt-line-strong);
+    border-bottom: 2px solid var(--rt-line-strong);
+  }
+  .rt-lbl {
+    font-size: 22px; letter-spacing: .03em; text-transform: uppercase;
+    color: var(--rt-faint); text-align: center; font-weight: 500;
+  }
+  .rt-lbl.rt-lbl-left { text-align: left; }
+  .rt-lbl.rt-lbl-right { text-align: left; }
+
+  /* work-order band spans full width */
+  .rt-band { display: flex; align-items: baseline; gap: 22px; padding: 34px 4px 12px; }
+  .rt-wo {
+    font-size: 38px; font-weight: 700; letter-spacing: .01em;
+    font-variant-numeric: tabular-nums; color: var(--text);
+  }
+  .rt-counts {
+    font-size: 24px; color: var(--rt-muted); font-variant-numeric: tabular-nums;
+    display: flex; gap: 16px;
+  }
+  .rt-counts .rt-rev { color: var(--rt-review); font-weight: 600; }
+  .rt-counts .rt-pas { color: var(--rt-pass); font-weight: 600; }
+  .rt-counts .rt-err { color: var(--rt-error); font-weight: 600; }
+  .rt-counts .rt-pnd { color: var(--rt-pending); font-weight: 600; }
+
+  /* row */
+  .rt-row { border-bottom: 1px solid var(--rt-line); position: relative; }
+  .rt-row-main {
+    display: grid; grid-template-columns: var(--rt-cols); column-gap: 20px;
+    align-items: center; cursor: pointer; padding: 4px 0; min-height: 116px;
+  }
+  .rt-row:focus-visible { outline: 3px solid #6ea8ff; outline-offset: -3px; }
+  /* #248: four operator-visible row states (ERROR/REVIEW/PASS/PENDING) plus
+     rt-unknown, the loud fallback for a state this table does not
+     recognize -- see rtStateClass. Same accent-bar/tint pattern for all. */
+  .rt-row.rt-review::before, .rt-row.rt-pass::before,
+  .rt-row.rt-error::before, .rt-row.rt-pending::before,
+  .rt-row.rt-unknown::before {
+    content: ""; position: absolute; left: -12px; top: 0; bottom: 0;
+    width: 6px; border-radius: 0 4px 4px 0;
+  }
+  .rt-row.rt-review::before { background: var(--rt-review); }
+  .rt-row.rt-pass::before { background: var(--rt-pass); }
+  .rt-row.rt-error::before { background: var(--rt-error); }
+  .rt-row.rt-pending::before { background: var(--rt-pending); }
+  .rt-row.rt-unknown::before { background: var(--rt-unknown); }
+  .rt-row.rt-review, .rt-row.rt-pass, .rt-row.rt-error, .rt-row.rt-pending,
+  .rt-row.rt-unknown {
+    border-radius: 0 16px 16px 0; margin-right: -12px; padding-right: 12px;
+  }
+  .rt-row.rt-review {
+    background: color-mix(in srgb, var(--rt-review) 6%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--rt-review) 25%, transparent);
+  }
+  .rt-row.rt-pass {
+    background: color-mix(in srgb, var(--rt-pass) 6%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--rt-pass) 25%, transparent);
+  }
+  .rt-row.rt-error {
+    background: color-mix(in srgb, var(--rt-error) 6%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--rt-error) 25%, transparent);
+  }
+  .rt-row.rt-pending {
+    background: color-mix(in srgb, var(--rt-pending) 6%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--rt-pending) 25%, transparent);
+  }
+  .rt-row.rt-unknown {
+    background: color-mix(in srgb, var(--rt-unknown) 10%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--rt-unknown) 35%, transparent);
+  }
+  .rt-row.rt-review + .rt-row.rt-pass,
+  .rt-row.rt-error + .rt-row.rt-review,
+  .rt-row.rt-pass + .rt-row.rt-pending {
+    border-top: 2px solid color-mix(in srgb, var(--rt-line-strong) 50%, #000);
+  }
+
+  .rt-chev {
+    justify-self: center; width: 46px; height: 46px; border: none;
+    background: none; cursor: pointer; color: var(--rt-muted); display: flex;
+    align-items: center; justify-content: center; border-radius: 8px;
+  }
+  .rt-chev svg { width: 30px; height: 30px; transition: transform .16s ease; }
+  .rt-chev:hover { background: #f2f2f2; }
+  .rt-row.rt-open .rt-chev svg { transform: rotate(90deg); }
+
+  .rt-seam {
+    display: flex; justify-content: center; gap: 6px; align-self: stretch;
+  }
+  .rt-thumb {
+    width: auto; aspect-ratio: 1 / 1; align-self: stretch; border-radius: 8px;
+    background: var(--rt-seam); border: 1px solid var(--rt-seam-border);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--rt-faint); font-size: 17px; font-weight: 700;
+  }
+
+  .rt-block {
+    justify-self: start; font-size: 34px; font-weight: 600;
+    font-variant-numeric: tabular-nums; color: var(--text);
+  }
+
+  .rt-cap {
+    justify-self: start; display: inline-flex; align-items: center; gap: 10px;
+    padding: 7px 12px; border-radius: 8px; border: 1px solid transparent;
+    font-size: 28px; font-weight: 600; letter-spacing: .02em; line-height: 1;
+    white-space: nowrap;
+  }
+  .rt-cap svg { width: 26px; height: 26px; }
+  .rt-cap.rt-pass {
+    color: color-mix(in srgb, var(--rt-pass) 75%, black 25%);
+    background: color-mix(in srgb, var(--rt-pass) 12%, transparent);
+    border-color: color-mix(in srgb, var(--rt-pass) 20%, transparent);
+  }
+  .rt-cap.rt-review {
+    color: color-mix(in srgb, var(--rt-review) 75%, black 25%);
+    background: color-mix(in srgb, var(--rt-review) 12%, transparent);
+    border-color: color-mix(in srgb, var(--rt-review) 20%, transparent);
+  }
+  .rt-cap.rt-error {
+    color: color-mix(in srgb, var(--rt-error) 75%, black 25%);
+    background: color-mix(in srgb, var(--rt-error) 12%, transparent);
+    border-color: color-mix(in srgb, var(--rt-error) 20%, transparent);
+  }
+  .rt-cap.rt-pending {
+    color: color-mix(in srgb, var(--rt-pending) 75%, black 25%);
+    background: color-mix(in srgb, var(--rt-pending) 12%, transparent);
+    border-color: color-mix(in srgb, var(--rt-pending) 20%, transparent);
+  }
+  /* Loud, not disguised as REVIEW/red: a distinct color for any verdict
+     outside the four known states (should never happen -- #248). */
+  .rt-cap.rt-unknown {
+    color: #ffffff;
+    background: var(--rt-unknown);
+    border-color: var(--rt-unknown);
+  }
+
+  /* expanded dropdown: reason + reserved evidence seam */
+  .rt-evi { display: none; padding: 4px 8px 34px 84px; }
+  .rt-row.rt-open .rt-evi { display: block; }
+  .rt-evi-reason-lbl {
+    font-size: 19px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--rt-faint);
+  }
+  .rt-evi-reason {
+    font-size: 32px; font-weight: 600; color: var(--rt-body);
+    margin: 8px 0 26px; max-width: 30ch;
+  }
+  .rt-evi-body { display: flex; gap: 38px; align-items: flex-start; }
+  .rt-evi-imgs { display: flex; gap: 14px; }
+  .rt-evi-img {
+    width: 240px; height: 240px; border-radius: 8px; background: var(--rt-seam);
+    border: 1px solid var(--rt-seam-border); display: flex; align-items: center;
+    justify-content: center; color: var(--rt-faint); overflow: hidden;
+  }
+  .rt-evi-img small { font-size: 15px; }
+  .rt-evi-meta {
+    flex: 1 1 auto; display: grid; grid-template-columns: auto 1fr;
+    gap: 10px 24px; align-content: start; font-size: 23px; max-width: 520px;
+  }
+  .rt-evi-meta dt { color: var(--rt-muted); }
+  .rt-evi-meta dd { margin: 0; color: var(--rt-faint); font-variant-numeric: tabular-nums; }
+  .rt-evi-note {
+    margin-top: 16px; font-size: 18px; color: var(--rt-faint);
+    font-style: italic; max-width: 44ch;
+  }
+  .rt-evi-img.rt-evi-img-clickable { cursor: zoom-in; }
+
+  /* fullscreen lightbox for a clicked evidence tile (#click-to-expand) */
+  .rt-lightbox {
+    display: none; position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,.86); align-items: center; justify-content: center;
+    cursor: zoom-out;
+  }
+  .rt-lightbox.rt-lightbox-open { display: flex; }
+  .rt-lightbox-img {
+    max-width: 92vw; max-height: 92vh; object-fit: contain;
+    border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,.5);
+  }
+
+  /* buttons */
+  .footer {
+    position: absolute; bottom: 60px; left: 60px; right: 60px;
+    display: flex; align-items: center; justify-content: center; gap: 28px;
+  }
+  .btn {
+    border: 1px solid var(--btn-border); background: var(--btn-bg);
+    color: var(--text); font-weight: 800; letter-spacing: .02em; cursor: pointer;
+    font-family: var(--font); font-size: 40px; padding: 30px 56px;
+    border-radius: var(--radius); white-space: nowrap;
+  }
+  .btn-xl { font-size: 62px; padding: 40px 70px; }  /* screen 01 START SESSION */
+  .btn-lg { font-size: 48px; padding: 30px 56px; }  /* screen 02 primary */
+  .btn-sm { font-size: 32px; padding: 22px 42px; }  /* screen 02 secondary */
+  /* Disabled = a briefly-debounced command button (WS-D) OR the no-op START
+     NEW SESSION affordance (no in-process new-session path). */
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  /* Screen 02 START NEW SESSION (btn-sm) keeps its no-op guard (still disabled,
+     no new verb wired) but renders at FULL opacity like RESUME -- Zeke: it must
+     not be faint. Only the visual dimming is removed, not the behaviour. */
+  .btn.btn-sm:disabled { opacity: 1; }
+
+  /* startup preview (screen 01)
+     Slot = free space between button and caption.
+     Frame = 4:3 bordered box (pixel size set by layoutIdlePreviewFrame JS).
+     Image = explicitly shrunk by JS to the full frame (not CSS crop). */
+  .idle-top {
+    position: absolute; top: 0; left: 60px; right: 60px; height: 22%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .idle-preview {
+    position: absolute; left: 3%; right: 3%; top: 22%; bottom: 2%;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center;
+    gap: 24px;
+    min-height: 0;
+  }
+  .idle-preview-slot {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .idle-preview .kiosk-image-frame {
+    position: relative;
+    flex: 0 0 auto;
+    /* width/height assigned in JS to the largest 4:3 that fits the slot */
+    width: 320px;
+    height: 240px;
+    margin: 0;
+    border: 4px solid var(--bar-border);
+    background: #efefef;
+    overflow: hidden;
+    box-sizing: border-box;
+  }
+  .idle-preview .kiosk-image {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: block;
+    /* width/height assigned in JS = natural size * scale (full frame, shrunk) */
+    width: auto;
+    height: auto;
+    max-width: none;
+    max-height: none;
+    object-fit: fill;
+    border: none;
+    background: transparent;
+  }
+  .preview-cap {
+    font-size: 32px; font-weight: 700; line-height: 1.2; margin: 0;
+    color: var(--text-faint);
+    flex: 0 0 auto;
+  }
+
+  /* Between work orders: use the same preview component and nearly the same
+     available area as startup, with a compact two-button action row below. */
+  .panel.variant-preview_actions .idle-preview {
+    top: 7%;
+    bottom: 18%;
+  }
+
+  /* Shared camera <img> slot — capture_review (#137). Same JS shrink path. */
+  .kiosk-image-frame {
+    position: relative;
+    flex: 0 1 auto;
+    width: 640px;
+    height: 480px;
+    max-width: 100%;
+    min-height: 0;
+    margin-top: 24px;
+    overflow: hidden;
+    background: #efefef;
+    border: 4px solid var(--bar-border);
+    box-sizing: border-box;
+  }
+  .kiosk-image {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: block;
+    width: auto;
+    height: auto;
+    object-fit: fill;
+    border: none;
+    background: transparent;
+    box-sizing: border-box;
+  }
+  .panel.variant-still .content {
+    top: 6%; bottom: 14%;
+    left: 3%; right: 3%;
+    min-height: 0;
+  }
+  .panel.variant-still .kiosk-image-frame {
+    flex: 0 0 auto;
+    margin-top: 12px;
+  }
+  .panel.variant-still .headline { font-size: 72px; }
+  .panel.variant-still .sub.sub-sm { margin-top: 20px; }
+
+  /* screen 18 duplicate flash: a ~2s alert overlaid ON TOP OF screen 06.
+     Design 18 is a WHITE screen with dark text + a dimmed status bar. */
+  .overlay {
+    position: absolute; inset: 0; z-index: 20; border-radius: 20px;
+    display: none; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; background: var(--surface);
+  }
+  .overlay.show { display: flex; }
+  .overlay .status-bar { color: var(--text-disabled); }
+  .overlay .headline { color: var(--text); }
+  .overlay .sub { color: var(--text-body); }
+
+  /* WS-A offline banner (design_spec §22): amber non-blocking banner layered
+     OVER the frozen last screen when state.online === false. Static copy; it
+     does NOT tear down the underlying screen (render returns early, leaving the
+     last painted screen intact beneath). */
+  .offline-banner {
+    display: none; position: absolute; top: 112px; left: 60px; right: 60px;
+    padding: 22px 30px; border-radius: 16px; background: var(--warning);
+    color: #111111; font-size: 32px; font-weight: 700; text-align: center;
+    z-index: 15;
+  }
+  .offline-banner.show { display: block; }
+
+  /* #256: THIRD layer -- a non-interrupting Hybrid attention banner, same
+     shape as .offline-banner immediately above (layered OVER whatever
+     screen is active; does NOT tear it down). Explicitly NOT the
+     screen-18 duplicate-scan overlay (a full-screen takeover). Tapping it
+     navigates to the hybrid_attention correction-flow screen. */
+  .attention-banner {
+    display: none; position: absolute; top: 190px; left: 60px; right: 60px;
+    padding: 22px 30px; border-radius: 16px; background: var(--warning);
+    color: #111111; font-size: 28px; font-weight: 700; text-align: center;
+    z-index: 14; cursor: pointer;
+  }
+  .attention-banner.show { display: block; }
+
+  /* #258: --profile-only Hybrid queue/timing panel. Same layered-overlay
+     shape as .attention-banner above (never torn down by whatever screen is
+     active beneath it) but bottom-anchored so it never collides with the
+     attention banner or status bar. Only ever added to the DOM's content
+     when the /state payload itself carries a "profile" key -- see render()
+     below -- so with no --profile launch flag this element stays empty and
+     hidden, never merely visually suppressed. */
+  .profile-panel {
+    display: none; position: absolute; left: 24px; right: 24px; bottom: 24px;
+    max-height: 40%; overflow-y: auto; padding: 14px 18px; border-radius: 12px;
+    background: rgba(0, 0, 0, .82); color: #eee; font: 20px/1.4 monospace;
+    z-index: 13;
+  }
+  .profile-panel.show { display: block; }
+  .profile-panel .profile-row { margin: 6px 0; }
+  .profile-panel .profile-shadow-tag {
+    color: #111; background: var(--warning); border-radius: 4px;
+    padding: 0 6px; margin-left: 6px; font-weight: 700;
+  }
+  .profile-panel summary { cursor: pointer; }
+
+  /* Dev-only scan affordance: lets QA prove the write path without a hardware
+     scanner. Kept OUTSIDE the scaled stage so it stays legible at any --fit.
+     The real scanner-keydown path is wired below. */
+  .dev-bar {
+    position: fixed; bottom: 6px; left: 6px; right: 6px; z-index: 30;
+    display: flex; gap: 8px; align-items: center; justify-content: center;
+    font: 12px/1.4 monospace; color: #888; opacity: .8;
+  }
+  .dev-bar input { font: 12px monospace; padding: 2px 6px; }
+</style>
+</head>
+<body>
+  <div class="viewport">
+    <div class="stage">
+      <div class="panel" id="panel">
+        <div class="offline-banner" id="offline-banner">Processing computer offline</div>
+        <div class="attention-banner" id="attention-banner"></div>
+        <div class="profile-panel" id="profile-panel"></div>
+        <div class="status-bar" id="status-bar"></div>
+
+        <div class="content" id="content">
+          <p class="headline" id="headline"></p>
+          <div class="sub" id="sub"></div>
+          <button class="btn btn-lg" id="chooser-primary"></button>
+          <div class="sub sub-sm" id="wo-line"></div>
+          <div class="sub2" id="sub2"></div>
+          <div class="kiosk-image-frame" id="kiosk-image-frame" style="display:none">
+            <img class="kiosk-image" id="kiosk-image" alt="">
+          </div>
+          <div class="progress" id="progress"><div class="fill"></div></div>
+          <div class="counts" id="counts"></div>
+          <div class="debug-box" id="debug-box">Debug details collapsed</div>
+          <div class="results-table" id="results-table"></div>
+        </div>
+
+        <div class="rt-lightbox" id="rt-lightbox">
+          <img class="rt-lightbox-img" id="rt-lightbox-img" alt="">
+        </div>
+
+        <div class="idle-top" id="idle-top"></div>
+        <div class="idle-preview" id="idle-preview">
+          <div class="idle-preview-slot">
+            <div class="kiosk-image-frame" id="idle-image-frame" style="display:none">
+              <img class="kiosk-image" id="idle-image" alt="">
+            </div>
+          </div>
+          <div class="preview-cap" id="preview-cap">Preview</div>
+        </div>
+        <div class="footer" id="footer"></div>
+
+        <div class="overlay" id="overlay">
+          <div class="status-bar" id="overlay-status"></div>
+          <p class="headline" id="overlay-headline"></p>
+          <div class="sub sub-sm" id="overlay-sub"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="dev-bar">
+    <span>dev only:</span>
+    <input id="dev-block-id" value="51151378" size="10" inputmode="numeric">
+    <button id="dev-scan">simulate scan</button>
+    <span id="conn"></span>
+    <span id="screen-id"></span>
+  </div>
+
+<script>
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  // ---- embedded catalog (offline fallback) -----------------------------
+  // Verbatim copy of the frozen 119 contract, keyed by screen id. GET /catalog
+  // (kiosk.screens.CATALOG) supersedes this once fetched; the copy keeps the
+  // renderer working before that route exists. "Scan Block" (screen 06) is the
+  // string the 119a E2E server test asserts is served.
+  const FALLBACK_CATALOG = { screens: {
+    "01": { headline: "LJI Block Check", sub: "Preview", variant: "idle",
+            bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "START SESSION", action: "engage" }] },
+    "first_work_order": { headline: "LJI Block Check", sub: "Preview", variant: "idle",
+            bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "START SESSION", action: "dispatch", verb: "start_work_order" }] },
+    "02": { headline: "Unfinished Session Found", sub: "",
+            variant: "chooser", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "RESUME SESSION {session_number}", action: "engage" },
+                      { label: "START NEW SESSION", action: "engage" }] },
+    "04": { headline: "Clear Backlight for Calibration", sub: "",
+            variant: "error", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "RETRY", action: "dispatch",
+                        verb: "confirm_empty", size: "lg" }] },  /* CALIBRATION_FAILED */
+    "05": { headline: "Calibrating…", sub: "", variant: "processing",
+            bg: "default", progress_bar: true, status_bar: false, buttons: [] },
+    "06": { headline: "Scan Block", sub: "{hybrid_pool_bounce_message}", variant: "capture",
+            bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "FINISH BLOCKS", action: "guard",
+                        target: "finish_blocks_guard" }] },
+    "07": { headline: "Place Block", sub: "BLOCK ID: {latest_block_id}",
+            variant: "place", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [] },
+    "hold_still": { headline: "Hold Still", sub: "BLOCK ID: {latest_block_id}",
+            variant: "place", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [] },
+    "capture_review": { headline: "Review Capture", sub: "BLOCK ID: {latest_block_id}",
+            variant: "still", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "RETAKE", action: "dispatch", verb: "retry_capture" },
+                      { label: "ACCEPT", action: "dispatch", verb: "accept_capture" }] },
+    "08": { headline: "Capturing…", sub: "BLOCK ID: {latest_block_id}",
+            variant: "capture", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [] },
+    "09": { headline: "Remove Block", sub: "BLOCK ID: {latest_block_id}",
+            variant: "reposition", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [] },
+    "10": { headline: "Finish Block Capture?", sub: "",
+            variant: "confirm", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "GO BACK", action: "back", target: "finish_blocks_guard" },
+                      { label: "FINISH BLOCKS", action: "dispatch", verb: "finish_blocks" }] },
+    "12": { headline: "Place Slide", sub: "{pending_slide_label}", variant: "place",
+            bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "FINISH SLIDES", action: "guard", target: "finish_slides_guard" }] },
+    "13": { headline: "Capturing…", sub: "", variant: "capture",
+            bg: "default", progress_bar: false, status_bar: true, buttons: [] },
+    "14": { headline: "Verifying…", sub: "Remove Slide", variant: "verify",
+            bg: "default", progress_bar: false, status_bar: true, buttons: [] },
+    "15": { headline: "PASS", sub: "Remove Slide", variant: "pass",
+            bg: "pass-full", progress_bar: false, status_bar: true, buttons: [] },
+    "16": { headline: "REVIEW", sub: "{latest_verdict.reason}", sub2: "Remove Slide",
+            variant: "review", bg: "review-full", progress_bar: false,
+            status_bar: true, buttons: [] },
+    "17": { headline: "Reposition Slide", sub: "Code could not be read",
+            variant: "reposition", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "RETAKE SLIDE", action: "dispatch", verb: "retry_capture" },
+                      { label: "SKIP SLIDE", action: "dispatch", verb: "skip_slide" }] },
+    "18": { headline: "Block Already Scanned", sub: "BLOCK ID: {latest_block_id}",
+            variant: "duplicate-flash", bg: "default", progress_bar: false,
+            status_bar: true, buttons: [] },
+    "19": { headline: "Capture Failed", sub: "", variant: "error",
+            bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "RETRY", action: "dispatch",
+                        verb: "retry_capture" }] },
+    "20": { headline: "Finish Slide Capture?", sub: "",
+            variant: "confirm", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "GO BACK", action: "back", target: "finish_slides_guard" },
+                      { label: "FINISH SLIDES", action: "dispatch", verb: "end_session" }] },
+    "21": { headline: "Session Complete", sub: "", variant: "counts",
+            bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "END SESSION", action: "disengage" }] },
+    "results_table": { headline: "Results", sub: "", variant: "table",
+            bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "GO BACK", action: "back", target: "view_results_guard" }] },
+    "between_orders": { headline: "Between Work Orders", sub: "Preview",
+            variant: "preview_actions", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "START NEW WORK ORDER", action: "dispatch", verb: "start_work_order" },
+                      { label: "VIEW RESULTS", action: "guard", target: "view_results_guard" },
+                      { label: "END SESSION", action: "dispatch", verb: "end_session" }] },
+    "block_scan_work_order": { headline: "Scan Block", sub: "", variant: "capture",
+            bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "FINISH BLOCKS", action: "guard", target: "finish_blocks_guard" }] },
+    "slide_capture_work_order": { headline: "Place Slide", sub: "{pending_slide_label}",
+            variant: "place", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "FINISH WORK ORDER", action: "dispatch", verb: "finish_work_order" },
+                      { label: "VIEW RESULTS", action: "dispatch", verb: "pause_capture" }] },
+    "hybrid_attention": { headline: "Slide Needs Attention", sub: "{attention.message}",
+            variant: "confirm", bg: "default", progress_bar: false, status_bar: false,
+            buttons: [{ label: "GO BACK", action: "back", target: "recapture_guard" },
+                      { label: "RETRY", action: "dispatch", verb: "retry_hybrid_slide" },
+                      { label: "RECAPTURE", action: "dispatch", verb: "arm_hybrid_recapture" }] },
+    "processing": { headline: "Processing…", sub: "", variant: "processing",
+            bg: "default", progress_bar: true, status_bar: false, buttons: [] }
+  }};
+
+  let catalog = FALLBACK_CATALOG;
+
+  // Client-owned routing flags -- the source of truth for these four lives
+  // here, not on the backend. They ride each /state poll as query params; the
+  // relay echoes them back so select_screen() stays a pure function.
+  const ui = {
+    engaged: false,
+    finish_blocks_guard: false,
+    finish_slides_guard: false,
+    view_results_guard: false,
+    recapture_guard: false,
+  };
+
+  let lastScreenId = null;
+
+  // ---- 1920x1080 -> viewport fit ----------------------------------------
+  function fit() {
+    const s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    document.documentElement.style.setProperty("--fit", s);
+    layoutIdlePreviewFrame();
+    layoutStillPreviewFrame();
+  }
+  window.addEventListener("resize", fit);
+
+  // ---- catalog lookup (tolerate object- or array-shaped screens) --------
+  function getScreen(id) {
+    const screens = catalog && catalog.screens;
+    if (!screens) return undefined;
+    if (Array.isArray(screens)) return screens.find((s) => s.id === id);
+    return screens[id];
+  }
+
+  async function loadCatalog() {
+    try {
+      const resp = await fetch("/catalog", { cache: "no-store" });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.screens) catalog = data;
+      }
+    } catch (err) {
+      /* keep the embedded fallback */
+    }
+  }
+
+  // ---- template substitution: "{path}" / "{path|default}" ---------------
+  function resolvePath(expr, state) {
+    let fallback = "";
+    const bar = expr.indexOf("|");
+    if (bar >= 0) { fallback = expr.slice(bar + 1); expr = expr.slice(0, bar); }
+    let cur = state;
+    for (const part of expr.trim().split(".")) {
+      if (cur == null) { cur = null; break; }
+      cur = cur[part];
+    }
+    return (cur === null || cur === undefined || cur === "") ? fallback : cur;
+  }
+  function fillTemplate(tpl, state) {
+    return (tpl || "").replace(/\{([^}]+)\}/g, (_, expr) => resolvePath(expr, state));
+  }
+
+  // #258: the five Hybrid worker stages, in pipeline order -- mirrors
+  // `session.profile_report.PROFILE_STAGE_ORDER` (the Python name authority
+  // this client cannot import directly). Display-label-only; not a second
+  // source of the underlying numbers, which all come from
+  // `profile_screen_fields`'s `stage_breakdown` dict verbatim.
+  const PROFILE_STAGE_ORDER = [
+    "queue_wait", "preparation", "heuristic_selection", "accurate_scoring",
+    "artifact_write",
+  ];
+
+  function profileEsc(text) {
+    const div = document.createElement("div");
+    div.textContent = String(text);
+    return div.innerHTML;
+  }
+
+  // Renders `state.profile` (KioskRelay._profile_fields ->
+  // session.profile_report.profile_screen_fields) into the --profile-only
+  // queue panel: a pending row shows its current stage + elapsed time; a
+  // finished row shows its total time behind a native <details> expander
+  // covering all five stages (no extra JS needed for the toggle). A shadow
+  // row is tagged so its complete-pool cost is never mistaken for pruned
+  // Hybrid timing.
+  function renderProfilePanel(profile) {
+    const rows = profile.rows || [];
+    const lines = [`<div class="profile-row"><b>Hybrid profile queue: ${profile.queue_count}</b></div>`];
+    for (const row of rows) {
+      const shadowTag = row.shadow ? '<span class="profile-shadow-tag">SHADOW</span>' : "";
+      if (row.state === "PENDING") {
+        const elapsed = row.elapsed_ms === undefined ? "?" : `${row.elapsed_ms}ms`;
+        lines.push(
+          `<div class="profile-row">${profileEsc(row.block_id)} ${row.state}${shadowTag} ` +
+          `stage=${profileEsc(row.stage || "?")} elapsed=${elapsed}</div>`
+        );
+      } else {
+        const total = row.total_ms === undefined ? "?" : `${row.total_ms}ms`;
+        const breakdown = row.stage_breakdown || {};
+        const details = PROFILE_STAGE_ORDER
+          .filter((name) => name in breakdown)
+          .map((name) => `<div>${name}: ${breakdown[name]}ms</div>`)
+          .join("");
+        lines.push(
+          `<details class="profile-row"><summary>${profileEsc(row.block_id)} ` +
+          `${row.state}${shadowTag} total=${total}</summary>${details}</details>`
+        );
+      }
+    }
+    return lines.join("");
+  }
+
+  function isSlideIdleScreen(id) {
+    return id === "12" || id === "slide_capture_work_order";
+  }
+
+  // Screen 07 / hold_still / 08 / 09 / capture_review (ADR 0005/0006): keep
+  // BLOCK ID visible from scan accept through remove/review. Prefer scanned id
+  // pre-capture; snapshot latest_block_id fills at capture time. Slide modes
+  // clear the sub on hold_still and capture_review.
+  function viewFor(id, state) {
+    const blockIdScreens = {
+      "07": true, "hold_still": true, "08": true, "09": true, "capture_review": true,
+    };
+    if (blockIdScreens[id]) {
+      if (
+        (id === "hold_still" || id === "capture_review") &&
+        state.capture_mode === "slide"
+      ) {
+        return Object.assign({}, state, { latest_block_id: "" });
+      }
+      const blockId = (state.last_event && state.last_event.block_id) ||
+                      state.pending_block_id || state.latest_block_id || "";
+      if (blockId) {
+        return Object.assign({}, state, { latest_block_id: blockId });
+      }
+    }
+    // Screen 12 positive scan indicator: once a slide is scanned, show the
+    // resolved id so the operator confirms the scan before placing the slide.
+    if (isSlideIdleScreen(id) && state.pending_slide_id) {
+      return Object.assign({}, state, {
+        pending_slide_label: "SCANNED: " + state.pending_slide_id + " · place slide",
+      });
+    }
+    return state;
+  }
+
+  // ---- status-bar text: mode picks BLOCK/SLIDE wording ------------------
+  // Built from live state, so one catalog `status_bar` flag drives both phases.
+  // work_order is deliberately deferred (119c WS-F) so it stays an em-dash; the
+  // WO slot is kept as the future seam. `remaining` is projected by the relay
+  // (WS-C) but still falls back to an em-dash when absent (bare workflow).
+  function statusText(state) {
+    const wo = state.work_order || "—";
+    const mode = state.capture_mode || (state.phase === "slides" ? "slide" : "block");
+    if (mode === "slide") {
+      const rem = (state.remaining !== undefined && state.remaining !== null)
+        ? state.remaining : "—";
+      return `SLIDE CAPTURE · WO: ${wo} · ${rem} REMAINING`;
+    }
+    const cap = (state.captured !== undefined && state.captured !== null)
+      ? state.captured : 0;
+    return `BLOCK CAPTURE · WO: ${wo} · ${cap} CAPTURED`;
+  }
+
+  // ---- duplicate flash (screen 18 overlay on top of 06 / 12) ------------
+  // Keyed on event_count so a re-delivered/out-of-order duplicate event can
+  // neither re-trigger a finished flash nor latch it open. A brand-new
+  // duplicate scan advances event_count, which re-arms the flash.
+  // Fires for both a duplicate block scan (screen 06) and a duplicate slide
+  // scan (screen 12, "Place Slide") — the scan-time mirror of the workflow's
+  // post-capture "already processed" guard — so an operator re-scanning an
+  // already-verdicted slide is warned before a capture cycle is spent.
+  let flashedKey = null;
+  let flashTimer = null;
+  function handleDuplicate(id, state) {
+    const kind = state.last_event && state.last_event.kind;
+    const isDup = (id === "06" && kind === "duplicate_block_scan") ||
+                  (isSlideIdleScreen(id) && kind === "duplicate_slide_scan");
+    if (!isDup) return;
+    const key = (state.event_count !== undefined && state.event_count !== null)
+      ? state.event_count : state.last_event.message;
+    if (key === flashedKey) return;  // already flashed for this event
+    flashedKey = key;
+    showOverlay(state);
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { hideOverlay(); flashTimer = null; }, 2000);
+  }
+  function showOverlay(state) {
+    const entry = getScreen("18") || {};
+    // The duplicate event carries the offending block id; prefer it over the
+    // snapshot's latest_block_id (which lags until capture time).
+    const dupView = Object.assign({}, state, {
+      latest_block_id: (state.last_event && state.last_event.block_id) ||
+                       state.pending_block_id || state.latest_block_id || "",
+    });
+    // Same overlay serves both duplicate kinds; a slide is identified by its
+    // block id (the sub stays accurate), so only the headline noun changes.
+    const isSlideDup = state.last_event &&
+                       state.last_event.kind === "duplicate_slide_scan";
+    const headline = isSlideDup ? "Slide Already Scanned" : entry.headline;
+    $("overlay-headline").textContent = fillTemplate(headline, dupView);
+    $("overlay-sub").textContent = fillTemplate(entry.sub, dupView);
+    $("overlay-status").textContent = statusText(state);
+    $("overlay").classList.add("show");
+  }
+  function hideOverlay() { $("overlay").classList.remove("show"); }
+
+  // ---- shared <img> render path (#137 review still; #139 boot preview) ----
+  // Layout is done in JS (not CSS object-fit): size a true 4:3 border box,
+  // then set the <img> pixel size to natural*scale so the FULL frame is
+  // visible and shrunk — never clipped by the border.
+  function kioskImageUrl(basePath, cacheKey) {
+    const url = new URL(basePath, window.location.origin);
+    if (cacheKey) url.searchParams.set("id", cacheKey);
+    return url.pathname + url.search;
+  }
+
+  function resultsEvidenceUrl(path) {
+    if (!path) return null;
+    // Cache-bust: absolute paths are stable; without a changing query the
+    // browser can keep a stale JPEG after preview evidence is rebuilt.
+    return "/results-evidence?path=" + encodeURIComponent(path)
+      + "&v=" + encodeURIComponent(path.length + ":" + path.slice(-24));
+  }
+
+  function reviewStillUrl(state) {
+    const captureId = state.pending_capture_id;
+    return captureId ? kioskImageUrl("/review-still", captureId) : null;
+  }
+
+  function largestFourByThree(maxW, maxH) {
+    let w = maxW;
+    let h = (maxW * 3) / 4;
+    if (h > maxH) {
+      h = maxH;
+      w = (maxH * 4) / 3;
+    }
+    return { w: Math.max(1, Math.floor(w)), h: Math.max(1, Math.floor(h)) };
+  }
+
+  function shrinkImageIntoFrame(frameEl, imgEl) {
+    if (!frameEl || !imgEl || frameEl.style.display === "none") return;
+    const border = 8; // 4px border each side (box-sizing:border-box)
+    const innerW = Math.max(1, frameEl.clientWidth - border);
+    const innerH = Math.max(1, frameEl.clientHeight - border);
+    const nw = imgEl.naturalWidth || 0;
+    const nh = imgEl.naturalHeight || 0;
+    if (nw < 1 || nh < 1) return;
+    const scale = Math.min(innerW / nw, innerH / nh);
+    imgEl.style.width = Math.max(1, Math.floor(nw * scale)) + "px";
+    imgEl.style.height = Math.max(1, Math.floor(nh * scale)) + "px";
+  }
+
+  function layoutIdlePreviewFrame() {
+    const slot = document.querySelector(".idle-preview-slot");
+    const frameEl = $("idle-image-frame");
+    const imgEl = $("idle-image");
+    if (!slot || !frameEl) return;
+    if (frameEl.style.display === "none") return;
+    const box = largestFourByThree(slot.clientWidth, slot.clientHeight);
+    frameEl.style.width = box.w + "px";
+    frameEl.style.height = box.h + "px";
+    shrinkImageIntoFrame(frameEl, imgEl);
+  }
+
+  function layoutStillPreviewFrame() {
+    const content = $("content");
+    const frameEl = $("kiosk-image-frame");
+    const imgEl = $("kiosk-image");
+    if (!content || !frameEl || frameEl.style.display === "none") return;
+    // Leave room for headline/sub above the still (~220px) inside content.
+    const maxW = content.clientWidth;
+    const maxH = Math.max(120, content.clientHeight - 220);
+    const box = largestFourByThree(maxW, maxH);
+    frameEl.style.width = box.w + "px";
+    frameEl.style.height = box.h + "px";
+    shrinkImageIntoFrame(frameEl, imgEl);
+  }
+
+  function applyKioskImage(frameEl, imgEl, url, visible) {
+    if (!visible || !url) {
+      frameEl.style.display = "none";
+      imgEl.removeAttribute("src");
+      imgEl.dataset.src = "";
+      imgEl.style.width = "";
+      imgEl.style.height = "";
+      return;
+    }
+    const layout = () => {
+      if (frameEl.id === "idle-image-frame") layoutIdlePreviewFrame();
+      else layoutStillPreviewFrame();
+    };
+    imgEl.onload = layout;
+    if (imgEl.dataset.src !== url) {
+      imgEl.dataset.src = url;
+      imgEl.src = url;
+    } else if (imgEl.complete && imgEl.naturalWidth) {
+      layout();
+    }
+    frameEl.style.display = "block";
+    layout();
+  }
+
+  // Boot/idle screen 01: poll /preview-frame only while that screen is active.
+  const PREVIEW_POLL_MS = 250;
+  let bootPreviewActive = false;
+  let bootPreviewTimer = null;
+  let bootPreviewTick = 0;
+
+  function bootPreviewUrl() {
+    return kioskImageUrl("/preview-frame", String(bootPreviewTick));
+  }
+
+  function stopBootPreview() {
+    if (bootPreviewTimer) {
+      clearInterval(bootPreviewTimer);
+      bootPreviewTimer = null;
+    }
+    applyKioskImage($("idle-image-frame"), $("idle-image"), null, false);
+  }
+
+  function startBootPreview() {
+    stopBootPreview();
+    bootPreviewTick = 0;
+    const frameEl = $("idle-image-frame");
+    const imgEl = $("idle-image");
+    function poll() {
+      bootPreviewTick += 1;
+      applyKioskImage(frameEl, imgEl, bootPreviewUrl(), true);
+    }
+    poll();
+    bootPreviewTimer = setInterval(poll, PREVIEW_POLL_MS);
+  }
+
+  function syncBootPreview(entry) {
+    // Every idle-layout screen uses the same full-size live preview.
+    const want = !!entry && ["idle", "preview_actions"].includes(entry.variant);
+    if (want && !bootPreviewActive) {
+      bootPreviewActive = true;
+      startBootPreview();
+    } else if (!want && bootPreviewActive) {
+      bootPreviewActive = false;
+      stopBootPreview();
+    }
+  }
+
+  // Last online /state snapshot — used to paint Calibrating… immediately on
+  // confirm_empty (engage auto-cal and screen-04 RETRY) before the POST returns.
+  let lastStateSnapshot = null;
+
+  // ---- render one catalog entry from one /state snapshot ----------------
+  function render(state) {
+    const online = state.online !== false;
+    $("conn").textContent = online ? "online" : "offline";
+
+    // WS-A: amber banner keyed purely off state.online === false. When offline
+    // the relay returns a bare {online:false} (no screen/counts), so we show the
+    // banner and RETURN before repainting -- the last online screen stays frozen
+    // beneath the banner instead of being torn down by the empty snapshot.
+    $("offline-banner").classList.toggle("show", !online);
+    if (!online) {
+      syncBootPreview("");
+      return;
+    }
+
+    // #256: THIRD layer, same shape as the offline banner above -- toggled
+    // purely off state.attention, layered over whatever screen paints
+    // below, never torn down by it.
+    const attentionBanner = $("attention-banner");
+    attentionBanner.classList.toggle("show", !!state.attention);
+    if (state.attention) {
+      attentionBanner.textContent = state.attention.message || "Slide needs attention";
+    }
+
+    // #258: --profile-only Hybrid queue/timing panel, same layered shape as
+    // the attention banner above. `state.profile` is entirely ABSENT (not
+    // merely falsy) whenever the launch flag is off -- see
+    // KioskRelay._profile_fields -- so hiding on its absence here is a
+    // second, redundant guard on top of that, not the only one.
+    const profilePanel = $("profile-panel");
+    profilePanel.classList.toggle("show", !!state.profile);
+    profilePanel.innerHTML = state.profile ? renderProfilePanel(state.profile) : "";
+
+    lastStateSnapshot = state;
+    let id = state.screen || lastScreenId || "01";
+    lastScreenId = id;
+    $("screen-id").textContent = "screen " + id;
+
+    const entry = getScreen(id) || getScreen("01") || {};
+    const variant = entry.variant || "";
+    const view = viewFor(id, state);
+
+    $("panel").className =
+      "panel bg-" + (entry.bg || "default") + " variant-" + variant;
+
+    const isIdle = variant === "idle";
+    const isPreviewActions = variant === "preview_actions";
+    const usesIdlePreview = isIdle || isPreviewActions;
+    const isChooser = variant === "chooser";
+    const isCounts = variant === "counts";
+    const isTable = variant === "table";
+
+    // status bar (built from live state; catalog only says whether to show it)
+    if (entry.status_bar) {
+      $("status-bar").textContent = statusText(state);
+      $("status-bar").style.display = "";
+    } else {
+      $("status-bar").style.display = "none";
+    }
+
+    // idle (startup preview) vs the shared centred content zone
+    $("content").style.display = usesIdlePreview ? "none" : "";
+    $("idle-top").style.display = isIdle ? "" : "none";
+    $("idle-preview").style.display = usesIdlePreview ? "" : "none";
+    if (usesIdlePreview) {
+      $("preview-cap").textContent = fillTemplate(entry.sub, view) || "Preview";
+    }
+
+    // headline (idle has none in the design). Screens 13/14 centre the base
+    // word ("Capturing"/"Verifying") with the trailing ellipsis absolutely
+    // overflowing to the right (design 13/14), so 13->14 shares one centred
+    // placement. Every other screen centres the whole string (incl. any "…").
+    const headlineText = fillTemplate(entry.headline, view);
+    const headlineEl = $("headline");
+    if ((id === "13" || id === "14") && headlineText.endsWith("…")) {
+      headlineEl.textContent = headlineText.slice(0, -1);
+      const ell = document.createElement("span");
+      ell.className = "ellipsis-tail";
+      ell.textContent = "…";
+      headlineEl.appendChild(ell);
+      headlineEl.classList.add("centered-base");
+    } else {
+      headlineEl.textContent = headlineText;
+      headlineEl.classList.remove("centered-base");
+    }
+    headlineEl.style.display = isIdle ? "none" : "";
+
+    // primary sub / chooser work-order line
+    let subText = fillTemplate(entry.sub, view);
+    // Screen 16 shows the verdict reason (event message "REVIEW: <reason>").
+    // Relabel the presentation prefix to "Reason:" without touching the
+    // backend verdict message.
+    if (id === "16") subText = subText.replace(/^REVIEW:\s*/i, "Reason: ");
+    if (id === "hold_still" && state.capture_mode === "slide") subText = "";
+    if (id === "capture_review" && state.capture_mode === "slide") subText = "";
+    if (isChooser) {
+      $("sub").style.display = "none";
+      $("wo-line").textContent = subText;
+      $("wo-line").style.display = subText ? "" : "none";
+    } else {
+      $("wo-line").style.display = "none";
+      $("sub").textContent = subText;
+      $("sub").style.display = subText ? "" : "none";
+      $("sub").classList.toggle(
+        "sub-sm",
+        id === "07" || id === "hold_still" || id === "08" || id === "09" ||
+        id === "capture_review"
+      );  // block-id line is 38px
+    }
+
+    // still-image variant (capture_review; reused by boot preview in #139)
+    applyKioskImage(
+      $("kiosk-image-frame"),
+      $("kiosk-image"),
+      variant === "still" ? reviewStillUrl(state) : null,
+      variant === "still"
+    );
+
+    // secondary sub (screen 16 "Remove Slide" under the reason)
+    const sub2Text = fillTemplate(entry.sub2, view);
+    $("sub2").textContent = sub2Text;
+    $("sub2").style.display = sub2Text ? "" : "none";
+
+    // progress bar (screens 05 + processing)
+    $("progress").style.display = entry.progress_bar ? "" : "none";
+
+    // counts grid + debug box (screen 21)
+    if (isCounts) {
+      renderCounts(state);
+      $("counts").style.display = "";
+      $("debug-box").style.display = "";
+    } else {
+      $("counts").style.display = "none";
+      $("debug-box").style.display = "none";
+    }
+
+    if (isTable) {
+      renderResultsTable(state.results_rows || []);
+      $("results-table").style.display = "block";
+    } else {
+      $("results-table").replaceChildren();
+      $("results-table").style.display = "none";
+      resultsSig = null;  // force a rebuild (+ default-open state) on re-entry
+    }
+
+    renderButtons(entry, view);
+    handleDuplicate(id, state);
+    syncBootPreview(entry);
+    maybeAutoCalibrate(state);
+  }
+
+  // Auto-start empty-backlight calibration when engaged and the capture
+  // session is waiting for confirm_empty (session start + slide-phase rebuild).
+  // Replaces the manual CALIBRATE NOW tap on retired screen 04.
+  let autoCalibrateArmed = false;
+  function maybeAutoCalibrate(state) {
+    if (!state.effective_engaged) {
+      autoCalibrateArmed = false;
+      return;
+    }
+    if (state.capture_state !== "AWAITING_BASELINE_CONFIRMATION") {
+      autoCalibrateArmed = false;
+      return;
+    }
+    if (autoCalibrateArmed) return;
+    autoCalibrateArmed = true;
+    command("confirm_empty");
+  }
+
+  function renderCounts(state) {
+    const rows = [
+      ["PASS", state.pass_count],
+      ["REVIEW", state.review_count],
+      ["TOTAL", state.captured],
+    ];
+    const el = $("counts");
+    el.innerHTML = "";
+    for (const [label, value] of rows) {
+      const lab = document.createElement("div");
+      lab.textContent = label;
+      const num = document.createElement("div");
+      num.textContent = (value !== undefined && value !== null) ? value : 0;
+      el.appendChild(lab);
+      el.appendChild(num);
+    }
+  }
+
+  // ---- results screen (#232): grouped, expandable results table ---------
+  // Rebuilt from the redesign mock. `rows` is project_results_table's output
+  // (ERROR/REVIEW/PASS/PENDING-ordered, each row carrying work_order /
+  // block_id / verdict / claim_reason / color / capture_id -- #248). We
+  // RE-group it by work_order into one section per WO, same order WITHIN
+  // each section, then render a chevron-expandable row per slide. The
+  // reason + the reserved thumbnail/metadata seam live in each row's
+  // dropdown; real thumbnails and candidate ranking Evidence thumbs load
+  // from row.evidence; display tiles load on expand (#236).
+  //
+  // Poll-safe: render() calls this on every /state poll (~750ms). We
+  // fingerprint the rows and SKIP the rebuild when they are unchanged, so the
+  // operator's interaction state (which row is open) survives across polls
+  // instead of being wiped each tick. Click/keydown delegation is wired ONCE.
+
+  const RT_CHEV = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>';
+  // Pass/review pill icons: set true to bring the check/exclamation glyphs back.
+  const RT_SHOW_CAP_ICONS = false;
+  const RT_ICON_PASS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.2l2.6 2.6L16 9"/></svg>';
+  const RT_ICON_REVIEW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5"/><path d="M12 16.2h.01"/></svg>';
+
+  // #248: the four operator-visible row states (CONTEXT.md "Hybrid Result
+  // State"), mirroring kiosk.results_table's _COLOR_BY_VERDICT /
+  // _SORT_RANK_BY_VERDICT. Explicit lookups, not a binary PASS/REVIEW
+  // ternary, so an unrecognized verdict falls through to a distinct
+  // "rt-unknown" bucket instead of being silently disguised as REVIEW/red
+  // (the bug #248 fixed).
+  const RT_STATE_COLOR = { ERROR: "rt-error", REVIEW: "rt-review", PASS: "rt-pass", PENDING: "rt-pending" };
+  const RT_STATE_RANK = { ERROR: 0, REVIEW: 1, PASS: 2, PENDING: 3 };
+  // #248-fix: the unknown-row fallback must sort AT OR ABOVE ERROR (never
+  // after PENDING) so a leaked internal state can never hide at the bottom
+  // of a long table. Mirrors kiosk.results_table._UNKNOWN_SORT_RANK.
+  const RT_UNKNOWN_RANK = -1;
+  function rtStateClass(verdict) { return RT_STATE_COLOR[verdict] || "rt-unknown"; }
+  function rtStateRank(verdict) {
+    return Object.prototype.hasOwnProperty.call(RT_STATE_RANK, verdict) ? RT_STATE_RANK[verdict] : RT_UNKNOWN_RANK;
+  }
+  // ERROR and REVIEW are the two states an operator must act on; PASS needs
+  // no action and PENDING has nothing to inspect yet (still scoring).
+  function rtNeedsAttention(verdict) { return verdict === "ERROR" || verdict === "REVIEW"; }
+
+  let resultsSig = null;
+
+  function rtEl(tag, cls, html) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (html != null) n.innerHTML = html;
+    return n;
+  }
+
+  function rtGroupByWorkOrder(rows) {
+    // First-seen order of work orders; ERROR/REVIEW/PASS/PENDING order
+    // within each (the input is already in that order globally, so a
+    // stable partition keeps it -- #248).
+    const groups = new Map();
+    for (const row of rows) {
+      const wo = row.work_order == null ? "" : String(row.work_order);
+      if (!groups.has(wo)) groups.set(wo, []);
+      groups.get(wo).push(row);
+    }
+    for (const list of groups.values()) {
+      list.sort((a, b) => rtStateRank(a.verdict) - rtStateRank(b.verdict));
+    }
+    return groups;
+  }
+
+  function rtPlural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+
+  function rtCounts(rows) {
+    return {
+      total: rows.length,
+      pass: rows.filter(r => r.verdict === "PASS").length,
+      review: rows.filter(r => r.verdict === "REVIEW").length,
+      error: rows.filter(r => r.verdict === "ERROR").length,
+      pending: rows.filter(r => r.verdict === "PENDING").length,
+    };
+  }
+
+  function rtCapsule(verdict) {
+    const cap = rtEl("span", "rt-cap " + rtStateClass(verdict));
+    const icon = RT_SHOW_CAP_ICONS
+      ? (verdict === "PASS" ? RT_ICON_PASS : verdict === "REVIEW" ? RT_ICON_REVIEW : "")
+      : "";
+    // #248: no silent default to "REVIEW" -- an unrecognized verdict shows
+    // its own (unexpected) text, loud rather than disguised as a match
+    // failure.
+    cap.innerHTML = icon + (verdict != null ? verdict : "UNKNOWN");
+    return cap;
+  }
+
+  // Thumbnails are queued in top-down document order and loaded one at a
+  // time (rather than firing every <img src> at once) so the fast, small
+  // seam thumbnails always paint before the larger per-row evidence tiles
+  // compete for the same connections. See _sequentialImageLoad below.
+  function rtThumb(letter, path, thumbQueue) {
+    const el = rtEl("div", "rt-thumb");
+    if (!path) {
+      el.textContent = letter;
+      return el;
+    }
+    const img = document.createElement("img");
+    img.alt = letter;
+    img.style.width = "100%"; img.style.height = "100%";
+    img.style.objectFit = "cover"; img.style.borderRadius = "8px";
+    el.appendChild(img);
+    thumbQueue.push({
+      img,
+      url: resultsEvidenceUrl(path),
+      onError: () => { img.remove(); el.textContent = letter; },
+    });
+    return el;
+  }
+
+  function rtSeam(row, thumbQueue) {
+    const seam = rtEl("div", "rt-seam");
+    const ev = row.evidence || {};
+    seam.appendChild(rtThumb("B", ev.block_thumb, thumbQueue));
+    seam.appendChild(rtThumb("S", ev.slide_thumb, thumbQueue));
+    return seam;
+  }
+
+  // Load queued <img>s one at a time (src set only after the previous one
+  // finishes loading or errors). A generation counter invalidates any queue
+  // still in flight from a prior render so a fast-changing poll cycle can't
+  // pile up overlapping load chains. `onDone` fires after the whole queue
+  // settles (used to defer the larger expanded-evidence tiles).
+  let _thumbLoadGen = 0;
+  function _sequentialImageLoad(entries, onDone) {
+    const gen = ++_thumbLoadGen;
+    let i = 0;
+    const step = () => {
+      if (gen !== _thumbLoadGen) return;
+      if (i >= entries.length) { if (onDone) onDone(); return; }
+      const entry = entries[i++];
+      entry.img.onload = step;
+      entry.img.onerror = () => { entry.onError(); step(); };
+      entry.img.src = entry.url;
+    };
+    step();
+  }
+
+  function rtOpenLightbox(url) {
+    const img = $("rt-lightbox-img");
+    img.src = url;
+    $("rt-lightbox").classList.add("rt-lightbox-open");
+  }
+  function rtCloseLightbox() {
+    $("rt-lightbox").classList.remove("rt-lightbox-open");
+    $("rt-lightbox-img").src = "";
+  }
+  $("rt-lightbox").addEventListener("click", rtCloseLightbox);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") rtCloseLightbox();
+  });
+
+  function rtDisplayTile(path) {
+    const tile = rtEl("div", "rt-evi-img");
+    if (!path) {
+      tile.appendChild(rtEl("small", "", "unavailable"));
+      return tile;
+    }
+    const img = document.createElement("img");
+    img.alt = "";
+    img.dataset.evidencePath = path;
+    img.style.width = "100%"; img.style.height = "100%";
+    img.style.objectFit = "cover";
+    img.onerror = () => {
+      img.remove();
+      tile.classList.remove("rt-evi-img-clickable");
+      if (!tile.querySelector("small")) {
+        tile.appendChild(rtEl("small", "", "unavailable"));
+      }
+    };
+    tile.appendChild(img);
+    tile.classList.add("rt-evi-img-clickable");
+    tile.addEventListener("click", () => rtOpenLightbox(img.src));
+    return tile;
+  }
+
+  function rtLoadExpandedEvidence(rowEl) {
+    rowEl.querySelectorAll("img[data-evidence-path]").forEach(img => {
+      img.src = resultsEvidenceUrl(img.dataset.evidencePath);
+    });
+  }
+
+  function rtEvidence(row) {
+    const evi = rtEl("div", "rt-evi");
+    evi.appendChild(rtEl("div", "rt-evi-reason-lbl", "Reason"));
+    evi.appendChild(rtEl("div", "rt-evi-reason", row.claim_reason || "—"));
+    const body = rtEl("div", "rt-evi-body");
+    const imgs = rtEl("div", "rt-evi-imgs");
+    const ev = row.evidence || {};
+    imgs.appendChild(rtDisplayTile(ev.block_display));
+    imgs.appendChild(rtDisplayTile(ev.slide_display));
+    // Spec #236: pending/error never show a third tile (no fake alignment).
+    if (ev.overlay_display) {
+      imgs.appendChild(rtDisplayTile(ev.overlay_display));
+    }
+    const meta = rtEl("dl", "rt-evi-meta");
+    meta.innerHTML =
+      "<dt>Claimed block</dt><dd>" + (row.block_id || "—") + "</dd>" +
+      "<dt>Top-ranked block</dt><dd>—</dd>" +
+      "<dt>Claimed rank</dt><dd>—</dd>" +
+      "<dt>Score difference</dt><dd>—</dd>";
+    const side = rtEl("div");
+    side.appendChild(meta);
+    if (!ev.block_display || !ev.slide_display) {
+      side.appendChild(rtEl("div", "rt-evi-note",
+        "Some evidence images are unavailable."));
+    }
+    body.appendChild(imgs);
+    body.appendChild(side);
+    evi.appendChild(body);
+    return evi;
+  }
+
+  function rtRow(row, expanded, thumbQueue, deferredExpand) {
+    const el = rtEl("div", "rt-row " + rtStateClass(row.verdict));
+    el.tabIndex = 0;
+    if (expanded) el.classList.add("rt-open");
+    const main = rtEl("div", "rt-row-main");
+    const chev = rtEl("button", "rt-chev", RT_CHEV);
+    chev.setAttribute("aria-label", "Toggle evidence");
+    main.appendChild(chev);
+    main.appendChild(rtCapsule(row.verdict));
+    main.appendChild(rtSeam(row, thumbQueue));
+    main.appendChild(rtEl("span", "rt-block", row.block_id || "—"));
+    el.appendChild(main);
+    el.appendChild(rtEvidence(row));
+    // Defer the auto-opened row's larger display tiles until every seam
+    // thumbnail has loaded (top-down) -- see renderResultsTable.
+    if (expanded) deferredExpand.push(el);
+    return el;
+  }
+
+  function renderResultsTable(rows) {
+    const table = $("results-table");
+    const sig = JSON.stringify(rows.map(r =>
+      [r.work_order, r.block_id, r.verdict, r.capture_id, r.claim_reason,
+       r.evidence && r.evidence.block_thumb,
+       r.evidence && r.evidence.slide_thumb,
+       r.evidence && r.evidence.block_display,
+       r.evidence && r.evidence.slide_display,
+       r.evidence && r.evidence.overlay_display]));
+    if (sig === resultsSig) return;  // unchanged -> keep open/closed state
+    resultsSig = sig;
+    table.replaceChildren();
+
+    if (!rows.length) {
+      table.appendChild(rtEl("div", "results-empty", "No completed results yet"));
+      return;
+    }
+
+    const groups = rtGroupByWorkOrder(rows);
+    const totals = rtCounts(rows);
+    const sessionNumber =
+      (lastStateSnapshot && lastStateSnapshot.session_number) || "";
+
+    const head = rtEl("div", "rt-head");
+    head.appendChild(rtEl("h1", "rt-title", "Results"));
+    head.appendChild(rtEl("p", "rt-sub",
+      "<b>Session " + sessionNumber + "</b> · " + rtPlural(groups.size, "work order") +
+      " · " + rtPlural(totals.total, "claim") + " · " +
+      totals.review + " to review" +
+      (totals.error ? " · " + rtPlural(totals.error, "error") : "")));
+    table.appendChild(head);
+
+    const COLHEAD_LABELS = [["", ""], ["Verdict", "rt-lbl-right"], ["", ""],
+                             ["Block ID", "rt-lbl-left"]];
+
+    // Only the FIRST row needing attention (ERROR or REVIEW, across all
+    // sections) starts open; every PASS/PENDING and any later ERROR/REVIEW
+    // starts collapsed, honouring "one open at a time" (#248: ERROR now
+    // outranks REVIEW, so this can no longer be "REVIEW-only").
+    let firstAttentionOpened = false;
+    const thumbQueue = [];
+    const deferredExpand = [];
+    for (const [wo, woRows] of groups) {
+      const c = rtCounts(woRows);
+      const band = rtEl("div", "rt-band");
+      band.appendChild(rtEl("div", "rt-wo", "WO-" + wo));
+      const counts = rtEl("div", "rt-counts");
+      counts.innerHTML =
+        "<span>" + rtPlural(c.total, "claim") + "</span>" +
+        '<span class="rt-pas">' + c.pass + " pass</span>" +
+        (c.review ? '<span class="rt-rev">' + c.review + " review</span>" : "") +
+        (c.error ? '<span class="rt-err">' + c.error + " error</span>" : "") +
+        (c.pending ? '<span class="rt-pnd">' + c.pending + " pending</span>" : "");
+      band.appendChild(counts);
+      table.appendChild(band);
+
+      const colhead = rtEl("div", "rt-colhead");
+      for (const [text, extra] of COLHEAD_LABELS) {
+        colhead.appendChild(rtEl("div", "rt-lbl " + extra, text));
+      }
+      table.appendChild(colhead);
+
+      for (const row of woRows) {
+        const open = !firstAttentionOpened && rtNeedsAttention(row.verdict);
+        if (open) firstAttentionOpened = true;
+        table.appendChild(rtRow(row, open, thumbQueue, deferredExpand));
+      }
+    }
+    // Every seam thumbnail (top-down across the whole table) loads first;
+    // only once that settles do we load the auto-opened row's larger
+    // block/slide/overlay display tiles.
+    _sequentialImageLoad(thumbQueue, () => {
+      deferredExpand.forEach(rowEl => rtLoadExpandedEvidence(rowEl));
+    });
+
+    if (!table.dataset.wired) {
+      table.dataset.wired = "1";
+      table.addEventListener("click", rtToggleFromEvent);
+      table.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          const row = ev.target.closest && ev.target.closest(".rt-row");
+          if (row) { ev.preventDefault(); rtToggle(row); }
+        }
+      });
+    }
+  }
+
+  function rtToggleFromEvent(ev) {
+    const row = ev.target.closest && ev.target.closest(".rt-row");
+    if (row) rtToggle(row);
+  }
+
+  // One row open at a time: close every open row, then open the tapped one if
+  // it was not already open (a second tap collapses it).
+  function rtToggle(row) {
+    const table = $("results-table");
+    const wasOpen = row.classList.contains("rt-open");
+    table.querySelectorAll(".rt-row.rt-open")
+      .forEach(r => r.classList.remove("rt-open"));
+    if (!wasOpen) {
+      row.classList.add("rt-open");
+      rtLoadExpandedEvidence(row);
+    }
+  }
+
+  function makeButton(b, cls, view) {
+    const el = document.createElement("button");
+    el.className = cls;
+    el.textContent = fillTemplate(b.label, view);
+    el.addEventListener("click", () => onButton(b, el));
+    return el;
+  }
+
+  // Buttons are placed by variant: idle puts the big START SESSION in the top
+  // third; chooser puts a large primary in the content zone and a small
+  // remaining buttons in the footer; every other screen puts its buttons in
+  // the footer.
+  function renderButtons(entry, view) {
+    const buttons = entry.buttons || [];
+    const variant = entry.variant || "";
+    const footer = $("footer");
+    footer.innerHTML = "";
+    const idleTop = $("idle-top");
+    idleTop.innerHTML = "";
+    const primary = $("chooser-primary");
+    primary.style.display = "none";
+    primary.onclick = null;
+
+    if (variant === "idle") {
+      for (const b of buttons) idleTop.appendChild(makeButton(b, "btn btn-xl", view));
+      return;
+    }
+    if (variant === "preview_actions") {
+      for (const b of buttons) footer.appendChild(makeButton(b, "btn btn-sm", view));
+      return;
+    }
+    if (variant === "chooser") {
+      // Primary = RESUME SESSION {n}: engages (re-attaches) the in-process
+      // session. The label carries the live session_number via fillTemplate.
+      if (buttons[0]) {
+        primary.textContent = fillTemplate(buttons[0].label, view);
+        primary.style.display = "";
+        primary.disabled = false;
+        primary.onclick = () => onButton(buttons[0], primary);
+      }
+      // Secondary = START NEW SESSION: there is NO in-process new-session path
+      // (plan §2 / Q6 -- creating a session needs a runtime rebind that does
+      // not exist), so render it as a disabled/no-op affordance rather than
+      // falsely engaging the resumed session. Keyed on the placeholder `engage`
+      // action, so if a real start_session verb is added later (action
+      // "dispatch") the button lights up automatically.
+      for (const button of buttons.slice(1)) {
+        const secondary = makeButton(button, "btn btn-sm", view);
+        if (button.action === "engage") secondary.disabled = true;
+        footer.appendChild(secondary);
+      }
+      return;
+    }
+    // Footer action buttons render at lg (48px) BY DEFAULT -- the design's
+    // uniform footer-button size. An explicit catalog `size` still overrides
+    // for exceptions (xl/sm/lg); with no `size` a footer button is lg.
+    for (const b of buttons) {
+      const size = b.size === "xl" ? "btn-xl" : b.size === "sm" ? "btn-sm"
+        : b.size === "lg" ? "btn-lg" : "btn-lg";
+      footer.appendChild(makeButton(b, "btn " + size, view));
+    }
+  }
+
+  // #257: tracks whether THIS client paused capture via the VIEW RESULTS
+  // entry point on the open slide-capture screen, so GO BACK only resumes
+  // capture it itself paused. Deliberately NOT part of `ui` (which only ever
+  // holds router-input flags echoed to /state) -- this is local bookkeeping
+  // so Open Retrieval's between_orders VIEW RESULTS/GO BACK pair (pure
+  // guard/back, never dispatches pause_capture) stays completely untouched.
+  let viewResultsPausedCapture = false;
+
+  // ---- five-verb button action vocabulary -------------------------------
+  function onButton(b, el) {
+    switch (b.action) {
+      case "dispatch":
+        // Disable the tapped button for the in-flight window so an accidental
+        // double-tap cannot re-fire the verb, then RE-ENABLE it the instant the
+        // POST resolves -- NOT on the next /state poll -- so a single tap always
+        // feels responsive and the button is never left stuck (Zeke: screen 04).
+        // The dispatchLocked guard in command() is the real double-fire guard.
+        if (el) el.disabled = true;
+        if (b.verb === "confirm_empty" && lastStateSnapshot) {
+          // Instant Calibrating…; runtime also exposes BUILDING_BASELINE while
+          // activate_mode runs so later polls stay on 05 until success/fail.
+          render(Object.assign({}, lastStateSnapshot, {
+            screen: "05",
+            capture_state: "BUILDING_BASELINE",
+          }));
+        }
+        if (b.verb === "finish_blocks") {
+          // Guard-latch fix (#250 review F1): finish_blocks_guard was only
+          // ever cleared by the "back" action, never by dispatching the
+          // confirm itself. A Hybrid <2-usable-blocks bounce returns phase
+          // to "blocks" -- if the guard were still true, select_screen()
+          // would route straight back to screen 10 (Finish Blocks Confirm)
+          // with no explanation, and every re-tap would re-drain and bounce
+          // forever with GO BACK the only escape. Clearing it here (whether
+          // the freeze proceeds or bounces) always lands the operator back
+          // on live block capture.
+          ui.finish_blocks_guard = false;
+        }
+        if (b.verb === "retry_hybrid_slide" || b.verb === "arm_hybrid_recapture") {
+          // #256 (RETRY) / #256 follow-up (RECAPTURE): the attention item's
+          // capture_id lives client-side on the last state snapshot
+          // (state.attention.capture_id) -- no catalog button carries args,
+          // so this is passed as a special case, mirroring confirm_empty/
+          // pause_capture's special cases above.
+          const captureId = lastStateSnapshot && lastStateSnapshot.attention
+            && lastStateSnapshot.attention.capture_id;
+          command(b.verb, captureId).finally(() => { if (el) el.disabled = false; });
+          break;
+        }
+        if (b.verb === "pause_capture") {
+          // #257: VIEW RESULTS on the open slide-capture screen both pauses
+          // automatic capture (the dispatch below, a real server-side side
+          // effect) and opens Results (the client-owned guard flag) in the
+          // SAME tap -- mirrors the finish_blocks special case above. The
+          // router itself stays a pure projection; the side effect lives
+          // here, in the verb layer, never in select_screen().
+          ui.view_results_guard = true;
+          viewResultsPausedCapture = true;
+        }
+        command(b.verb).finally(() => { if (el) el.disabled = false; });
+        break;
+      case "guard":     setFlag(b.target, true); break;   // -> confirm screen
+      case "back":
+        if (b.target === "view_results_guard" && viewResultsPausedCapture) {
+          // #257: only resume capture when THIS client is the one that
+          // paused it (the open slide-capture entry point). Open
+          // Retrieval's between_orders VIEW RESULTS never sets this flag
+          // (it never dispatches pause_capture), so its GO BACK stays the
+          // unchanged pure guard/back no-dispatch path.
+          viewResultsPausedCapture = false;
+          command("resume_capture");
+        }
+        setFlag(b.target, false);  // clear guard
+        break;
+      case "engage":    setFlag("engaged", true); break;  // boot latch on
+      case "disengage": setFlag("engaged", false); break; // boot latch off
+    }
+  }
+
+  function setFlag(name, value) {
+    if (name in ui) ui[name] = value;
+    refresh();  // re-poll immediately so the routed screen updates now
+  }
+
+  // ---- read path: poll /state with the client flags, then render --------
+  function stateUrl() {
+    const p = new URLSearchParams();
+    p.set("engaged", ui.engaged ? "1" : "0");
+    p.set("finish_blocks_guard", ui.finish_blocks_guard ? "1" : "0");
+    p.set("finish_slides_guard", ui.finish_slides_guard ? "1" : "0");
+    p.set("view_results_guard", ui.view_results_guard ? "1" : "0");
+    p.set("recapture_guard", ui.recapture_guard ? "1" : "0");
+    return "/state?" + p.toString();
+  }
+
+  // WS-E ordering guard: refresh() is triggered from three uncoordinated
+  // sources (the 750ms poll, post-command, post-flag-tap) with no request
+  // cancellation. A slower in-flight response for a stale screen can land
+  // after a faster, newer response already rendered -- repainting the
+  // previous slide's verdict for one poll cycle. Track the highest sequence
+  // number rendered so far and drop any response older than that.
+  let refreshSeq = 0;
+  let renderedSeq = 0;
+  async function refresh() {
+    const mySeq = ++refreshSeq;
+    try {
+      const state = await (await fetch(stateUrl(), { cache: "no-store" })).json();
+      if (mySeq < renderedSeq) return; // superseded by a newer response already rendered
+      renderedSeq = mySeq;
+      render(state);
+    } catch (err) {
+      $("conn").textContent = "offline";
+    }
+  }
+
+  // ---- write path: one tap -> POST /command -> dispatch verb ------------
+  // WS-D debounce: a single in-flight lock. A double-tapped CALIBRATE NOW (or
+  // any command button) within the poll gap has its second dispatch dropped, so
+  // confirm_empty cannot fire twice and race the AWAITING_BASELINE_CONFIRMATION
+  // -> BUILDING_BASELINE transition (the RuntimeError the relay/server seam also
+  // hardens against). The per-button disable below is the visible half of this.
+  let dispatchLocked = false;
+  async function command(name, ...args) {
+    if (dispatchLocked) return;
+    dispatchLocked = true;
+    try {
+      await fetch("/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, args }),
+      });
+    } catch (err) {
+      /* offline / relay down: surfaced via the next /state poll's online flag */
+    } finally {
+      dispatchLocked = false;
+    }
+    refresh();  // reflect the mutation back through the read path
+  }
+
+  // Real input: a hardware scanner behaves as a keyboard -- characters then
+  // Enter. The scanner is NOT a catalog button; it self-dispatches the unified
+  // scan_qr front door (runtime routes it: block mode registers the 8-digit id
+  // via scan_block, slide mode stashes the full label payload). Buffer EVERY
+  // printable key (e.key.length === 1), not just digits: a slide label payload
+  // like "12080_51137181_01_HE" carries underscores and letters that a
+  // digits-only filter would silently drop.
+  let scanBuffer = "";
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      if (scanBuffer) { command("scan_qr", scanBuffer); scanBuffer = ""; }
+      return;
+    }
+    if (e.key.length === 1) { scanBuffer += e.key; }  // printable char (skips Shift/Tab/…)
+  });
+
+  // #256: tapping the passive attention banner is the "direct route into
+  // the correction flow" -- sets recapture_guard, routing to
+  // hybrid_attention on the next poll (mirrors every other guard-nav
+  // button's setFlag call).
+  $("attention-banner").addEventListener("click", () => setFlag("recapture_guard", true));
+
+  // Dev-only simulate-scan button (QA without a hardware scanner). Accepts a
+  // block id (block mode) or a full slide label payload (slide mode).
+  $("dev-scan").addEventListener("click", () =>
+    command("scan_qr", $("dev-block-id").value.trim()));
+
+  // ---- boot: fetch catalog once, then poll /state on the 119a cadence ---
+  (async () => {
+    fit();
+    await loadCatalog();
+    refresh();
+    setInterval(refresh, 750);
+  })();
+</script>
+</body>
+</html>

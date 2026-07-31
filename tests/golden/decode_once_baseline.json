@@ -1,0 +1,100 @@
+{
+  "matched": {
+    "block_mask": {
+      "dtype": "uint8",
+      "sha256": "9ef61cfa69eceacf07f60a118f5188f928e7e5687bc8fbf9241769c4a3994236",
+      "shape": [
+        3040,
+        4056
+      ]
+    },
+    "decisions_csv_row": {
+      "block_id": "51137201",
+      "reason": "score 0.739 below threshold 0.85",
+      "score": "0.7386",
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "gates": {
+      "align_soft_iou": 0.321979,
+      "best_angle": 2.0,
+      "best_flip": true,
+      "block_occupied_fraction": 0.009033,
+      "block_path": "capture_000001_block_51137201_20260623T180000Z.png",
+      "claim_id": "51137201",
+      "mask_iou": 0.15,
+      "reason": "score 0.739 below threshold 0.85",
+      "router_size_signal": 0.003952,
+      "score": 0.738556,
+      "selected_metric": "point_layout",
+      "slide_occupied_fraction": 0.003952,
+      "slide_path": "capture_20260623_200415.jpg",
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "outcome": {
+      "reason": "score 0.739 below threshold 0.85",
+      "score": 0.738556,
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "qc_pixel_sha256": "2c6f7115c65f8faea9e2ca8c97fc091efa0dc86d8a816dd1145f95291b86ca81",
+    "slide_mask": {
+      "dtype": "uint8",
+      "sha256": "906687dd1ecb74d369f33e6bbefc563590c2d8e4fcfd76d6845d2b70f07ad43e",
+      "shape": [
+        3040,
+        4056
+      ]
+    }
+  },
+  "mismatched": {
+    "block_mask": {
+      "dtype": "uint8",
+      "sha256": "9ef61cfa69eceacf07f60a118f5188f928e7e5687bc8fbf9241769c4a3994236",
+      "shape": [
+        3040,
+        4056
+      ]
+    },
+    "decisions_csv_row": {
+      "block_id": "51137201",
+      "reason": "score 0.511 below threshold 0.85",
+      "score": "0.5114",
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "gates": {
+      "align_soft_iou": 0.449283,
+      "best_angle": 68.0,
+      "best_flip": true,
+      "block_occupied_fraction": 0.009033,
+      "block_path": "capture_000001_block_51137201_20260623T180000Z.png",
+      "claim_id": "51137201",
+      "mask_iou": 0.377754,
+      "reason": "score 0.511 below threshold 0.85",
+      "router_size_signal": 0.009033,
+      "score": 0.511433,
+      "selected_metric": "point_layout",
+      "slide_occupied_fraction": 0.010986,
+      "slide_path": "capture_20260623_202054.jpg",
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "outcome": {
+      "reason": "score 0.511 below threshold 0.85",
+      "score": 0.511433,
+      "stage": "scoring",
+      "verdict": "REVIEW"
+    },
+    "qc_pixel_sha256": "a04e710da743b8fafab0d7b3860b526ae0bdfdbb73a53daf68fda87a58f68f84",
+    "slide_mask": {
+      "dtype": "uint8",
+      "sha256": "f49ffa5aa8f087f84ec08c1d37c19da6b188dafd857bff48bd6c62fcdad18250",
+      "shape": [
+        3040,
+        4056
+      ]
+    }
+  }
+}
