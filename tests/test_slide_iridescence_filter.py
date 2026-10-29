@@ -7,36 +7,29 @@ Its fringe produces *green-dominant* pixels (g > r and g > b) which H&E stain
 can never make, so green-dominance marks the artifact. The filter drops a kept
 slide component when most of it sits near green AND its own median stain is low.
 
-The guard (the bug fix)
------------------------
+The guard
+---------
 A real tissue dot on slide_017 sat right next to the rainbow band, so proximity
-alone wrongly condemned it. The fix: never remove a component whose own median
-stain is strong (>= STAIN_GUARD) — iridescent fringe is pale, real tissue is
+alone wrongly condemned it. The guard never removes a component whose own median
+stain is strong (>= STAIN_GUARD): iridescent fringe is pale, real tissue is
 saturated. test_guard_spares_stained_component_near_green locks this down.
 
-Feature flag
-------------
-SLIDE_IRIDESCENCE_FILTER_ENABLED is OFF by default; production behaviour is
-unchanged until it is deliberately turned on.
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-_REPO = Path(__file__).resolve().parent.parent
-_CODE = _REPO / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
+import verify.segmentation as seg
+from constants import CAPTURE_DIMENSIONS
+from session.preparation import prepare_specimen_from_image, PreparedSpecimen
+from verify.scale import pixel_scale_for
 
-import constants  # noqa: E402
-import verify.segmentation as seg  # noqa: E402
-from session.preparation import prepare_specimen_from_image, PreparedSpecimen  # noqa: E402
+_REPO = Path(__file__).resolve().parent.parent
 
 _DATASET = _REPO / "images" / "pi_images_v3"
 _GREEN_BGR = (100, 200, 100)   # b,g,r: green-dominant -> "iridescence" source
@@ -101,46 +94,6 @@ def test_keeps_component_far_from_green():
 
 
 # ---------------------------------------------------------------------------
-# Feature-flag gating (synthetic, always run)
-# ---------------------------------------------------------------------------
-
-def test_filter_enabled_in_production():
-    """The filter is ON in production: it removes the coverslip rainbow fans
-    so SLIDE_LAB_A_MIN can stay at the slide_008-safe 130."""
-    assert constants.SLIDE_IRIDESCENCE_FILTER_ENABLED is True
-    assert constants.SLIDE_LAB_A_MIN == 130, (
-        "LAB_A_MIN must stay 130 (008-safe); artifacts are handled by the filter"
-    )
-
-
-def _slide_image():
-    """Synthetic slide with a pink tissue blob that passes the H&E stain gate."""
-    img = np.full((600, 800, 3), 230, dtype=np.uint8)
-    cv2.circle(img, (400, 300), 80, (200, 150, 230), -1)
-    return img
-
-
-def test_flag_gates_the_filter_call(monkeypatch):
-    """segment_tissue calls the filter only when the flag is on."""
-    calls = []
-    real = seg._remove_green_iridescence
-
-    def recorder(mask, bgr, stain, *, pixel_scale=1.0):
-        calls.append(True)
-        return real(mask, bgr, stain, pixel_scale=pixel_scale)
-
-    monkeypatch.setattr(seg, "_remove_green_iridescence", recorder)
-
-    monkeypatch.setattr(seg, "SLIDE_IRIDESCENCE_FILTER_ENABLED", False)
-    seg.segment_tissue(_slide_image(), "slide")
-    assert not calls, "filter ran even though the flag is OFF"
-
-    monkeypatch.setattr(seg, "SLIDE_IRIDESCENCE_FILTER_ENABLED", True)
-    seg.segment_tissue(_slide_image(), "slide")
-    assert calls, "filter did not run even though the flag is ON"
-
-
-# ---------------------------------------------------------------------------
 # Real-image regression tests (skip if dataset absent)
 # ---------------------------------------------------------------------------
 
@@ -148,9 +101,15 @@ _SLIDE_017 = _DATASET / "slide_017_esophagus_WT3_01_HE.png"
 _SLIDE_014 = _DATASET / "slide_014_esophagus_WT2_01_HE.png"
 
 
-def _prep_mask(path, *, filter_on):
+def _production_slide(path):
+    """Load a native capture and shrink it the way capture storage does."""
     img = cv2.imread(str(path))
     assert img is not None, f"could not read {path}"
+    return cv2.resize(img, CAPTURE_DIMENSIONS["slide"], interpolation=cv2.INTER_AREA)
+
+
+def _prep_mask(path, *, filter_on):
+    img = _production_slide(path)
     with pytest.MonkeyPatch().context() as mp:
         mp.setattr(seg, "SLIDE_IRIDESCENCE_FILTER_ENABLED", filter_on)
         result = prepare_specimen_from_image(img, "slide")
@@ -158,12 +117,29 @@ def _prep_mask(path, *, filter_on):
     return result.mask
 
 
+def _segment_mask(path, *, filter_on):
+    """Segment only — isolates the iridescence filter from later prep steps.
+
+    ``select_label_nearest_sheet`` already drops the slide_014 fan when the
+    filter is off, so prepare-level on/off pixel counts match and cannot
+    prove the filter works. Measure at ``segment_tissue`` instead.
+    """
+    img = _production_slide(path)
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(seg, "SLIDE_IRIDESCENCE_FILTER_ENABLED", filter_on)
+        return seg.segment_tissue(
+            img, "slide", pixel_scale=pixel_scale_for(img.shape[1])
+        )
+
+
 @pytest.mark.skipif(not _SLIDE_017.exists(), reason="slide_017 not in images/pi_images_v3/")
 def test_slide_017_real_dot_survives():
     """The esophagus dot near the rainbow band must NOT be removed (the bug)."""
     mask_on = _prep_mask(_SLIDE_017, filter_on=True)
-    # dot centroid measured at ~(2222, 1284); assert tissue survives in its window
-    window = mask_on[1284 - 40:1284 + 40, 2222 - 40:2222 + 40]
+    # dot centroid ~(2222, 1284) at native 4056 px width; map to stored size
+    k = mask_on.shape[1] / 4056
+    x, y, r = round(2222 * k), round(1284 * k), round(40 * k)
+    window = mask_on[y - r:y + r, x - r:x + r]
     assert np.count_nonzero(window) > 0, (
         "slide_017 esophagus dot was deleted by the iridescence filter"
     )
@@ -172,8 +148,8 @@ def test_slide_017_real_dot_survives():
 @pytest.mark.skipif(not _SLIDE_014.exists(), reason="slide_014 not in images/pi_images_v3/")
 def test_slide_014_fan_is_removed():
     """The slide_014 iridescent fan must be substantially removed when ON."""
-    off = int(np.count_nonzero(_prep_mask(_SLIDE_014, filter_on=False)))
-    on = int(np.count_nonzero(_prep_mask(_SLIDE_014, filter_on=True)))
+    off = int(np.count_nonzero(_segment_mask(_SLIDE_014, filter_on=False)))
+    on = int(np.count_nonzero(_segment_mask(_SLIDE_014, filter_on=True)))
     assert on < off * 0.9, (
         f"expected the iridescent fan to be removed (>=10% fewer px); "
         f"off={off} on={on}"

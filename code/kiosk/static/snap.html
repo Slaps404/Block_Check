@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Snap mode</title>
+<style>
+  /* Simple capture: live preview, Enter = one debug still via the `snap_quiet` verb. */
+  body { margin: 0; background: #111; color: #eee; font: 20px/1.4 system-ui, sans-serif; }
+  .wrap { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
+  .top { display: flex; width: 100%; max-width: 1200px; justify-content: space-between; align-items: center; }
+  .top a { color: #eee; border: 1px solid #888; border-radius: 6px; padding: 8px 20px; text-decoration: none; font-weight: 700; }
+  #preview { max-width: 1200px; width: 100%; max-height: 62vh; object-fit: contain; background: #000; border: 1px solid #444; }
+  .row { display: flex; gap: 12px; width: 100%; max-width: 1200px; }
+  input, textarea { font: 18px/1.3 inherit; border-radius: 6px; border: 1px solid #888; padding: 8px 12px; background: #222; color: #eee; }
+  #block-id { width: 220px; }
+  #note { flex: 1; resize: vertical; min-height: 44px; }
+  #status { min-height: 1.4em; font-weight: 700; }
+  #status.ok { color: #6c6; } #status.err { color: #e66; } #status.busy { color: #fc6; }
+  .hint { color: #888; font-size: 16px; }
+  #snap-btn { width: 100%; max-width: 1200px; padding: 24px; font: 800 48px system-ui, sans-serif;
+              color: #111; background: #6c6; border: 0; border-radius: 10px; cursor: pointer; }
+  #snap-btn:disabled { background: #555; }
+  .toggle { font-size: 20px; cursor: pointer; }
+  .toggle input { width: 22px; height: 22px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <a href="/">BACK</a>
+    <div id="status">Ready</div>
+    <div class="hint">ENTER = capture</div>
+  </div>
+  <img id="preview" alt="live preview">
+  <div class="row">
+    <input id="block-id" placeholder="Block ID (optional, scan)">
+    <textarea id="note" rows="2" maxlength="500" autofocus placeholder="Optional note (saved with the snap)"></textarea>
+  </div>
+  <label class="toggle"><input type="checkbox" id="deskew-toggle"> Also save deskewed copy</label>
+  <button id="snap-btn">SNAP</button>
+  <div class="hint">Type a note, press ENTER (or tap SNAP). Scanning fills Block ID. Both clear after each capture.</div>
+</div>
+<script>
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  let tick = 0;
+  let busy = false;
+
+  // Poll the same preview endpoint the main kiosk uses.
+  setInterval(() => { tick += 1; $("preview").src = "/preview-frame?t=" + tick; }, 250);
+
+  function setStatus(text, cls) { $("status").textContent = text; $("status").className = cls || ""; }
+
+  async function snap() {
+    if (busy) return;
+    busy = true;
+    $("snap-btn").disabled = true;
+    setStatus("Capturing…", "busy");
+    const blockId = $("block-id").value.trim();
+    const note = $("note").value.trim();
+    const text = [blockId && ("block " + blockId), note].filter(Boolean).join(" | ");
+    try {
+      const resp = await fetch("/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Toggle on: raw + deskewed pair via the deskew verb; off: one plain still.
+        body: JSON.stringify({
+          name: $("deskew-toggle").checked ? "deskew_quiet" : "snap_quiet",
+          args: text ? [text] : [],
+        }),
+      });
+      const body = await resp.json();
+      if (body.ok) {
+        setStatus(body.result, "ok");
+        $("block-id").value = "";
+        $("note").value = "";
+      }
+      else setStatus("Failed: " + (body.error || resp.status), "err");
+    } catch (err) {
+      setStatus("Failed: " + err, "err");
+    } finally {
+      busy = false;
+      $("snap-btn").disabled = false;
+    }
+  }
+
+  $("snap-btn").addEventListener("click", () => snap());
+
+  // Enter always captures; a scanner burst (fast keys + Enter) fills Block ID instead.
+  const SCAN_GAP_MS = 30;     // scanner keys arrive faster than human typing
+  const SCAN_MIN_CHARS = 4;
+  let burst = "";
+  let lastKeyAt = 0;
+
+  function focusNote() { $("note").focus(); }
+
+  // Remove the scanned chars from whichever box they were typed into.
+  function stripScan(text) {
+    const el = document.activeElement;
+    if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return;
+    const pos = el.selectionStart;
+    if (el.value.slice(pos - text.length, pos) === text) {
+      el.value = el.value.slice(0, pos - text.length) + el.value.slice(pos);
+    }
+  }
+
+  document.addEventListener("keydown", (e) => {
+    const now = performance.now();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const isScan = burst.length >= SCAN_MIN_CHARS && now - lastKeyAt < 100;
+      if (isScan) {
+        stripScan(burst);
+        $("block-id").value = burst;
+      } else if (!e.repeat) {
+        snap();
+      }
+      burst = "";
+      focusNote();
+      return;
+    }
+    if (e.key.length === 1) {
+      burst = now - lastKeyAt < SCAN_GAP_MS ? burst + e.key : e.key;
+      lastKeyAt = now;
+    }
+  });
+
+  $("snap-btn").addEventListener("click", focusNote);
+
+  // Remember the deskew toggle per browser (best-effort).
+  try { $("deskew-toggle").checked = localStorage.getItem("snapDeskew") === "1"; } catch (e) {}
+  $("deskew-toggle").addEventListener("change", (e) => {
+    try { localStorage.setItem("snapDeskew", e.target.checked ? "1" : "0"); } catch (err) {}
+    focusNote();
+  });
+  focusNote();
+</script>
+</body>
+</html>

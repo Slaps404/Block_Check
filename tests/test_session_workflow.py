@@ -1,5 +1,5 @@
 """Highest-level acceptance test for the fake-hardware session workflow,
-covering startup through summary and explicit finalization (#93-#100)."""
+covering startup through summary and explicit finalization."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -16,12 +16,6 @@ import contact_sheet
 import numpy as np
 import pytest
 
-from camera_calibration import (
-    ActivatedCameraMode,
-    CalibrationQuality,
-    LockedCameraControls,
-    PhaseCameraCalibration,
-)
 import session.workflow as session_workflow_module
 
 from capture_runtime import CaptureController
@@ -30,7 +24,6 @@ from capture_storage import CaptureRecord, CaptureStore
 from session.pipeline import decide_claim
 from session.preparation import PreparationFailure, PreparedSpecimen
 from session.session_mode import SessionMode
-from session.workflow_types import SessionIdentity
 from slide.qr import DecodeCandidate, select_slide_identity
 from session.workflow import (
     FramingCalibrationStore,
@@ -42,9 +35,51 @@ from session.workflow import (
     UploadReceipt,
     default_work_order_scorer,
 )
+from store_harness import (  # noqa: F401
+    lightweight_slide_qc,
+    lightweight_qc_artifacts,
+    fake_fingerprint_builder as _fake_fingerprint_builder,
+    fake_score_cache_builder as _fake_score_cache_builder,
+    full_res_capture as _capture,
+    valid_slide_result as _valid_slide_result,
+    FastPreprocessor,
+    StubContactSheetRenderer,
+    StubWorkOrderScorer,
+    ToggleTransport,
+    _FakeResultsRowsStore,
+    _drain_to_slides,
+    _evaluable_block,
+    _identical_mask_slide_preprocessor,
+    _results_workflow,
+    upload_block,
+)
+from capture_fakes import FakePhaseCamera
 
 
 STARTED_AT = datetime(2026, 7, 2, 18, 5, 6, tzinfo=timezone.utc)
+
+
+def _workflow(tmp_path, session, store, **kwargs):
+    """SessionWorkflow with the usual test outbox, offline ToggleTransport
+    and fake phase camera; any of the three can be overridden."""
+    if "outbox" not in kwargs:
+        kwargs["outbox"] = PiOutbox(tmp_path / "outbox")
+    if "transport" not in kwargs:
+        kwargs["transport"] = ToggleTransport(store)
+    if "camera" not in kwargs:
+        kwargs["camera"] = FakePhaseCamera()
+    return SessionWorkflow(session=session, store=store, **kwargs)
+
+
+class _CountingPreprocessor:
+    """Succeeds immediately with a full mask and counts its calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, capture_path):
+        self.calls += 1
+        return np.full((8, 8), 255, dtype=np.uint8), {"method": "test"}
 
 
 def test_restore_pending_block_rearms_block_capture_but_rejects_slide_mode():
@@ -57,27 +92,6 @@ def test_restore_pending_block_rearms_block_capture_but_rejects_slide_mode():
     slide_session = CaptureSession(mode="slide")
     with pytest.raises(RuntimeError, match="block mode"):
         slide_session.restore_pending_block("51151378")
-
-
-class FakePhaseCamera:
-    def __init__(self):
-        self.actions = []
-
-    def activate_mode(self, mode):
-        self.actions.append(("activate", mode))
-        calibration = PhaseCameraCalibration(
-            mode=mode,
-            controls=LockedCameraControls(1, 1.0, (1.0, 1.0)),
-            quality=CalibrationQuality(
-                True, 1, 0, 0.0, 0.0, 0.0, 0.0, 220.0, 0.0, 0.0
-            ),
-            metadata_samples=(),
-        )
-        return ActivatedCameraMode(calibration, f"{mode}-baseline-{len(self.actions)}")
-
-
-def _prepare_block_backlight(workflow: SessionWorkflow) -> None:
-    workflow.prepare_empty_backlight("block")
 
 
 def _prepare_slide_backlight(workflow: SessionWorkflow) -> None:
@@ -93,45 +107,11 @@ class FakeStillCamera:
         pass
 
 
-class ToggleTransport:
-    def __init__(self, store):
-        self.store = store
-        self.connected = False
-
-    def status(self, session_number):
-        if not self.connected:
-            raise ConnectionRefusedError("offline")
-        return {"session_number": session_number}
-
-    def upload(self, session_number, capture):
-        if not self.connected:
-            raise ConnectionRefusedError("offline")
-        return self.store.receive_capture(
-            session_number,
-            capture_id=capture.capture_id,
-            block_id=capture.block_id,
-            checksum=capture.checksum,
-            body=capture.path.read_bytes(),
-        )
-
-
-class FastPreprocessor:
-    def __call__(self, capture_path):
-        assert capture_path.is_file()
-        return np.full((8, 8), 255, dtype=np.uint8), {"method": "test"}
-
-
 def test_session_orders_block_drain_and_slide_modes_with_fresh_baselines(tmp_path):
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
     camera = FakePhaseCamera()
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=camera,
-    )
+    workflow = _workflow(tmp_path, session, store, camera=camera)
 
     assert workflow.snapshot().phase == "blocks"
     assert camera.actions == []  # deferred — no ctor activate
@@ -181,13 +161,7 @@ def test_failed_slide_activation_invalidates_block_camera_state(tmp_path):
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
     camera = FailingSlideCamera()
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=camera,
-    )
+    workflow = _workflow(tmp_path, session, store, camera=camera)
 
     workflow.prepare_empty_backlight("block")
     workflow.finish_blocks()
@@ -207,7 +181,10 @@ def test_failed_slide_activation_invalidates_block_camera_state(tmp_path):
 
 
 def test_slide_capture_persists_validated_identity_and_full_decode_audit(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     decoded = select_slide_identity((
         DecodeCandidate("zxing", "QRCode", "raw", "malformed"),
@@ -215,14 +192,7 @@ def test_slide_capture_persists_validated_identity_and_full_decode_audit(tmp_pat
             "zxing", "DataMatrix", "label+raw", "12080_51137181_01_HE"
         ),
     ))
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: decoded,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: decoded)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -254,20 +224,16 @@ def test_slide_capture_persists_validated_identity_and_full_decode_audit(tmp_pat
 
 
 def test_scanned_payload_overrides_slide_decoder_and_persists_identity(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
 
     def unexpected_decoder(_image):
         raise AssertionError("slide decoder must not run for scanned payload")
 
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=unexpected_decoder,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=unexpected_decoder)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -295,14 +261,7 @@ def test_invalid_scanned_payload_fails_without_calling_slide_decoder(
         raise AssertionError("slide decoder must not run for scanned payload")
 
     monkeypatch.setattr(session_workflow_module, "sleep", lambda _seconds: None)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=unexpected_decoder,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=unexpected_decoder)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -327,14 +286,7 @@ def test_failed_slide_decode_waits_for_quiet_window_before_prompt(
     slept = []
     monkeypatch.setattr(session_workflow_module, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(session_workflow_module, "sleep", slept.append)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -350,39 +302,10 @@ def test_failed_slide_decode_waits_for_quiet_window_before_prompt(
     assert event.message == "Reposition slide"
 
 
-def test_session_workflow_defaults_to_real_clock(tmp_path):
-    """#171: omitting `clock=` must not raise, and production still measures
-    real (>=0) per-stage slide durations via the default wall clock, mirroring
-    `CaptureController(clock=...)` (capture_runtime.py)."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-    )
-    workflow.finish_blocks()
-    _prepare_slide_backlight(workflow)
-
-    result = workflow.capture_slide(
-        _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT,
-        scanned_payload="12080_51137181_01_HE",
-    )
-
-    assert result.success is True
-    timings = workflow.last_slide_stage_timings
-    assert timings.decode_ms >= 0
-    assert timings.outbox_ms >= 0
-    assert timings.send_ms >= 0
-
-
 def test_capture_slide_stamps_exact_decode_outbox_send_durations_against_scripted_clock(
     tmp_path,
 ):
-    """#171: decode, outbox-write, and send-to-main-computer are each measured
+    """Decode, outbox-write, and send-to-main-computer are each measured
     off an injectable `clock=` seam (identical prior art to
     `CaptureController(clock=...)`), against exact scripted durations rather
     than a loose `>= 0` check.
@@ -397,7 +320,10 @@ def test_capture_slide_stamps_exact_decode_outbox_send_durations_against_scripte
       7. (any further/final clock read, e.g. the existing decode
          audit `duration_ms` end-of-call reading)
     """
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     schedule = iter([
         0.000,
@@ -412,14 +338,7 @@ def test_capture_slide_stamps_exact_decode_outbox_send_durations_against_scripte
     def scripted_clock() -> float:
         return next(schedule)
 
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        clock=scripted_clock,
-    )
+    workflow = _workflow(tmp_path, session, store, clock=scripted_clock)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -446,14 +365,7 @@ def test_unreadable_slide_reposition_state_is_restored_after_restart(
     clock = iter((10.0, 10.2, 11.5))
     monkeypatch.setattr(session_workflow_module, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(session_workflow_module, "sleep", lambda seconds: None)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -462,12 +374,8 @@ def test_unreadable_slide_reposition_state_is_restored_after_restart(
     )
 
     restarted_store = ProcessingStore(root)
-    restarted = SessionWorkflow(
-        session=restarted_store.resume_session(session.number),
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(restarted_store),
-        camera=FakePhaseCamera(),
+    restarted = _workflow(
+        tmp_path, restarted_store.resume_session(session.number), restarted_store,
     )
     _prepare_slide_backlight(restarted)
     capture_session = CaptureSession(SessionConfig(baseline_frames=1), mode="slide")
@@ -487,13 +395,7 @@ def test_recovered_unreadable_slide_can_be_skipped_before_baseline(tmp_path):
     root = tmp_path / "processing"
     store = ProcessingStore(root)
     session = store.start_session(started_at=STARTED_AT)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
     store.record_slide_capture(
@@ -504,12 +406,8 @@ def test_recovered_unreadable_slide_can_be_skipped_before_baseline(tmp_path):
         duration_ms=1500.0,
     )
     restarted_store = ProcessingStore(root)
-    restarted = SessionWorkflow(
-        session=restarted_store.resume_session(session.number),
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(restarted_store),
-        camera=FakePhaseCamera(),
+    restarted = _workflow(
+        tmp_path, restarted_store.resume_session(session.number), restarted_store,
     )
     _prepare_slide_backlight(restarted)
     capture_session = CaptureSession(SessionConfig(baseline_frames=1), mode="slide")
@@ -535,14 +433,7 @@ def test_removing_unreadable_slide_clears_durable_recovery_state(
     session = store.start_session(started_at=STARTED_AT)
     failed = select_slide_identity(())
     monkeypatch.setattr(session_workflow_module, "DECODE_BUDGET_SECONDS", 0.0)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -564,12 +455,8 @@ def test_removing_unreadable_slide_clears_durable_recovery_state(
     assert store.slide_recovery_state(session.number) == "waiting"
 
     restarted_store = ProcessingStore(root)
-    restarted = SessionWorkflow(
-        session=restarted_store.resume_session(session.number),
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(restarted_store),
-        camera=FakePhaseCamera(),
+    restarted = _workflow(
+        tmp_path, restarted_store.resume_session(session.number), restarted_store,
     )
     restarted_capture_session = CaptureSession(
         SessionConfig(baseline_frames=1), mode="slide"
@@ -577,6 +464,39 @@ def test_removing_unreadable_slide_clears_durable_recovery_state(
     _prepare_slide_backlight(restarted)
     restarted.restore_slide_capture_session(restarted_capture_session)
     assert restarted_capture_session.state is CaptureState.AWAITING_BASELINE_CONFIRMATION
+
+
+def test_overridden_slide_removal_clears_durable_recovery_state(tmp_path):
+    root = tmp_path / "processing"
+    store = ProcessingStore(
+        root, slide_preprocessor=_identical_mask_slide_preprocessor
+    )
+    session = store.start_session(started_at=STARTED_AT)
+    workflow = _workflow(tmp_path, session, store)
+    workflow.finish_blocks()
+    _prepare_slide_backlight(workflow)
+    store.record_slide_capture(
+        session.number,
+        _capture(tmp_path / "slide.png", 120),
+        captured_at=STARTED_AT,
+        result=_valid_slide_result("51151378"),
+        duration_ms=10.0,
+    )
+
+    capture_session = CaptureSession(
+        SessionConfig(baseline_frames=1), mode="slide"
+    )
+    capture_session.confirm_empty()
+    capture_session.accept_frame(
+        np.full((80, 120, 3), 180, dtype=np.uint8), now=0.0
+    )
+    workflow.restore_slide_capture_session(capture_session)
+    assert capture_session.state is CaptureState.WAITING_FOR_REMOVAL
+
+    capture_session.next_capture()
+
+    assert capture_session.state is CaptureState.EMPTY
+    assert store.slide_recovery_state(session.number) == "waiting"
 
 
 def test_removal_survives_recovery_state_persistence_error(
@@ -587,14 +507,7 @@ def test_removal_survives_recovery_state_persistence_error(
     session = store.start_session(started_at=STARTED_AT)
     failed = select_slide_identity(())
     monkeypatch.setattr(session_workflow_module, "DECODE_BUDGET_SECONDS", 0.0)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -629,13 +542,7 @@ def test_skipped_slide_remains_disarmed_when_removal_persistence_fails(
     root = tmp_path / "processing"
     store = ProcessingStore(root)
     session = store.start_session(started_at=STARTED_AT)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
     store.record_slide_capture(
@@ -678,14 +585,7 @@ def test_workflow_recaptures_once_after_reposition_and_skip_retains_audits(
     failed = select_slide_identity((DecodeCandidate(
         "zxing", "QRCode", "raw", "malformed"
     ),))
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
     capture_session = CaptureSession(
@@ -734,12 +634,8 @@ def test_workflow_recaptures_once_after_reposition_and_skip_retains_audits(
     assert workflow.snapshot().latest_block_id is None
 
     restarted_store = ProcessingStore(tmp_path / "processing")
-    restarted = SessionWorkflow(
-        session=restarted_store.resume_session(session.number),
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(restarted_store),
-        camera=FakePhaseCamera(),
+    restarted = _workflow(
+        tmp_path, restarted_store.resume_session(session.number), restarted_store,
     )
     restarted_capture_session = CaptureSession(
         SessionConfig(baseline_frames=1), mode="slide"
@@ -757,19 +653,15 @@ def test_workflow_recaptures_once_after_reposition_and_skip_retains_audits(
 
 
 def test_settled_slide_capture_automatically_emits_validated_identity(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     decoded = select_slide_identity((DecodeCandidate(
         "zxing", "QRCode", "raw", "12080_51137181_01_HE"
     ),))
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
-        camera=FakePhaseCamera(),
-        slide_decoder=lambda image: decoded,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: decoded)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
     capture_session = CaptureSession(
@@ -807,10 +699,7 @@ def test_finish_blocks_is_resumable_across_disconnect_and_reports_drain_counts(t
     session = store.start_session(started_at=STARTED_AT)
     outbox = PiOutbox(tmp_path / "outbox")
     transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-        camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store, outbox=outbox, transport=transport)
     assert workflow.scan_block("51151378").accepted
     outbox.publish_block(
         _capture(tmp_path / "block.png", 80), "51151378", STARTED_AT
@@ -825,12 +714,9 @@ def test_finish_blocks_is_resumable_across_disconnect_and_reports_drain_counts(t
 
     # A process restart reconstructs the durable draining phase instead of
     # defaulting to blocks or entering slides early.
-    workflow = SessionWorkflow(
-        session=store.resume_session(session.number),
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
+    workflow = _workflow(
+        tmp_path, store.resume_session(session.number), store,
         transport=transport,
-        camera=FakePhaseCamera(),
     )
     assert workflow.snapshot().phase == "draining_blocks"
 
@@ -850,7 +736,7 @@ def test_finish_blocks_is_resumable_across_disconnect_and_reports_drain_counts(t
 
 
 def test_failed_block_auto_unusable_on_drain_enters_slides(tmp_path):
-    """#187: a failed segment must not stall Finish Blocks on Processing…"""
+    """A failed segment must not stall Finish Blocks on Processing…"""
 
     def fail(_capture_path):
         raise ValueError("specimen could not be segmented")
@@ -859,13 +745,7 @@ def test_failed_block_auto_unusable_on_drain_enters_slides(tmp_path):
     session = store.start_session(started_at=STARTED_AT)
     transport = ToggleTransport(store)
     transport.connected = True
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=transport,
-        camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store, transport=transport)
     workflow.capture_block(
         "51151378", _capture(tmp_path / "failed.png", 80), captured_at=STARTED_AT
     )
@@ -886,23 +766,8 @@ def test_failed_block_auto_unusable_on_drain_enters_slides(tmp_path):
     )
 
 
-def _fake_fingerprint_builder(mask):
-    from verify.invariant_descriptors import DescriptorValue
-    return {"fake_v1": DescriptorValue(vector=np.array([1.0]), construction_ns=1)}
-
-
-def _fake_score_cache_builder(specimen):
-    from verify.scorer import LockedScoreCache, _ComponentFeatures
-    return LockedScoreCache(
-        normalized_mask=specimen.mask,
-        component_features=_ComponentFeatures(
-            points=np.zeros((0, 2)), areas=np.zeros(0), shapes=np.zeros((0, 3)),
-        ),
-    )
-
-
 def test_finish_blocks_in_hybrid_mode_freezes_pool_with_two_usable_blocks(tmp_path):
-    """#250: Finish Blocks in HYBRID mode freezes the Hybrid Candidate Pool
+    """Finish Blocks in HYBRID mode freezes the Hybrid Candidate Pool
     instead of unconditionally entering slides."""
     store = ProcessingStore(
         tmp_path / "processing", preprocessor=FastPreprocessor(),
@@ -912,15 +777,15 @@ def test_finish_blocks_in_hybrid_mode_freezes_pool_with_two_usable_blocks(tmp_pa
     session = store.start_session(started_at=STARTED_AT)
     transport = ToggleTransport(store)
     transport.connected = True
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=PiOutbox(tmp_path / "outbox"),
-        transport=transport, camera=FakePhaseCamera(),
+    workflow = _workflow(
+        tmp_path, session, store,
+        transport=transport,
         session_mode=SessionMode.HYBRID,
         hybrid_descriptor_names=("fake_v1",),
     )
-    # #269: Hybrid now requires the same real work-order bracket Open
-    # Retrieval already has -- freeze_hybrid_pool resolves the open
-    # (capturing) work order internally and keys the pool on it.
+    # Hybrid requires the same real work-order bracket as Open Retrieval:
+    # freeze_hybrid_pool resolves the open (capturing) work order internally
+    # and keys the pool on it.
     work_order_id = workflow.start_work_order()
     workflow.capture_block(
         "51151378", _capture(tmp_path / "b1.png", 10), captured_at=STARTED_AT
@@ -940,7 +805,7 @@ def test_finish_blocks_in_hybrid_mode_freezes_pool_with_two_usable_blocks(tmp_pa
 
 
 def test_finish_blocks_in_hybrid_mode_with_one_block_returns_to_blocks(tmp_path):
-    """#250: fewer than two usable blocks does not freeze, does not abandon,
+    """Fewer than two usable blocks does not freeze, does not abandon,
     and leaves the work order usable (back to the blocks phase)."""
     store = ProcessingStore(
         tmp_path / "processing", preprocessor=FastPreprocessor(),
@@ -950,9 +815,9 @@ def test_finish_blocks_in_hybrid_mode_with_one_block_returns_to_blocks(tmp_path)
     session = store.start_session(started_at=STARTED_AT)
     transport = ToggleTransport(store)
     transport.connected = True
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=PiOutbox(tmp_path / "outbox"),
-        transport=transport, camera=FakePhaseCamera(),
+    workflow = _workflow(
+        tmp_path, session, store,
+        transport=transport,
         session_mode=SessionMode.HYBRID,
         hybrid_descriptor_names=("fake_v1",),
     )
@@ -975,7 +840,7 @@ def test_finish_blocks_in_hybrid_mode_with_one_block_returns_to_blocks(tmp_path)
 def test_finish_blocks_in_normal_and_open_retrieval_modes_never_touch_hybrid_pool(
     tmp_path, session_mode
 ):
-    """#250 acceptance criterion: NORMAL/OPEN_RETRIEVAL Finish Blocks behavior
+    """NORMAL/OPEN_RETRIEVAL Finish Blocks behavior
     is unchanged -- a single captured block still enters slides directly
     (no Hybrid >=2 usable-block requirement), and no Hybrid Candidate Pool is
     ever created."""
@@ -983,9 +848,10 @@ def test_finish_blocks_in_normal_and_open_retrieval_modes_never_touch_hybrid_poo
     session = store.start_session(started_at=STARTED_AT)
     transport = ToggleTransport(store)
     transport.connected = True
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=PiOutbox(tmp_path / "outbox"),
-        transport=transport, camera=FakePhaseCamera(), session_mode=session_mode,
+    workflow = _workflow(
+        tmp_path, session, store,
+        transport=transport,
+        session_mode=session_mode,
     )
     workflow.capture_block(
         "51151378", _capture(tmp_path / "b1.png", 10), captured_at=STARTED_AT
@@ -995,11 +861,9 @@ def test_finish_blocks_in_normal_and_open_retrieval_modes_never_touch_hybrid_poo
     finished = workflow.finish_blocks()
 
     assert finished.phase == "slides"
-    # #269 FIX5b: `hybrid_pool`'s parameter is `work_order_id`, not
-    # `session_number` -- passing `session.number` here is a semantically
-    # wrong negative control that only ever passed vacuously (`hybrid_pools`
-    # is empty for NORMAL/OPEN_RETRIEVAL regardless of which id is queried).
-    # Assert the real invariant directly against the table instead.
+    # `hybrid_pool` is keyed by `work_order_id`, so querying it by
+    # `session.number` would pass vacuously. Assert the real invariant
+    # directly against the table instead.
     with store._connect() as db:
         count = db.execute("SELECT COUNT(*) AS n FROM hybrid_pools").fetchone()["n"]
     assert count == 0
@@ -1010,12 +874,10 @@ def test_framing_calibration_is_durable_and_explicitly_replaced(tmp_path):
     calibration = FramingCalibrationStore(path)
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store),
+    workflow = _workflow(
+        tmp_path, session, store,
         framing_calibration=calibration,
+        camera=None,
     )
     assert workflow.view_framing_calibration() is None
 
@@ -1034,54 +896,16 @@ def test_framing_calibration_is_durable_and_explicitly_replaced(tmp_path):
     ]
 
 
-_CAPTURE_PNGS: dict[int, bytes] = {}
-
-
-def _capture(path: Path, value: int) -> Path:
-    encoded = _CAPTURE_PNGS.get(value)
-    if encoded is None:
-        image = np.full((3040, 4056, 3), value, dtype=np.uint8)
-        success, png = cv2.imencode(".png", image)
-        assert success
-        encoded = png.tobytes()
-        _CAPTURE_PNGS[value] = encoded
-    path.write_bytes(encoded)
-    return path
-
-
 _REAL_WRITE_QC = ProcessingStore._write_qc
 
 
 @pytest.fixture(autouse=True)
-def lightweight_qc_artifacts(monkeypatch):
-    """Keep workflow tests focused on artifact lifecycle, not large rendering."""
-    def write_qc(capture, mask, destination):
-        assert capture.is_file()
-        assert mask.ndim == 2
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_failure_qc(capture, reason, destination):
-        assert capture.is_file()
-        assert reason
-        panel = np.full((8, 8, 3), (0, 0, 180), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_slide_qc(image, mask, destination):
-        assert image.ndim == 3
-        assert mask.ndim == 2
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    monkeypatch.setattr(ProcessingStore, "_write_qc", staticmethod(write_qc))
-    monkeypatch.setattr(
-        ProcessingStore, "_write_failure_qc", staticmethod(write_failure_qc)
-    )
-    monkeypatch.setattr(
-        ProcessingStore, "_write_slide_qc", staticmethod(write_slide_qc)
-    )
+def _lightweight_qc(lightweight_qc_artifacts, lightweight_slide_qc):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into both shared harness QC fixtures."""
 
 
+@pytest.mark.native_resolution
 def test_real_qc_writer_creates_full_resolution_three_panel(tmp_path):
     capture = _capture(tmp_path / "capture.png", 80)
     mask = np.full((3040, 4056), 255, dtype=np.uint8)
@@ -1116,11 +940,11 @@ def test_block_runs_from_durable_outbox_through_loopback_preprocessing(tmp_path)
     session = store.start_session(started_at=STARTED_AT)
 
     with LoopbackCaptureReceiver(store) as receiver:
-        workflow = SessionWorkflow(
-            session=session,
-            store=store,
+        workflow = _workflow(
+            tmp_path, session, store,
             outbox=PiOutbox(tmp_path / "pi-outbox"),
             transport=HttpCaptureClient(receiver.url),
+            camera=None,
         )
         first = workflow.capture_block(
             "51151378", _capture(tmp_path / "first.png", 80), captured_at=STARTED_AT
@@ -1198,15 +1022,7 @@ def test_receiver_rejects_bad_checksum_without_acknowledging_or_queueing(tmp_pat
 
 
 def test_repeated_capture_id_returns_receipt_without_duplicate_job(tmp_path):
-    class ImmediatePreprocessor:
-        def __init__(self):
-            self.calls = 0
-
-        def __call__(self, capture_path):
-            self.calls += 1
-            return np.full((8, 8), 255, dtype=np.uint8), {"method": "test"}
-
-    preprocessor = ImmediatePreprocessor()
+    preprocessor = _CountingPreprocessor()
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
     outbox = PiOutbox(tmp_path / "outbox")
@@ -1280,11 +1096,10 @@ def test_pi_restart_replays_pending_captures_in_capture_order(tmp_path):
 def test_capture_continues_while_receiver_is_unreachable(tmp_path):
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
-    workflow = SessionWorkflow(
-        session=session,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
+    workflow = _workflow(
+        tmp_path, session, store,
         transport=HttpCaptureClient("http://127.0.0.1:1", timeout=0.1),
+        camera=None,
     )
 
     assert workflow.capture_block(
@@ -1299,14 +1114,6 @@ def test_capture_continues_while_receiver_is_unreachable(tmp_path):
 
 
 def test_receiver_restart_resumes_same_session_and_queued_job(tmp_path):
-    class ImmediatePreprocessor:
-        def __init__(self):
-            self.calls = 0
-
-        def __call__(self, capture_path):
-            self.calls += 1
-            return np.full((8, 8), 255, dtype=np.uint8), {"recovered": True}
-
     root = tmp_path / "processing"
     first_store = ProcessingStore(root, recover_jobs=False)
     session = first_store.start_session(started_at=STARTED_AT)
@@ -1324,7 +1131,7 @@ def test_receiver_restart_resumes_same_session_and_queued_job(tmp_path):
         start_job=False,
     )
 
-    preprocessor = ImmediatePreprocessor()
+    preprocessor = _CountingPreprocessor()
     restarted = ProcessingStore(root, preprocessor=preprocessor)
     resumed = restarted.resume_session()
     restarted.wait_for_jobs()
@@ -1336,14 +1143,6 @@ def test_receiver_restart_resumes_same_session_and_queued_job(tmp_path):
 
 
 def test_lost_ack_retry_uses_original_receipt_without_duplicate_work(tmp_path):
-    class ImmediatePreprocessor:
-        def __init__(self):
-            self.calls = 0
-
-        def __call__(self, capture_path):
-            self.calls += 1
-            return np.full((8, 8), 255, dtype=np.uint8), {}
-
     class LoseFirstAcknowledgement:
         def __init__(self, store):
             self.store = store
@@ -1365,7 +1164,7 @@ def test_lost_ack_retry_uses_original_receipt_without_duplicate_work(tmp_path):
                 raise ConnectionResetError("acknowledgement was lost")
             return receipt
 
-    preprocessor = ImmediatePreprocessor()
+    preprocessor = _CountingPreprocessor()
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
     assert store.scan_block(session.number, "51151378").accepted
@@ -1491,18 +1290,7 @@ def test_preprocessing_failure_preserves_evidence_and_does_not_stop_capture(tmp_
     preprocessor = FailingPreprocessor()
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
-    assert store.scan_block(session.number, "51151378").accepted
-    capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "failed.png", 80), "51151378", STARTED_AT
-    )
-
-    store.receive_capture(
-        session.number,
-        capture_id=capture.capture_id,
-        block_id=capture.block_id,
-        checksum=capture.checksum,
-        body=capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "51151378", 80)
     store.wait_for_jobs()
 
     failed = store.get_set(session.number, "51151378")
@@ -1541,11 +1329,10 @@ def test_successful_recapture_replaces_failed_input_once_and_clears_warning(tmp_
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
     with LoopbackCaptureReceiver(store) as receiver:
-        workflow = SessionWorkflow(
-            session=session,
-            store=store,
-            outbox=PiOutbox(tmp_path / "outbox"),
+        workflow = _workflow(
+            tmp_path, session, store,
             transport=HttpCaptureClient(receiver.url),
+            camera=None,
         )
         first = workflow.capture_block(
             "51151378", _capture(tmp_path / "first.png", 50), captured_at=STARTED_AT
@@ -1582,14 +1369,7 @@ def test_dismissal_is_auditable_and_failed_block_stays_fail_closed(tmp_path):
 
     store = ProcessingStore(tmp_path / "processing", preprocessor=fail)
     session = store.start_session(started_at=STARTED_AT)
-    assert store.scan_block(session.number, "51151378").accepted
-    capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "failed.png", 50), "51151378", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=capture.capture_id, block_id=capture.block_id,
-        checksum=capture.checksum, body=capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "51151378", 80)
     store.wait_for_jobs()
 
     store.dismiss_block(session.number, "51151378", reason="operator confirmed unusable")
@@ -1612,40 +1392,13 @@ def test_empty_preprocessing_result_is_non_evaluable_without_a_fake_mask(tmp_pat
 
     store = ProcessingStore(tmp_path / "processing", preprocessor=empty)
     session = store.start_session(started_at=STARTED_AT)
-    assert store.scan_block(session.number, "51151378").accepted
-    capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "empty.png", 50), "51151378", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=capture.capture_id, block_id=capture.block_id,
-        checksum=capture.checksum, body=capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "51151378", 80)
     store.wait_for_jobs()
 
     row = store.get_set(session.number, "51151378")
     assert row["preprocessing_status"] == "failed"
     assert row["failure_reason"] == "preprocessor returned an empty comparable mask"
     assert row["mask_path"] is None
-
-
-def _identical_mask_slide_preprocessor(_img):
-    """Deterministic evaluable slide result that mirrors ``FastPreprocessor``."""
-    return PreparedSpecimen(
-        role="slide", mask=np.full((8, 8), 255, dtype=np.uint8), roi_ok=True,
-    )
-
-
-def _evaluable_block(store, session, tmp_path, block_id="51151378"):
-    assert store.scan_block(session.number, block_id).accepted
-    capture = PiOutbox(tmp_path / "outbox_for_test").publish_block(
-        _capture(tmp_path / f"{block_id}_block.png", 80), block_id, STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=capture.capture_id, block_id=capture.block_id,
-        checksum=capture.checksum, body=capture.path.read_bytes(),
-    )
-    store.wait_for_jobs()
-    return block_id
 
 
 def test_evaluable_claim_reuses_block_mask_and_persists_pass_verdict(tmp_path):
@@ -1681,7 +1434,10 @@ def test_evaluable_claim_reuses_block_mask_and_persists_pass_verdict(tmp_path):
 
 
 def test_absent_block_id_reviews_without_scoring(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
 
     outcome = store.resolve_claim(
@@ -1711,14 +1467,7 @@ def test_dismissed_block_reviews_claim_without_invoking_scorer(tmp_path):
         slide_preprocessor=poisoned_slide_preprocessor,
     )
     session = store.start_session(started_at=STARTED_AT)
-    assert store.scan_block(session.number, "51151378").accepted
-    capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "failed.png", 50), "51151378", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=capture.capture_id, block_id=capture.block_id,
-        checksum=capture.checksum, body=capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "51151378", 80)
     store.wait_for_jobs()
     store.dismiss_block(session.number, "51151378", reason="operator confirmed unusable")
 
@@ -1739,7 +1488,7 @@ def test_dismissed_block_reviews_claim_without_invoking_scorer(tmp_path):
 def test_evaluable_claim_invokes_slide_preprocessor_exactly_once(tmp_path):
     """Complements
     `test_dismissed_block_reviews_claim_without_invoking_scorer`: pins the
-    OTHER side of af526f7's hoisted `_prepare_slide_for_artifacts` call so a
+    OTHER side of the hoisted `_prepare_slide_for_artifacts` call so a
     future change cannot "fix" the not-evaluable leak by making
     `resolve_claim` stop preparing slides altogether. An evaluable block
     must still invoke `self.slide_preprocessor` -- exactly once, never
@@ -1973,14 +1722,6 @@ def test_restart_repairs_export_after_verdict_commit(tmp_path, monkeypatch):
     assert "PASS" in export
 
 
-def _valid_slide_result(block_id):
-    return select_slide_identity((
-        DecodeCandidate(
-            "zxing", "QRCode", "raw", f"12080_{block_id}_01_HE"
-        ),
-    ))
-
-
 def test_pi_outbox_slide_filename_includes_decoded_block_id(tmp_path):
     source = _capture(tmp_path / "slide.png", 120)
     result = _valid_slide_result("51151378")
@@ -1996,7 +1737,10 @@ def test_pi_outbox_slide_filename_includes_decoded_block_id(tmp_path):
 
 
 def test_processing_store_slide_filename_includes_decoded_block_id(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     store.begin_block_drain(session.number)
     assert store.try_enter_slides(session.number)
@@ -2040,7 +1784,10 @@ def test_unresolved_slide_filename_does_not_claim_a_block_id(tmp_path, publisher
 
 
 def test_missing_block_review_is_in_decisions_export(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     store.begin_block_drain(session.number)
     assert store.try_enter_slides(session.number)
@@ -2113,15 +1860,7 @@ def test_summary_reports_processed_pass_review_counts_from_durable_state(tmp_pat
         _capture(tmp_path / "slide_pass.png", 120),
     )
     reviewed_block = "62262489"
-    assert store.scan_block(session.number, reviewed_block).accepted
-    failed_capture = PiOutbox(tmp_path / "outbox_reviewed").publish_block(
-        _capture(tmp_path / "62262489_block.png", 60), reviewed_block, STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=failed_capture.capture_id,
-        block_id=failed_capture.block_id, checksum=failed_capture.checksum,
-        body=failed_capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, reviewed_block, 60)
     store.wait_for_jobs()
     store.dismiss_block(session.number, reviewed_block, reason="operator confirmed unusable")
     store.resolve_claim(
@@ -2152,26 +1891,10 @@ def test_summary_exposes_pending_and_failed_block_detail(tmp_path):
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
     # A block whose preprocessing failed and awaits recapture/dismissal.
-    assert store.scan_block(session.number, "22222222").accepted
-    failed_capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "failed.png", 50), "22222222", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=failed_capture.capture_id,
-        block_id=failed_capture.block_id, checksum=failed_capture.checksum,
-        body=failed_capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "22222222", 50)
     store.wait_for_jobs()
     # A block still mid-preprocessing: pending work, not yet decided.
-    assert store.scan_block(session.number, "11111111").accepted
-    pending_capture = PiOutbox(tmp_path / "outbox2").publish_block(
-        _capture(tmp_path / "pending.png", 51), "11111111", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=pending_capture.capture_id,
-        block_id=pending_capture.block_id, checksum=pending_capture.checksum,
-        body=pending_capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "11111111", 51)
     assert held.wait(timeout=5)
 
     summary = store.summarize(session)
@@ -2196,7 +1919,7 @@ def test_summary_exposes_missing_slides_once_blocks_are_ready(tmp_path):
 
 
 def test_summary_exposes_blocks_captured_even_when_nothing_scored(tmp_path):
-    # #188: sets_processed only counts verdicted pairs, so a session with real
+    # sets_processed only counts verdicted pairs, so a session with real
     # blocks captured and zero slides scored yet must still surface a nonzero
     # "there is work here" signal via blocks_captured.
     store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
@@ -2211,22 +1934,14 @@ def test_summary_exposes_blocks_captured_even_when_nothing_scored(tmp_path):
 
 
 def test_summary_excludes_dismissed_blocks_from_blocks_captured(tmp_path):
-    # #188: a dismissed (resolved-unusable) block is not work left to resume --
+    # A dismissed (resolved-unusable) block is not work left to resume --
     # an all-dismissed session must not misreport blocks_captured > 0.
     def preprocessor(capture_path):
         raise ValueError("no tissue found")
 
     store = ProcessingStore(tmp_path / "processing", preprocessor=preprocessor)
     session = store.start_session(started_at=STARTED_AT)
-    assert store.scan_block(session.number, "22222222").accepted
-    failed_capture = PiOutbox(tmp_path / "outbox").publish_block(
-        _capture(tmp_path / "failed.png", 50), "22222222", STARTED_AT
-    )
-    store.receive_capture(
-        session.number, capture_id=failed_capture.capture_id,
-        block_id=failed_capture.block_id, checksum=failed_capture.checksum,
-        body=failed_capture.path.read_bytes(),
-    )
+    upload_block(store, session.number, "22222222", 50)
     store.wait_for_jobs()
     store.dismiss_block(session.number, "22222222", reason="operator confirmed unusable")
 
@@ -2235,15 +1950,12 @@ def test_summary_excludes_dismissed_blocks_from_blocks_captured(tmp_path):
     assert summary.blocks_captured == 0
 
 
-def test_summary_exposes_skipped_slide_decodes(tmp_path):
+def test_summary_exposes_skipped_slide_decodes(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_workflow_module, "sleep", lambda _seconds: None)
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
     failed = select_slide_identity(())
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(store), camera=FakePhaseCamera(),
-        slide_decoder=lambda image: failed,
-    )
+    workflow = _workflow(tmp_path, session, store, slide_decoder=lambda image: failed)
     workflow.finish_blocks()
     _prepare_slide_backlight(workflow)
 
@@ -2260,10 +1972,7 @@ def test_workflow_summary_includes_outbox_pending_uploads(tmp_path):
     store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
     session = store.start_session(started_at=STARTED_AT)
     outbox = PiOutbox(tmp_path / "outbox")
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox,
-        transport=ToggleTransport(store), camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store, outbox=outbox)
     assert workflow.scan_block("51151378").accepted
     outbox.publish_block(_capture(tmp_path / "block.png", 80), "51151378", STARTED_AT)
 
@@ -2282,10 +1991,7 @@ def _session_ready_for_slides(tmp_path, *, preprocessor=None, slide_preprocessor
     session = store.start_session(started_at=STARTED_AT)
     outbox = PiOutbox(tmp_path / "outbox")
     transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-        camera=FakePhaseCamera(),
-    )
+    workflow = _workflow(tmp_path, session, store, outbox=outbox, transport=transport)
     drained = workflow.finish_blocks()
     assert drained.phase == "slides"
     return store, session, outbox, transport, workflow
@@ -2313,39 +2019,21 @@ def test_end_session_blocks_further_slide_capture(tmp_path):
 
 def test_full_lifecycle_finalizes_with_verified_exports_and_pi_cleanup(tmp_path):
     block_id = "51151378"
-    store2 = ProcessingStore(
-        tmp_path / "processing2", preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-    )
-    session2 = store2.start_session(started_at=STARTED_AT)
-    outbox2 = PiOutbox(tmp_path / "outbox2")
-    transport2 = ToggleTransport(store2)
-    workflow2 = SessionWorkflow(
-        session=session2, store=store2, outbox=outbox2, transport=transport2,
-        camera=FakePhaseCamera(),
-    )
-    transport2.connected = True
-    receipt = workflow2.capture_block(
-        block_id, _capture(tmp_path / "block.png", 80), captured_at=STARTED_AT
-    )
-    assert receipt is not None and receipt.acknowledged
-    store2.wait_for_jobs()
-    assert workflow2.finish_blocks().phase == "slides"
+    store, session, _transport, workflow = _captured_block_session(tmp_path, block_id)
 
-    outcome_slide = _capture(tmp_path / "slide.png", 120)
-    claim = store2.resolve_claim(
-        session2.number, block_id, "slide_capture_1", outcome_slide
+    claim = store.resolve_claim(
+        session.number, block_id, "slide_capture_1", _capture(tmp_path / "slide.png", 120)
     )
     assert claim.verdict == "PASS"
 
-    summary = workflow2.summarize()
+    summary = workflow.summarize()
     assert summary.sets_processed == 1
     assert summary.pass_count == 1
 
-    final = workflow2.end_session(confirm=True)
+    final = workflow.end_session(confirm=True)
 
     assert final.phase == "finalized"
-    session_dir = session2.directory
+    session_dir = session.directory
     manifest = (session_dir / "manifest.csv").read_text(encoding="utf-8")
     assert block_id in manifest and "PASS" in manifest
     decisions = (session_dir / "decisions.csv").read_text(encoding="utf-8")
@@ -2355,143 +2043,43 @@ def test_full_lifecycle_finalizes_with_verified_exports_and_pi_cleanup(tmp_path)
     assert session_meta["finalized_at"]
     # The one durable Pi capture was acknowledged, so it must be gone after
     # finalization confirms the processing computer's copy is safe.
-    assert outbox2.entries() == ()
-    kinds = [event.kind for event in workflow2.events()]
+    assert workflow.outbox.entries() == ()
+    kinds = [event.kind for event in workflow.events()]
     assert "session_finalized" in kinds
 
 
-def test_finalization_survives_restart_and_completes_once_resolved(tmp_path):
-    block_id = "51151378"
-    store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
-    session = store.start_session(started_at=STARTED_AT)
-    outbox = PiOutbox(tmp_path / "outbox")
-    transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-        camera=FakePhaseCamera(),
+def _captured_block_session(tmp_path, block_id="51151378"):
+    """One acknowledged, preprocessed block capture, drained into slides."""
+    store = ProcessingStore(
+        tmp_path / "processing", preprocessor=FastPreprocessor(),
+        slide_preprocessor=_identical_mask_slide_preprocessor,
     )
+    session = store.start_session(started_at=STARTED_AT)
+    transport = ToggleTransport(store)
     transport.connected = True
-    workflow.capture_block(
+    workflow = _workflow(tmp_path, session, store, transport=transport)
+    receipt = workflow.capture_block(
         block_id, _capture(tmp_path / "block.png", 80), captured_at=STARTED_AT
     )
+    assert receipt is not None and receipt.acknowledged
     store.wait_for_jobs()
     assert workflow.finish_blocks().phase == "slides"
-    row = store.get_set(session.number, block_id)
+    return store, session, transport, workflow
+
+
+def test_finalization_rejects_corruption_durably_and_completes_after_restart(tmp_path):
+    store, session, transport, workflow = _captured_block_session(tmp_path)
+    row = store.get_set(session.number, "51151378")
     original_bytes = Path(row["capture_path"]).read_bytes()
-    Path(row["capture_path"]).write_bytes(b"corrupted before the first finalize attempt")
+    # Simulate storage-layer bit rot of the durably stored capture.
+    Path(row["capture_path"]).write_bytes(b"not a real capture anymore")
 
     interrupted = workflow.end_session(confirm=True)
+
     assert interrupted.phase == "finalizing"
-
-    # A restart reconstructs the still-unfinalized session instead of losing
-    # track of the fact that finalization was already requested.
-    restarted = SessionWorkflow(
-        session=store.resume_session(session.number),
-        store=store, outbox=PiOutbox(tmp_path / "outbox"), transport=transport,
-        camera=FakePhaseCamera(),
-    )
-    assert restarted.snapshot().phase == "finalizing"
-
-    # The underlying storage issue is fixed, so the next poll can complete.
-    Path(row["capture_path"]).write_bytes(original_bytes)
-    finished = restarted.poll_finalization()
-
-    assert finished.phase == "finalized"
-
-
-def test_finalization_rejects_corrupted_capture_and_stays_resumable(tmp_path):
-    block_id = "51151378"
-    # Build one durable, acknowledged block capture the normal way, then
-    # corrupt the durably stored file to simulate storage-layer bit rot.
-    store2 = ProcessingStore(tmp_path / "processing_corrupt", preprocessor=FastPreprocessor())
-    session2 = store2.start_session(started_at=STARTED_AT)
-    outbox2 = PiOutbox(tmp_path / "outbox_corrupt")
-    transport2 = ToggleTransport(store2)
-    workflow2 = SessionWorkflow(
-        session=session2, store=store2, outbox=outbox2, transport=transport2,
-        camera=FakePhaseCamera(),
-    )
-    transport2.connected = True
-    workflow2.capture_block(
-        block_id, _capture(tmp_path / "corrupt_block.png", 80), captured_at=STARTED_AT
-    )
-    store2.wait_for_jobs()
-    assert workflow2.finish_blocks().phase == "slides"
-    row = store2.get_set(session2.number, block_id)
-    Path(row["capture_path"]).write_bytes(b"not a real capture anymore")
-
-    result = workflow2.end_session(confirm=True)
-
-    assert result.phase == "finalizing"
-    kinds = [event.kind for event in workflow2.events()]
+    kinds = [event.kind for event in workflow.events()]
     assert "finalization_verification_failed" in kinds
-    assert outbox2.entries() != ()  # nothing was deleted on a failed verification
-
-
-def test_export_failure_keeps_finalization_recoverable_before_pi_cleanup(
-    tmp_path, monkeypatch
-):
-    block_id = "51151378"
-    store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
-    session = store.start_session(started_at=STARTED_AT)
-    outbox = PiOutbox(tmp_path / "outbox")
-    transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-        camera=FakePhaseCamera(),
-    )
-    transport.connected = True
-    workflow.capture_block(
-        block_id, _capture(tmp_path / "block.png", 80), captured_at=STARTED_AT
-    )
-    store.wait_for_jobs()
-    assert workflow.finish_blocks().phase == "slides"
-
-    original_export = store._refresh_manifest_export
-    attempts = 0
-
-    def fail_once(session_identity):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise OSError("simulated export failure")
-        original_export(session_identity)
-
-    monkeypatch.setattr(store, "_refresh_manifest_export", fail_once)
-
-    with pytest.raises(OSError, match="simulated export failure"):
-        workflow.end_session(confirm=True)
-
-    assert workflow.snapshot().phase == "finalizing"
-    assert outbox.entries() != ()
-
-    finished = workflow.poll_finalization()
-
-    assert finished.phase == "finalized"
-    assert outbox.entries() == ()
-    assert attempts == 2
-
-
-def test_finalization_failure_reason_is_durable_across_restart(tmp_path):
-    block_id = "51151378"
-    store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
-    session = store.start_session(started_at=STARTED_AT)
-    outbox = PiOutbox(tmp_path / "outbox")
-    transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-        camera=FakePhaseCamera(),
-    )
-    transport.connected = True
-    workflow.capture_block(
-        block_id, _capture(tmp_path / "block.png", 80), captured_at=STARTED_AT
-    )
-    store.wait_for_jobs()
-    assert workflow.finish_blocks().phase == "slides"
-    row = store.get_set(session.number, block_id)
-    Path(row["capture_path"]).write_bytes(b"not a real capture anymore")
-
-    workflow.end_session(confirm=True)
+    assert workflow.outbox.entries() != ()  # nothing deleted on a failed verification
     original_error = store.summarize(session).finalization_error
     assert original_error is not None
     assert str(row["capture_path"]) in original_error
@@ -2502,12 +2090,24 @@ def test_finalization_failure_reason_is_durable_across_restart(tmp_path):
         (session.directory / "session.json").read_text(encoding="utf-8")
     )
     assert session_meta["last_finalization_error"] == original_error
-
-    restarted_store = ProcessingStore(tmp_path / "processing", preprocessor=FastPreprocessor())
+    restarted_store = ProcessingStore(
+        tmp_path / "processing", preprocessor=FastPreprocessor(), recover_jobs=False,
+    )
     resumed_summary = restarted_store.summarize(
         restarted_store.resume_session(session.number)
     )
     assert resumed_summary.finalization_error == original_error
+
+    # A restart reconstructs the still-unfinalized session instead of losing
+    # track of the fact that finalization was already requested.
+    restarted = _workflow(
+        tmp_path, store.resume_session(session.number), store, transport=transport,
+    )
+    assert restarted.snapshot().phase == "finalizing"
+
+    # The underlying storage issue is fixed, so the next poll can complete.
+    Path(row["capture_path"]).write_bytes(original_bytes)
+    assert restarted.poll_finalization().phase == "finalized"
 
 
 def test_outbox_delete_acknowledged_leaves_pending_entries_untouched(tmp_path):
@@ -2654,12 +2254,9 @@ def test_cleanup_pending_resumes_acknowledged_cleanup_after_restart(tmp_path):
         (session.directory / "session.json").read_text("utf-8")
     )
     assert repaired_on_resume["phase"] == "cleanup_pending"
-    restarted = SessionWorkflow(
-        session=resumed_session,
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
+    restarted = _workflow(
+        tmp_path, resumed_session, restarted_store,
         transport=transport,
-        camera=FakePhaseCamera(),
     )
     result = restarted.poll_finalization(replay=False)
 
@@ -2753,13 +2350,7 @@ def test_metadata_reconciles_from_sqlite_after_transition_crash(tmp_path, monkey
         (session.directory / "session.json").read_text("utf-8")
     )
     assert repaired_on_resume["phase"] == "cleanup_pending"
-    restarted = SessionWorkflow(
-        session=resumed_session,
-        store=restarted_store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=ToggleTransport(restarted_store),
-        camera=FakePhaseCamera(),
-    )
+    restarted = _workflow(tmp_path, resumed_session, restarted_store)
 
     assert restarted.poll_finalization(replay=False).phase == "finalized"
     repaired = json.loads((session.directory / "session.json").read_text("utf-8"))
@@ -2767,17 +2358,25 @@ def test_metadata_reconciles_from_sqlite_after_transition_crash(tmp_path, monkey
 
 
 def test_export_and_metadata_failures_are_recorded_durably(tmp_path, monkeypatch):
-    store, session, _, _, workflow = _session_ready_for_slides(tmp_path)
+    store, session, _transport, workflow = _captured_block_session(tmp_path)
+    original_export = store._refresh_manifest_export
+    export_attempts = 0
 
-    def fail_export(session_identity):
-        raise OSError("simulated export failure")
+    def fail_export_once(session_identity):
+        nonlocal export_attempts
+        export_attempts += 1
+        if export_attempts == 1:
+            raise OSError("simulated export failure")
+        original_export(session_identity)
 
-    monkeypatch.setattr(store, "_refresh_manifest_export", fail_export)
+    monkeypatch.setattr(store, "_refresh_manifest_export", fail_export_once)
     with pytest.raises(OSError, match="export failure"):
         workflow.end_session(confirm=True)
+    # Still recoverable before Pi cleanup: nothing was deleted yet.
+    assert workflow.snapshot().phase == "finalizing"
+    assert workflow.outbox.entries() != ()
     assert "export failure" in store.summarize(session).finalization_error
 
-    monkeypatch.undo()
     original_reconcile = store.reconcile_session_metadata
 
     def fail_metadata(session_number):
@@ -2792,39 +2391,21 @@ def test_export_and_metadata_failures_are_recorded_durably(tmp_path, monkeypatch
             (session.number,),
         ).fetchone()["last_finalization_error"]
     assert "metadata failure" in error
+
     monkeypatch.setattr(store, "reconcile_session_metadata", original_reconcile)
+    assert workflow.poll_finalization().phase == "finalized"
+    assert workflow.outbox.entries() == ()
+    assert export_attempts == 2  # the recovery poll re-ran the export once
 
 
 # ---------------------------------------------------------------------------
-# Work-order-scoped N^2 retrieval mode (#149, ADR 0009).
+# Work-order-scoped N^2 retrieval mode (ADR 0009).
 #
 # A work order is the operator's explicit start/finish capture bracket. Every
 # block scan and slide capture stamped inside the bracket belongs to that work
 # order; finishing it dispatches an async all-pairs scoring job so the kiosk
 # stays responsive while a prior order's results are still computing.
 # ---------------------------------------------------------------------------
-
-
-class StubWorkOrderScorer:
-    """Deterministic, synchronous stand-in for the production N^2 scorer.
-
-    Ignores the (block_results, slide_results) mappings it is handed and
-    instead returns whatever ``scores_by_slide`` has been populated with for
-    each slide capture id -- tests populate this dict *after* construction,
-    once the real capture id is known, but *before* ``finish_work_order`` is
-    called.
-    """
-
-    def __init__(self):
-        self.scores_by_slide: dict[str, dict[str, float | None]] = {}
-        self.calls = 0
-
-    def __call__(self, block_results, slide_results):
-        self.calls += 1
-        return {
-            capture_id: dict(self.scores_by_slide.get(capture_id, {}))
-            for capture_id in slide_results
-        }
 
 
 class GatedWorkOrderScorer:
@@ -2849,12 +2430,7 @@ class GatedWorkOrderScorer:
         }
 
 
-def _drain_to_slides(store, session):
-    store.begin_block_drain(session.number)
-    assert store.try_enter_slides(session.number)
-
-
-def test_work_order_lifecycle_survives_restart(tmp_path):
+def test_work_order_lifecycle_stamps_captures_and_survives_restart(tmp_path):
     root = tmp_path / "processing"
     store = ProcessingStore(
         root, preprocessor=FastPreprocessor(),
@@ -2863,10 +2439,23 @@ def test_work_order_lifecycle_survives_restart(tmp_path):
     session = store.start_session(started_at=STARTED_AT)
     work_order_id = store.start_work_order(session.number)
     block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
+    _drain_to_slides(store, session)
+    slide_id = store.record_slide_capture(
+        session.number, _capture(tmp_path / "slide.png", 120),
+        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
+    )
 
+    # Every capture between start and finish is stamped with the work order.
     assert store.get_set(session.number, block_id)["work_order_id"] == work_order_id
-    wo = store.get_work_order(session.number, work_order_id)
-    assert wo["lifecycle_state"] == "capturing"
+    assert (
+        store.get_slide_capture(session.number, slide_id)["work_order_id"]
+        == work_order_id
+    )
+    assert store.get_work_order(session.number, work_order_id)["lifecycle_state"] == (
+        "capturing"
+    )
+    kinds = [event.kind for event in store.events(session.number)]
+    assert "work_order_started" in kinds
 
     restarted = ProcessingStore(
         root, preprocessor=FastPreprocessor(),
@@ -2875,8 +2464,11 @@ def test_work_order_lifecycle_survives_restart(tmp_path):
 
     restarted_wo = restarted.get_work_order(session.number, work_order_id)
     assert restarted_wo["lifecycle_state"] == "capturing"
-    restarted_row = restarted.get_set(session.number, block_id)
-    assert restarted_row["work_order_id"] == work_order_id
+    assert restarted.get_set(session.number, block_id)["work_order_id"] == work_order_id
+    assert (
+        restarted.get_slide_capture(session.number, slide_id)["work_order_id"]
+        == work_order_id
+    )
 
 
 def test_recover_work_orders_reenqueues_scoring_after_restart(tmp_path):
@@ -2919,108 +2511,15 @@ def test_recover_work_orders_reenqueues_scoring_after_restart(tmp_path):
     assert Path(wo_after["verdict_csv_path"]).is_file()
 
 
-@pytest.mark.parametrize("session_mode", [SessionMode.NORMAL])
-def test_finish_work_order_scoring_transition_unaffected_by_session_mode_gate(
-    tmp_path, session_mode
-):
-    """#269 acceptance criterion / negative control: NORMAL remains unchanged
-    by the new `sessions.session_mode` gate on
-    `finish_work_order`'s N-by-N scoring transition -- the
-    finalized->scoring commit and job submission still happen exactly as
-    before, and a crash between them is still recovered by
-    `_recover_work_orders`. Mirrors
-    `test_recover_work_orders_reenqueues_scoring_after_restart` above,
-    for the non-retrieval mode."""
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer, recover_jobs=False,
-    )
-    session = store.start_session(
-        started_at=STARTED_AT, session_mode=session_mode.value
-    )
-    work_order_id = store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    capture_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[capture_id] = {block_id: 0.95}
-
-    # Model a crash after the finalized->scoring transition commits but
-    # before the executor actually starts the job.
-    finished_id = store.finish_work_order(session.number, start_job=False)
-    assert finished_id == work_order_id
-    wo = store.get_work_order(session.number, work_order_id)
-    assert wo["lifecycle_state"] == "scoring"
-
-    restarted_scorer = StubWorkOrderScorer()
-    restarted_scorer.scores_by_slide[capture_id] = {block_id: 0.95}
-    restarted = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=restarted_scorer,
-    )
-    restarted.wait_for_jobs()
-
-    wo_after = restarted.get_work_order(session.number, work_order_id)
-    assert wo_after["lifecycle_state"] == "results_ready"
-    assert restarted_scorer.calls == 1
-
-
 def test_session_mode_fails_closed_for_an_unknown_session(tmp_path):
-    """#269 review LOW finding 5d: `_session_mode` used to default to
-    'normal' for an unknown session number. That is a safety-gate
-    failure-OPEN bug: `finish_work_order` is the sole caller, and uses this
-    value to decide whether a work order may run the full N-by-N scoring
-    path -- silently guessing "not Hybrid" for a session it cannot find is
-    exactly backwards. It must fail closed (raise) instead."""
+    """`_session_mode` must fail closed (raise) for an unknown session.
+    `finish_work_order` uses it to decide whether a work order may run the
+    full N-by-N scoring path, so silently guessing "normal" (not Hybrid) for
+    a session it cannot find would fail open."""
     store = ProcessingStore(tmp_path / "processing")
 
     with pytest.raises(ValueError, match="unknown session"):
         store._session_mode(999999)
-
-
-@pytest.mark.parametrize("session_mode", [SessionMode.NORMAL, SessionMode.OPEN_RETRIEVAL])
-def test_session_mode_still_correct_for_every_real_session_mode(tmp_path, session_mode):
-    """#269 review 5d follow-up: the fail-closed change must not disturb the
-    one real caller (`finish_work_order`, exercised end-to-end elsewhere in
-    this file) for any legitimate, existing session."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT, session_mode=session_mode.value)
-
-    assert store._session_mode(session.number) == session_mode.value
-
-
-def test_start_and_finish_work_order_stamp_captures_between_the_bracket(tmp_path):
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-
-    work_order_id = store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
-    )
-
-    assert store.get_set(session.number, block_id)["work_order_id"] == work_order_id
-    assert (
-        store.get_slide_capture(session.number, slide_id)["work_order_id"]
-        == work_order_id
-    )
-
-    kinds = [event.kind for event in store.events(session.number)]
-    assert "work_order_started" in kinds
 
 
 def test_finishing_one_work_order_lets_a_new_one_start_and_capture_independently(
@@ -3089,7 +2588,7 @@ def test_starting_the_next_work_order_returns_the_session_to_block_capture(tmp_p
 
 
 def test_start_work_order_is_idempotent_returns_existing_capturing_row(tmp_path):
-    """#155: a double-tap on START WORK ORDER (retry, or a Pi restart landing
+    """A double-tap on START WORK ORDER (retry, or a Pi restart landing
     mid-request) must not orphan an extra capturing row -- the second call
     reuses the SAME work order id the first call opened, mirroring the
     SELECT-before-INSERT guard `finish_work_order` already applies."""
@@ -3111,7 +2610,7 @@ def test_start_work_order_is_idempotent_returns_existing_capturing_row(tmp_path)
 
 
 def test_open_work_order_id_reflects_capturing_state_then_none_after_finish(tmp_path):
-    """#155: the boot-seed read helper -- returns the open bracket's id while
+    """The boot-seed read helper -- returns the open bracket's id while
     one is `capturing`, and None once it has been finished (or before any
     work order has ever started)."""
     root = tmp_path / "processing"
@@ -3201,39 +2700,58 @@ def test_finish_work_order_dispatches_async_job_and_a_new_order_can_start_while_
     )
 
 
-def test_finish_work_order_persists_verdict_csv_with_ranked_candidates(tmp_path):
-    root = tmp_path / "processing"
+@pytest.mark.parametrize(
+    ("block_ids", "claimed", "scores", "verdict", "csv_message"),
+    [
+        (("51151378", "62626262"), "51151378", {"51151378": 0.92, "62626262": 0.40},
+         "PASS", "Claimed block clearly scored highest."),
+        (("51151378",), "51151378", {"51151378": 0.90}, "PASS", "unverified"),
+        (("51151378",), "99999999", {"51151378": 0.90},
+         "REVIEW", "Claimed block 99999999 not in this order."),
+        (("51151378",), "51151378", {"51151378": None}, "REVIEW", "Preparation failed."),
+    ],
+    ids=[
+        "ranked-candidates", "single-block-threshold-fallback",
+        "claim-absent-from-order", "claimed-pair-gate-failure-fails-closed",
+    ],
+)
+def test_finish_work_order_persists_verdict_csv(
+    tmp_path, block_ids, claimed, scores, verdict, csv_message,
+):
     scorer = StubWorkOrderScorer()
     store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
+        tmp_path / "processing", preprocessor=FastPreprocessor(),
         slide_preprocessor=_identical_mask_slide_preprocessor,
         work_order_scorer=scorer,
     )
     session = store.start_session(started_at=STARTED_AT)
     work_order_id = store.start_work_order(session.number)
-    block_a = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    block_b = _evaluable_block(store, session, tmp_path, block_id="62626262")
+    for block_id in block_ids:
+        _evaluable_block(store, session, tmp_path, block_id=block_id)
     _drain_to_slides(store, session)
     slide_id = store.record_slide_capture(
         session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_a), duration_ms=10.0,
+        captured_at=STARTED_AT, result=_valid_slide_result(claimed), duration_ms=10.0,
     )
-    scorer.scores_by_slide[slide_id] = {block_a: 0.92, block_b: 0.40}
+    scorer.scores_by_slide[slide_id] = scores
 
     store.finish_work_order(session.number)
     store.wait_for_jobs()
 
+    assert scorer.calls == 1  # the injected scorer ran, not the production one
+    if claimed in block_ids:
+        row = store.get_set(session.number, claimed)
+        assert row["verdict"] == verdict
+        if scores[claimed] is not None:
+            assert row["score"] == pytest.approx(scores[claimed])
+    else:
+        assert store.get_slide_capture(session.number, slide_id)["verdict"] == verdict
     wo = store.get_work_order(session.number, work_order_id)
     csv_text = Path(wo["verdict_csv_path"]).read_text(encoding="utf-8")
     assert slide_id in csv_text
-    assert block_a in csv_text
-    assert "PASS" in csv_text
-    assert "Claimed block clearly scored highest." in csv_text
-
-    row = store.get_set(session.number, block_a)
-    assert row["verdict"] == "PASS"
-    assert row["score"] == pytest.approx(0.92)
-
+    assert claimed in csv_text
+    assert verdict in csv_text
+    assert csv_message in csv_text
     kinds = [event.kind for event in store.events(session.number)]
     assert "work_order_results_ready" in kinds
 
@@ -3253,11 +2771,16 @@ def test_default_work_order_scorer_builds_candidate_scores_from_production_score
         ),
     }
 
-    scores = default_work_order_scorer(block_results, slide_results).scores
+    result = default_work_order_scorer(block_results, slide_results)
+    scores = result.scores
 
     assert scores["slide_capture_1"]["51151378"] == pytest.approx(1.0)
     other = scores["slide_capture_1"]["62626262"]
     assert other is None or other < scores["slide_capture_1"]["51151378"]
+    # The overlay needs the scored pose, so pair decisions must keep it.
+    decision = result.pair_decisions["slide_capture_1"]["51151378"]
+    assert decision.best_angle is not None
+    assert decision.best_flip is not None
 
 
 def _synthetic_specimen(role, seed):
@@ -3272,16 +2795,17 @@ def _synthetic_specimen(role, seed):
 
 
 def test_work_order_scorer_hoists_normalization_cache_per_item_not_per_pair():
-    """ADR 0011 / issue #158: `default_work_order_scorer` must build
+    """ADR 0011: `default_work_order_scorer` must build
     `build_locked_score_cache` once per item (M+K), not once per pair (2*M*K),
     and the per-pair scores it produces must be unchanged (within 1e-9) from
     the old per-pair-rebuilding path (`decide_claim` with no `scorer=`
     override, i.e. `score_pair_result_routed`)."""
+    # 2x2 is the smallest grid where per-item (4) and per-pair (8) differ.
     block_results = {
-        f"block_{i}": _synthetic_specimen("block", i) for i in range(3)
+        f"block_{i}": _synthetic_specimen("block", i) for i in range(2)
     }
     slide_results = {
-        f"slide_{i}": _synthetic_specimen("slide", i + 10) for i in range(4)
+        f"slide_{i}": _synthetic_specimen("slide", i + 10) for i in range(2)
     }
     num_blocks = len(block_results)
     num_slides = len(slide_results)
@@ -3299,7 +2823,7 @@ def test_work_order_scorer_hoists_normalization_cache_per_item_not_per_pair():
         call_counts["cached"] += 1
         return real_build_cache(specimen)
 
-    # (a) default path: the old per-pair loop body, `decide_claim` with no
+    # (a) reference path: the per-pair loop body, `decide_claim` with no
     # `scorer=` override so it falls through to `score_pair_result_routed`,
     # which rebuilds both caches on every single pair.
     with patch("verify.scorer.build_locked_score_cache", side_effect=counting_build_default):
@@ -3313,7 +2837,7 @@ def test_work_order_scorer_hoists_normalization_cache_per_item_not_per_pair():
                 row[block_id] = decision.score
             default_scores[slide_id] = row
 
-    # (b) new cache-injected path via the production entry point.
+    # (b) cache-injected path via the production entry point.
     with patch(
         "session.processing_store.build_locked_score_cache",
         side_effect=counting_build_cached,
@@ -3330,12 +2854,15 @@ def test_work_order_scorer_hoists_normalization_cache_per_item_not_per_pair():
             )
 
 
-def test_work_order_scorer_skips_cache_and_scorer_for_failed_block():
-    valid_slide = _synthetic_specimen("slide", 10)
-    block_results = {
-        "failed_block": PreparationFailure(role="block", reason="segmentation failed"),
-    }
-    slide_results = {"slide_1": valid_slide}
+@pytest.mark.parametrize("failed_role", ["block", "slide"])
+def test_work_order_scorer_skips_cache_and_scorer_for_failed_item(failed_role):
+    failed = PreparationFailure(role=failed_role, reason="preparation failed")
+    if failed_role == "block":
+        valid = _synthetic_specimen("slide", 10)
+        block_results, slide_results = {"block_1": failed}, {"slide_1": valid}
+    else:
+        valid = _synthetic_specimen("block", 1)
+        block_results, slide_results = {"block_1": valid}, {"slide_1": failed}
     cached_specimens = []
 
     def record_cache_build(specimen):
@@ -3350,303 +2877,12 @@ def test_work_order_scorer_skips_cache_and_scorer_for_failed_block():
     ):
         scores = default_work_order_scorer(block_results, slide_results).scores
 
-    assert scores == {"slide_1": {"failed_block": None}}
-    assert cached_specimens == [valid_slide]
-
-
-def test_work_order_scorer_skips_cache_and_scorer_for_failed_slide():
-    valid_block = _synthetic_specimen("block", 1)
-    block_results = {"block_1": valid_block}
-    slide_results = {
-        "failed_slide": PreparationFailure(role="slide", reason="label detection failed"),
-    }
-    cached_specimens = []
-
-    def record_cache_build(specimen):
-        cached_specimens.append(specimen)
-        return object()
-
-    with patch(
-        "session.processing_store.build_locked_score_cache", side_effect=record_cache_build
-    ), patch(
-        "session.processing_store.score_routed_caches",
-        side_effect=AssertionError("failed pair must not reach cache lookup"),
-    ):
-        scores = default_work_order_scorer(block_results, slide_results).scores
-
-    assert scores == {"failed_slide": {"block_1": None}}
-    assert cached_specimens == [valid_block]
-
-
-def test_finish_work_order_single_block_order_falls_back_to_threshold(tmp_path):
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    work_order_id = store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_id] = {block_id: 0.90}
-
-    store.finish_work_order(session.number)
-    store.wait_for_jobs()
-
-    row = store.get_set(session.number, block_id)
-    assert row["verdict"] == "PASS"
-    wo = store.get_work_order(session.number, work_order_id)
-    csv_text = Path(wo["verdict_csv_path"]).read_text(encoding="utf-8")
-    assert "unverified" in csv_text
-
-
-def test_finish_work_order_claimed_block_absent_from_order_reviews(tmp_path):
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    work_order_id = store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result("99999999"), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_id] = {block_id: 0.90}
-
-    store.finish_work_order(session.number)
-    store.wait_for_jobs()
-
-    slide_row = store.get_slide_capture(session.number, slide_id)
-    assert slide_row["verdict"] == "REVIEW"
-    wo = store.get_work_order(session.number, work_order_id)
-    csv_text = Path(wo["verdict_csv_path"]).read_text(encoding="utf-8")
-    assert "Claimed block 99999999 not in this order." in csv_text
-
-
-def test_finish_work_order_claimed_pair_gate_failure_reviews_fail_closed(tmp_path):
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    work_order_id = store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_id] = {block_id: None}
-
-    store.finish_work_order(session.number)
-    store.wait_for_jobs()
-
-    row = store.get_set(session.number, block_id)
-    assert row["verdict"] == "REVIEW"
-    wo = store.get_work_order(session.number, work_order_id)
-    csv_text = Path(wo["verdict_csv_path"]).read_text(encoding="utf-8")
-    assert "Preparation failed." in csv_text
-
-
-def test_processing_store_accepts_injectable_work_order_scorer_kwarg(tmp_path):
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    store.start_work_order(session.number)
-    block_id = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_id), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_id] = {block_id: 0.9}
-
-    store.finish_work_order(session.number)
-    store.wait_for_jobs()
-
-    assert scorer.calls == 1
-    row = store.get_set(session.number, block_id)
-    assert row["verdict"] == "PASS"
-
-
-def test_workflow_start_and_finish_work_order_delegate_to_the_store(tmp_path):
-    store, session, _outbox, _transport, workflow = _session_ready_for_slides(tmp_path)
-
-    work_order_id = workflow.start_work_order()
-    assert store.get_work_order(session.number, work_order_id)["lifecycle_state"] == (
-        "capturing"
-    )
-
-    finished_id = workflow.finish_work_order()
-    assert finished_id == work_order_id
-
-
-def test_results_status_returns_work_orders_and_rows_from_list_results_ready_work_orders(
-    tmp_path,
-):
-    """#153: the kiosk's live-results seam. ``results_status()`` must wrap
-    the already-existing ``list_results_ready_work_orders`` into the
-    ``{"work_orders": (...), "rows": [...]}`` shape ``test_kiosk_relay``'s
-    ``_ResultsFake.results_status()`` test double exercises against
-    ``KioskRelay._results_status()``'s degrading getattr+callable read --
-    proving the REAL ``SessionWorkflow`` handle resolves the same seam
-    production reads, with zero mocking of the underlying store."""
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    outbox = PiOutbox(tmp_path / "outbox")
-    transport = ToggleTransport(store)
-    workflow = SessionWorkflow(
-        session=session, store=store, outbox=outbox, transport=transport,
-    )
-
-    work_order_a = workflow.start_work_order()
-    block_1 = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    decoy_1 = _evaluable_block(store, session, tmp_path, block_id="12121212")
-    _drain_to_slides(store, session)
-    slide_a = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide_a.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_1), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_a] = {block_1: 0.9, decoy_1: 0.1}
-    workflow.finish_work_order()
-    store.wait_for_jobs()
-
-    work_order_b = workflow.start_work_order()
-    block_2 = _evaluable_block(store, session, tmp_path, block_id="62626262")
-    decoy_2 = _evaluable_block(store, session, tmp_path, block_id="73737373")
-    _drain_to_slides(store, session)
-    slide_b = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide_b.png", 121),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_2), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_b] = {block_2: 0.05, decoy_2: 0.02}
-    workflow.finish_work_order()
-    store.wait_for_jobs()
-
-    status = workflow.results_status()
-
-    # Distinct work orders, sorted -- not the raw per-row duplication.
-    assert status["work_orders"] == tuple(sorted({work_order_a, work_order_b}))
-    by_capture = {row["capture_id"]: row for row in status["rows"]}
-    assert set(by_capture) == {slide_a, slide_b}
-    assert by_capture[slide_a]["verdict"] == "PASS"
-    assert by_capture[slide_a]["work_order_id"] == work_order_a
-    assert by_capture[slide_b]["verdict"] == "PASS"
-    assert by_capture[slide_b]["work_order_id"] == work_order_b
-
-
-class _FakeResultsRowsStore:
-    """Minimal store double for ``results_status()``'s #252 mode-routing
-    seam: only the handful of methods ``SessionWorkflow.__init__``/
-    ``results_status`` touch, so these tests don't need a full block/slide
-    capture lifecycle through a real ``ProcessingStore`` (which has no
-    ``list_hybrid_results`` yet -- that lands separately) just to prove
-    which store method gets called for which session mode."""
-
-    def __init__(
-        self, *, ready_rows=(), hybrid_rows=(), retrieval_rows=(),
-        hybrid_error=None, retrieval_error=None,
-        profile_rows=(), profile_error=None,
-    ):
-        self.ready_calls = 0
-        self.hybrid_calls = 0
-        self.retrieval_calls = 0
-        # #257: recorded, never asserted-away -- a real assertion that
-        # pause_capture/resume_capture never wait on or cancel jobs.
-        self.wait_for_jobs_calls = 0
-        # #258: recorded so hybrid_profile_status's own mode-gate/degrade
-        # tests can prove list_hybrid_profile_rows was (or was not) reached,
-        # mirroring hybrid_calls above.
-        self.profile_calls = 0
-        self._ready_rows = tuple(ready_rows)
-        self._hybrid_rows = tuple(hybrid_rows)
-        self._retrieval_rows = tuple(retrieval_rows)
-        self._hybrid_error = hybrid_error
-        self._retrieval_error = retrieval_error
-        self._profile_rows = tuple(profile_rows)
-        self._profile_error = profile_error
-
-    def slide_recovery_state(self, session_number):
-        return None
-
-    def list_results_ready_work_orders(self, session_number):
-        self.ready_calls += 1
-        return self._ready_rows
-
-    def list_hybrid_results(self, session_number):
-        self.hybrid_calls += 1
-        if self._hybrid_error is not None:
-            raise self._hybrid_error
-        return self._hybrid_rows
-
-    def list_retrieval_results(self, session_number):
-        self.retrieval_calls += 1
-        if self._retrieval_error is not None:
-            raise self._retrieval_error
-        return self._retrieval_rows
-
-    def list_hybrid_profile_rows(self, session_number):
-        self.profile_calls += 1
-        if self._profile_error is not None:
-            raise self._profile_error
-        return self._profile_rows
-
-    def wait_for_jobs(self):
-        self.wait_for_jobs_calls += 1
-
-
-def _results_workflow(tmp_path, *, session_mode, store):
-    """A ``SessionWorkflow`` wired to a fake store, for #252 results_status()
-    mode-routing tests. ``framing_calibration`` is passed explicitly (rather
-    than defaulted from ``store.root``) since the fake store has no ``root``.
-    ``outbox``/``transport`` are never touched by ``results_status()`` or
-    ``SessionWorkflow.__init__`` -- real, harmless instances stand in (a real
-    ``PiOutbox`` directory and an ``HttpCaptureClient`` whose base_url is
-    never dialed) so this stays type-correct rather than passing ``None``
-    against their non-Optional parameter types."""
-    identity = SessionIdentity(
-        number=99,
-        started_at=STARTED_AT,
-        directory=tmp_path,
-        session_mode=session_mode.value,
-    )
-    return SessionWorkflow(
-        session=identity,
-        store=store,
-        outbox=PiOutbox(tmp_path / "outbox"),
-        transport=HttpCaptureClient("http://unused.invalid"),
-        framing_calibration=FramingCalibrationStore(tmp_path / "framing.json"),
-        session_mode=session_mode,
-    )
+    assert scores == {"slide_1": {"block_1": None}}
+    assert cached_specimens == [valid]
 
 
 def test_pause_capture_and_resume_capture_toggle_pure_state_only(tmp_path):
-    """#257: pause_capture/resume_capture must be pure in-process flags -- no
+    """pause_capture/resume_capture must be pure in-process flags -- no
     store I/O, no job wait/cancel -- so background scoring and queued jobs
     are completely unaffected while Results is open. `wait_for_jobs_calls`
     is a real, non-vacuous assertion (not merely "no exception raised")."""
@@ -3669,7 +2905,7 @@ def test_pause_capture_and_resume_capture_toggle_pure_state_only(tmp_path):
 
 @pytest.mark.parametrize("mode", [SessionMode.HYBRID, SessionMode.HYBRID_SHADOW])
 def test_results_status_sources_hybrid_rows_from_list_hybrid_results(tmp_path, mode):
-    """#252: HYBRID/HYBRID_SHADOW must read the dedicated Hybrid projection,
+    """HYBRID/HYBRID_SHADOW must read the dedicated Hybrid projection,
     not the NORMAL/OPEN_RETRIEVAL batch-atomic reveal -- and must do so from
     ``self.session_mode`` (the durable, resume-carried value), never from
     whether rows/artifacts happen to exist."""
@@ -3735,7 +2971,7 @@ def test_results_status_normal_keeps_results_ready_projection(tmp_path):
 def test_results_status_degrades_to_empty_rows_when_list_hybrid_results_raises(
     tmp_path, mode,
 ):
-    """Blast-radius guard (#252): ``results_status()`` runs on the kiosk's
+    """Blast-radius guard: ``results_status()`` runs on the kiosk's
     poll path, which reaches ``_camera_loop``'s bare ``except Exception`` if
     anything escapes. Even though the store contract promises
     ``list_hybrid_results`` never raises on its own poll path, this proves
@@ -3749,145 +2985,10 @@ def test_results_status_degrades_to_empty_rows_when_list_hybrid_results_raises(
     assert store.hybrid_calls == 1
 
 
-# --------------------------------------------------------------------------
-# #258: hybrid_profile_status -- the ONE shared source both the kiosk relay
-# and the console read for --profile Hybrid queue/timing display. Mirrors
-# results_status's own mode-gate + broad-except tests immediately above.
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("mode", [SessionMode.HYBRID, SessionMode.HYBRID_SHADOW])
-def test_hybrid_profile_status_projects_pending_and_finished_rows(tmp_path, mode):
-    """A PENDING row surfaces its current stage + elapsed time (computed from
-    the controlled ``now_ns`` passed in, never a real clock read); a
-    finished row surfaces its total time plus the full five-stage
-    breakdown; the queue count counts only the PENDING row."""
-    raw_rows = (
-        {"capture_id": "cap-1", "block_id": "11111111", "job_state": "scoring",
-         "verdict": None, "stage": "heuristic_selection",
-         "queued_ns": 4_000_000_000, "total_ms": None, "stage_ms_json": None,
-         "shadow": 0},
-        {"capture_id": "cap-2", "block_id": "22222222", "job_state": "complete",
-         "verdict": "PASS", "stage": None, "queued_ns": 0, "total_ms": 4200,
-         "stage_ms_json": json.dumps({
-             "queue_wait": 100, "preparation": 200,
-             "heuristic_selection": 300, "accurate_scoring": 3500,
-             "artifact_write": 100,
-         }),
-         "shadow": 0},
-    )
-    store = _FakeResultsRowsStore(profile_rows=raw_rows)
-    workflow = _results_workflow(tmp_path, session_mode=mode, store=store)
-
-    status = workflow.hybrid_profile_status(now_ns=5_000_000_000)
-
-    assert store.profile_calls == 1
-    assert status["queue_count"] == 1
-    by_capture = {row.capture_id: row for row in status["rows"]}
-    pending = by_capture["cap-1"]
-    assert pending.state == "PENDING"
-    assert pending.stage == "heuristic_selection"
-    assert pending.elapsed_ms == 1000  # (5_000_000_000 - 4_000_000_000) ns -> ms
-    finished = by_capture["cap-2"]
-    assert finished.state == "PASS"
-    assert finished.total_ms == 4200
-    assert set(finished.stage_ms) == {
-        "queue_wait", "preparation", "heuristic_selection",
-        "accurate_scoring", "artifact_write",
-    }
-
-
-@pytest.mark.parametrize("mode", [SessionMode.NORMAL, SessionMode.OPEN_RETRIEVAL])
-def test_hybrid_profile_status_normal_and_open_retrieval_never_call_the_store(
-    tmp_path, mode,
-):
-    """Non-vacuous control (#258): must fail if the explicit mode gate in
-    ``hybrid_profile_status`` is dropped -- rows are supplied here precisely
-    so "empty queue" is proven by the gate, not merely by the store having
-    nothing to return."""
-    raw_rows = (
-        {"capture_id": "cap-1", "block_id": "11111111", "job_state": "scoring",
-         "verdict": None, "stage": "preparation", "queued_ns": 0,
-         "total_ms": None, "stage_ms_json": None, "shadow": 0},
-    )
-    store = _FakeResultsRowsStore(profile_rows=raw_rows)
-    workflow = _results_workflow(tmp_path, session_mode=mode, store=store)
-
-    status = workflow.hybrid_profile_status(now_ns=1_000_000_000)
-
-    assert status == {"queue_count": 0, "rows": ()}
-    assert store.profile_calls == 0
-
-
-@pytest.mark.parametrize("mode", [SessionMode.HYBRID, SessionMode.HYBRID_SHADOW])
-def test_hybrid_profile_status_degrades_to_empty_queue_when_the_store_raises(
-    tmp_path, mode,
-):
-    """Blast-radius guard (#258): this runs on the same kiosk poll path as
-    ``results_status``/``list_hybrid_results`` -- even though
-    ``list_hybrid_profile_rows`` promises never to raise on its own poll
-    path, this proves the degrade holds if it ever does anyway."""
-    store = _FakeResultsRowsStore(profile_error=RuntimeError("boom"))
-    workflow = _results_workflow(tmp_path, session_mode=mode, store=store)
-
-    status = workflow.hybrid_profile_status(now_ns=1_000_000_000)
-
-    assert status == {"queue_count": 0, "rows": ()}
-    assert store.profile_calls == 1
-
-
-def test_hybrid_profile_status_shadow_row_carries_the_shadow_flag(tmp_path):
-    """Hybrid Shadow's complete-pool cost must be distinguishable from
-    pruned real Hybrid timing -- ``shadow=True`` rides straight through from
-    the store's ``profile_shadow`` column."""
-    raw_rows = (
-        {"capture_id": "cap-9", "block_id": "99999999", "job_state": "complete",
-         "verdict": "PASS", "stage": None, "queued_ns": 0, "total_ms": 999,
-         "stage_ms_json": None, "shadow": 1},
-    )
-    store = _FakeResultsRowsStore(profile_rows=raw_rows)
-    workflow = _results_workflow(
-        tmp_path, session_mode=SessionMode.HYBRID_SHADOW, store=store
-    )
-
-    status = workflow.hybrid_profile_status(now_ns=1_000_000_000)
-
-    assert status["rows"][0].shadow is True
-
-
-def test_console_and_screen_render_the_same_numbers_from_one_shared_source(tmp_path):
-    """#258: proves console (``format_profile_console``) and touchscreen
-    (``profile_screen_fields``) can never disagree, because both read the
-    exact same ``ProfileRow`` tuple ``hybrid_profile_status`` returns -- one
-    shared formatter, not two independently maintained renderers."""
-    from session.profile_report import format_profile_console, profile_screen_fields
-
-    raw_rows = (
-        {"capture_id": "cap-1", "block_id": "11111111", "job_state": "scoring",
-         "verdict": None, "stage": "accurate_scoring",
-         "queued_ns": 3_000_000_000, "total_ms": None, "stage_ms_json": None,
-         "shadow": 0},
-    )
-    store = _FakeResultsRowsStore(profile_rows=raw_rows)
-    workflow = _results_workflow(
-        tmp_path, session_mode=SessionMode.HYBRID, store=store
-    )
-
-    status = workflow.hybrid_profile_status(now_ns=5_000_000_000)
-    screen = profile_screen_fields(status["rows"], queue_count=status["queue_count"])
-    console = format_profile_console(status["rows"], queue_count=status["queue_count"])
-
-    elapsed_ms = screen["rows"][0]["elapsed_ms"]
-    assert elapsed_ms == 2000
-    assert f"elapsed={elapsed_ms}ms" in console
-    assert f"queue={status['queue_count']}" in console
-    assert screen["queue_count"] == status["queue_count"] == 1
-
-
 def test_list_results_ready_work_orders_returns_per_slide_verdict_rows(tmp_path):
-    """#150: the kiosk results table's data source -- every slide-capture row
+    """The kiosk results table's data source -- every slide-capture row
     from every ``results_ready`` work order in the session, carrying the
-    verdict/claim_score/claim_reason/block_id/capture_id columns #149's
+    verdict/claim_score/claim_reason/block_id/capture_id columns
     ``_finalize_claim`` already populates. No new schema, no CSV re-parsing."""
     root = tmp_path / "processing"
     scorer = StubWorkOrderScorer()
@@ -3948,11 +3049,11 @@ def test_list_results_ready_work_orders_returns_per_slide_verdict_rows(tmp_path)
 
 
 def test_list_results_ready_work_orders_proxy_matches_local_store_over_rpc(tmp_path):
-    """#149/#150/#153: the kiosk reads results through RemoteProcessingStore
+    """The kiosk reads results through RemoteProcessingStore
     over /rpc, so the proxied per-slide verdict rows must equal the local
     store's rows -- not silently degrade to empty (the AttributeError gap that
     made results unreachable from the Pi)."""
-    from store.remote import RemoteProcessingStore
+    from transport.remote import RemoteProcessingStore
 
     root = tmp_path / "processing"
     scorer = StubWorkOrderScorer()
@@ -4018,7 +3119,7 @@ def test_list_results_ready_work_orders_excludes_orders_still_capturing_or_scori
 
 
 # ---------------------------------------------------------------------------
-# #151: contact-sheet rendering for flagged pairs on REVIEW verdicts.
+# Contact-sheet rendering for flagged pairs on REVIEW verdicts.
 #
 # ``ProcessingStore`` accepts an injectable ``contact_sheet_renderer`` (same
 # seam shape as ``work_order_scorer``), and ``_score_work_order`` uses it to
@@ -4026,45 +3127,6 @@ def test_list_results_ready_work_orders_excludes_orders_still_capturing_or_scori
 # differs) into a durable directory persisted onto
 # ``work_orders.contact_sheet_dir``.
 # ---------------------------------------------------------------------------
-
-
-class StubContactSheetRenderer:
-    """Records every call instead of touching cv2; writes a tiny placeholder
-    file at ``output_path`` so existence assertions have something real to
-    check, mirroring ``StubWorkOrderScorer``'s "record + fake the effect"
-    shape."""
-
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    def __call__(self, **kwargs):
-        self.calls.append(kwargs)
-        output_path = kwargs.get("output_path")
-        if output_path is not None:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(output_path).write_bytes(b"stub-contact-sheet")
-
-
-def test_processing_store_accepts_injectable_contact_sheet_renderer_kwarg(tmp_path):
-    """A stub renderer injected at construction must be called instead of
-    the real cv2-backed ``write_contact_sheet`` free function."""
-    renderer = StubContactSheetRenderer()
-    store = ProcessingStore(
-        tmp_path / "processing",
-        preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        contact_sheet_renderer=renderer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    block_id = _evaluable_block(store, session, tmp_path)
-
-    outcome = store.resolve_claim(
-        session.number, block_id, "slide_capture_1",
-        _capture(tmp_path / "slide.png", 120),
-    )
-
-    assert outcome.accepted
-    assert renderer.calls, "the injected renderer must be called, not the free function"
 
 
 def test_score_work_order_writes_a_sheet_for_both_top_match_and_claim_when_they_differ(
@@ -4106,8 +3168,10 @@ def test_score_work_order_writes_a_sheet_for_both_top_match_and_claim_when_they_
     assert top_match_sheet.is_file()
     assert claim_sheet.is_file()
     assert top_match_sheet != claim_sheet
+    # The directory is persisted on the work order, sibling to the verdict CSV.
+    assert sheets_dir.parent == Path(wo["verdict_csv_path"]).parent
 
-    # AC3: each rendered sheet must self-identify which physical block it
+    # Each rendered sheet must self-identify which physical block it
     # shows -- the block id must reach the header via role_label, not just
     # live in the filename.
     role_labels_by_block = {
@@ -4119,48 +3183,8 @@ def test_score_work_order_writes_a_sheet_for_both_top_match_and_claim_when_they_
     assert block_b in role_labels_by_block[claim_sheet.name]
 
 
-def test_finish_work_order_persists_contact_sheets_alongside_verdict_csv(tmp_path):
-    """The contact-sheet directory must be persisted onto
-    ``work_orders.contact_sheet_dir``, sibling to the verdict CSV's
-    directory, and contain the rendered PNG(s) for audit."""
-    root = tmp_path / "processing"
-    scorer = StubWorkOrderScorer()
-    renderer = StubContactSheetRenderer()
-    store = ProcessingStore(
-        root, preprocessor=FastPreprocessor(),
-        slide_preprocessor=_identical_mask_slide_preprocessor,
-        work_order_scorer=scorer,
-        contact_sheet_renderer=renderer,
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    work_order_id = store.start_work_order(session.number)
-    block_a = _evaluable_block(store, session, tmp_path, block_id="51151378")
-    block_b = _evaluable_block(store, session, tmp_path, block_id="62626262")
-    _drain_to_slides(store, session)
-    slide_id = store.record_slide_capture(
-        session.number, _capture(tmp_path / "slide.png", 120),
-        captured_at=STARTED_AT, result=_valid_slide_result(block_b), duration_ms=10.0,
-    )
-    scorer.scores_by_slide[slide_id] = {block_a: 0.9, block_b: 0.2}
-
-    store.finish_work_order(session.number)
-    store.wait_for_jobs()
-
-    wo = store.get_work_order(session.number, work_order_id)
-    assert wo["contact_sheet_dir"], "contact_sheet_dir must be populated on results_ready"
-    sheets_dir = Path(wo["contact_sheet_dir"])
-    assert sheets_dir.is_dir()
-    png_files = list(sheets_dir.glob("*.png"))
-    assert len(png_files) >= 1
-
-    verdict_csv_dir = Path(wo["verdict_csv_path"]).parent
-    assert sheets_dir.parent == verdict_csv_dir, (
-        "contact sheets must live sibling to the verdict CSV's directory"
-    )
-
-
 # ---------------------------------------------------------------------------
-# --profile (#168): ProcessingStore.record_profile_capture + RPC whitelist
+# --profile: record_profile_capture must reach the RPC whitelist
 # ---------------------------------------------------------------------------
 
 _PROFILE_FIELDS = {
@@ -4180,97 +3204,12 @@ def _profile_summary_csv(root: Path, session_number: int) -> Path:
     return matches[0]
 
 
-def test_record_profile_capture_appends_row_with_one_column_per_stage(tmp_path):
-    root = tmp_path / "processing"
-    store = ProcessingStore(root)
-    session = store.start_session(started_at=STARTED_AT)
-
-    store.record_profile_capture(session.number, "capture_000001", _PROFILE_FIELDS)
-
-    csv_path = _profile_summary_csv(root, session.number)
-    text = csv_path.read_text(encoding="utf-8")
-    header = text.splitlines()[0]
-    for key in _PROFILE_FIELDS:
-        assert key in header
-    assert "capture_id" in header
-    for value in ("100", "20", "30", "5", "155"):
-        assert value in text
-
-
-def test_record_profile_capture_joins_by_capture_identity(tmp_path):
-    root = tmp_path / "processing"
-    store = ProcessingStore(root)
-    session = store.start_session(started_at=STARTED_AT)
-
-    store.record_profile_capture(session.number, "capture_000001", _PROFILE_FIELDS)
-    store.record_profile_capture(
-        session.number,
-        "capture_000002",
-        {**_PROFILE_FIELDS, "total_capture_ms": 999},
-    )
-
-    csv_path = _profile_summary_csv(root, session.number)
-    lines = csv_path.read_text(encoding="utf-8").splitlines()
-    data_lines = lines[1:]
-    assert len(data_lines) == 2
-    assert any("capture_000001" in line for line in data_lines)
-    assert any("capture_000002" in line and "999" in line for line in data_lines)
-
-
-def test_record_profile_capture_includes_consumer_split_columns(tmp_path):
-    """#171: the per-capture summary table gains decode/outbox/send columns
-    once the consumer stage reports its sub-durations."""
-    root = tmp_path / "processing"
-    store = ProcessingStore(root)
-    session = store.start_session(started_at=STARTED_AT)
-    fields = {
-        **_PROFILE_FIELDS,
-        "consumer_decode_ms": 12,
-        "consumer_outbox_ms": 7,
-        "consumer_send_ms": 41,
-    }
-
-    store.record_profile_capture(session.number, "capture_000001", fields)
-
-    csv_path = _profile_summary_csv(root, session.number)
-    text = csv_path.read_text(encoding="utf-8")
-    header = text.splitlines()[0]
-    for key in ("consumer_decode_ms", "consumer_outbox_ms", "consumer_send_ms"):
-        assert key in header
-    for value in ("12", "7", "41"):
-        assert value in text
-
-
-def test_record_profile_capture_includes_settling_columns(tmp_path):
-    """#172: the per-capture summary table gains settling duration/reset/
-    peak-motion columns once the capture carries a settling summary."""
-    root = tmp_path / "processing"
-    store = ProcessingStore(root)
-    session = store.start_session(started_at=STARTED_AT)
-    fields = {
-        **_PROFILE_FIELDS,
-        "settling_duration_ms": 850,
-        "settling_resets": 2,
-        "settling_max_motion": 0.031,
-    }
-
-    store.record_profile_capture(session.number, "capture_000001", fields)
-
-    csv_path = _profile_summary_csv(root, session.number)
-    text = csv_path.read_text(encoding="utf-8")
-    header = text.splitlines()[0]
-    for key in ("settling_duration_ms", "settling_resets", "settling_max_motion"):
-        assert key in header
-    for value in ("850", "2", "0.031"):
-        assert value in text
-
-
 def test_remote_processing_store_record_profile_capture_reaches_rpc_whitelist(tmp_path):
-    """#168, per memory `pi-store-remote-rpc`: a new ProcessingStore method the
+    """A new ProcessingStore method the
     Pi calls must reach both `_RPC_METHODS` and the `RemoteProcessingStore`
     proxy, or the Pi gets a live AttributeError despite green in-process
     tests."""
-    from store.remote import RemoteProcessingStore
+    from transport.remote import RemoteProcessingStore
 
     root = tmp_path / "processing"
     store = ProcessingStore(root)

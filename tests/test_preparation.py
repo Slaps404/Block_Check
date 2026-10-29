@@ -1,19 +1,12 @@
-"""Tests for image preparation into comparable masks (issue #17).
+"""Tests for image preparation into comparable masks.
 
 All fixtures use synthetic in-memory images — no real image files needed.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pytest
-
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 from session.preparation import (
     PreparedSpecimen,
@@ -91,9 +84,13 @@ def test_valid_block_image_produces_specimen(tmp_path):
     assert result.role == "block"
     assert result.mask is not None
     assert result.mask.ndim == 2
+    assert isinstance(result.roi_ok, bool)
+    assert isinstance(result.roi_reason, str)
+    assert result.segmentation_backend == "classical"
 
 
 def test_valid_slide_image_produces_specimen(tmp_path):
+    """Gray label strip must not stop slide preparation."""
     img_path = tmp_path / "slide.jpg"
     cv2.imwrite(str(img_path), _slide_image_with_label())
     result = prepare_specimen(img_path, role="slide")
@@ -102,86 +99,29 @@ def test_valid_slide_image_produces_specimen(tmp_path):
     assert result.mask is not None
 
 
-def test_block_roi_status_is_visible(tmp_path):
-    img_path = tmp_path / "block.jpg"
-    cv2.imwrite(str(img_path), _block_tissue_image())
-    result = prepare_specimen(img_path, role="block")
-    assert isinstance(result, PreparedSpecimen)
-    assert isinstance(result.roi_ok, bool)
-    assert isinstance(result.roi_reason, str)
-
-
-def test_prepared_block_records_the_active_segmentation_backend(tmp_path):
-    img_path = tmp_path / "block.jpg"
-    cv2.imwrite(str(img_path), _block_tissue_image())
-
-    result = prepare_specimen(img_path, role="block")
-
-    assert isinstance(result, PreparedSpecimen)
-    assert result.segmentation_backend == "classical"
-
-
-# ---------------------------------------------------------------------------
-# Preparation from in-memory image (seam used by tests and pipeline)
-# ---------------------------------------------------------------------------
-
-def test_prepare_specimen_from_image_block():
-    result = prepare_specimen_from_image(_block_tissue_image(), role="block")
-    assert isinstance(result, PreparedSpecimen)
-
-
-def test_prepare_specimen_from_image_slide():
-    result = prepare_specimen_from_image(_slide_image_with_label(), role="slide")
-    assert isinstance(result, PreparedSpecimen)
-
-
 # ---------------------------------------------------------------------------
 # Failure cases
 # ---------------------------------------------------------------------------
 
-def test_unreadable_file_returns_failure(tmp_path):
-    bad_path = tmp_path / "nonexistent.jpg"
+@pytest.mark.parametrize("contents", [None, b"not an image"], ids=["missing", "corrupt"])
+def test_unreadable_file_returns_failure(tmp_path, contents):
+    bad_path = tmp_path / "bad.jpg"
+    if contents is not None:
+        bad_path.write_bytes(contents)
     result = prepare_specimen(bad_path, role="block")
     assert isinstance(result, PreparationFailure)
     assert result.role == "block"
     assert result.reason
 
 
-def test_invalid_image_data_returns_failure(tmp_path):
-    bad_path = tmp_path / "corrupt.jpg"
-    bad_path.write_bytes(b"not an image")
-    result = prepare_specimen(bad_path, role="block")
+@pytest.mark.parametrize("role, image", [
+    ("block", _blank_image()),
+    ("slide", np.zeros((10, 10, 3), dtype=np.uint8)),
+])
+def test_blank_image_returns_failure(role, image):
+    result = prepare_specimen_from_image(image, role=role)
     assert isinstance(result, PreparationFailure)
     assert result.reason
-
-
-def test_blank_image_returns_failure():
-    result = prepare_specimen_from_image(_blank_image(), role="block")
-    assert isinstance(result, PreparationFailure)
-    assert result.reason
-
-
-def test_failure_reason_is_non_empty_string():
-    result = prepare_specimen_from_image(np.zeros((10, 10, 3), dtype=np.uint8), role="slide")
-    assert isinstance(result, PreparationFailure)
-    assert len(result.reason) > 0
-
-
-# ---------------------------------------------------------------------------
-# Role awareness
-# ---------------------------------------------------------------------------
-
-def test_slide_preparation_does_not_crash_with_label_region():
-    result = prepare_specimen_from_image(_slide_image_with_label(), role="slide")
-    assert isinstance(result, PreparedSpecimen)
-
-
-def test_block_and_slide_role_recorded_on_result():
-    block = prepare_specimen_from_image(_block_tissue_image(), role="block")
-    slide = prepare_specimen_from_image(_slide_image_with_label(), role="slide")
-    assert block.role == "block"
-    assert slide.role == "slide"
-
 
 # ---------------------------------------------------------------------------
 # Crop mask embed
@@ -196,22 +136,6 @@ def test_embed_crop_mask_places_crop_at_origin():
     assert out.shape == (100, 100)
     assert np.count_nonzero(out) == 20 * 30
     assert out[0, 0] == 0
-
-
-# ---------------------------------------------------------------------------
-# Slide border inset — backlight-edge fringe removal (see mvp_tuning_log.md)
-# ---------------------------------------------------------------------------
-
-def _slide_image_edge_fringe() -> np.ndarray:
-    """Slide image: interior pink tissue blob + a pink strip hugging the right
-    edge (simulates the colored backlight-boundary fringe). The right strip is
-    vertically centered so the label detector does not treat it as a label."""
-    img = np.full((800, 600, 3), 230, dtype=np.uint8)
-    cv2.circle(img, (300, 400), 80, _TISSUE_PINK_BGR, -1)        # interior tissue
-    cv2.rectangle(img, (585, 300), (600, 500), _TISSUE_PINK_BGR, -1)  # edge fringe
-    return img
-
-
 
 
 def test_opposite_tag_artifact_filter_handles_landscape_left_tag():

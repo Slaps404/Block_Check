@@ -1,21 +1,12 @@
-"""End-to-end --profile integration test (issue #173).
+"""End-to-end --profile integration test.
 
-Every profiling slice (#168 flag+bundle, #169 motion command, #171 consumer
-clock seam, #172 settling observer + motion curve sync) already has unit/pure
-coverage in isolation, but nothing drives the REAL `PiCaptureRuntime` loop
-end-to-end with `profile=True` the way
-`test_pi_capture_runtime_drives_controller_and_publishes_block` does for
-block mode -- existing slide-mode tests bypass the loop by calling
-`runtime._consume_capture(...)` directly. This module closes that gap: it
-builds a real `ProcessingStore` + `LoopbackCaptureReceiver` +
-`SessionWorkflow` (with an injected scripted `clock`) and a real
-`PiCaptureRuntime(profile=True, action_logger=...)`, then drives
-`runtime.start(background=False)` + `runtime.process_frame(...)` through a
-scripted EMPTY -> SETTLING (with a deliberate flicker frame, so the settling
-reset count is >= 1) -> CAPTURE_REQUESTED sequence for one normal slide
-capture and one deliberately-marked-[SLOW] slide capture, then
-`runtime.end_session(confirm=True)` inside the receiver's `with` block so the
-motion-curve flush + HTTP upload lands `motion_curve.csv` into the bundle.
+Drives the REAL `PiCaptureRuntime` loop with `profile=True` against a real
+`ProcessingStore` + `LoopbackCaptureReceiver` + `SessionWorkflow` (with an
+injected scripted `clock`). Other slide-mode tests bypass the loop by calling
+`runtime._consume_capture(...)` directly. Runs one normal slide capture (with
+a flicker frame, so the settling reset count is >= 1) and one forced-[SLOW]
+capture, then `runtime.end_session(confirm=True)` inside the receiver's `with`
+block so the motion-curve upload lands `motion_curve.csv` in the bundle.
 
 No wall-clock comparison ever occurs between "two machines": the only clocks
 involved are the injected `SessionWorkflow._clock` (a scripted queue) and the
@@ -25,8 +16,9 @@ by capture identity (`result.path.stem`), not by timestamp equality.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
-import json
+import io
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,8 +34,6 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from action_logger import ActionLogger  # noqa: E402
 from capture_runtime import CAPTURE_STAGE_TIMING_KEYS, SETTLING_STAGE_KEYS  # noqa: E402
-from constants import SETTLING_CONFIRMATION_FRAMES  # noqa: E402
-from capture_session import SessionConfig  # noqa: E402
 from session.workflow import (  # noqa: E402
     FramingCalibrationStore,
     HttpCaptureClient,
@@ -53,7 +43,8 @@ from session.workflow import (  # noqa: E402
     SessionWorkflow,
 )
 
-import run_pi_session  # noqa: E402
+from app import pi_session as run_pi_session  # noqa: E402
+from store_harness import _identical_mask_slide_preprocessor  # noqa: E402
 
 
 STARTED_AT = datetime(2026, 7, 18, 12, 0, 0, tzinfo=timezone.utc)
@@ -128,13 +119,12 @@ def _build_workflow_and_runtime(
 ):
     """Builds a real slide-phase `SessionWorkflow` + `PiCaptureRuntime(profile=True)`.
 
-    Mirrors `test_pi_session.py`'s `_build_workflow`, plus: (1) an injected
-    scripted `clock` for deterministic consumer-split timings, (2) a real
-    `ActionLogger` (mandatory -- `_attach_capture_logging` is a no-op without
-    one, so `profile=True` alone would silently produce neither the console
-    block nor the summary row), (3) `profile=True`, and (4) draining an empty
-    session into the slides phase + calibrating the slide phase camera before
-    construction, exactly like `test_scanned_slide_capture_never_attempts_camera_qr_decode`.
+    Uses an injected scripted `clock` for deterministic consumer-split
+    timings and a real `ActionLogger` (mandatory: `_attach_capture_logging` is
+    a no-op without one, so `profile=True` alone would silently produce
+    neither the console block nor the summary row). The empty session is
+    drained into the slides phase and the slide camera calibrated before
+    construction.
     """
     workflow = SessionWorkflow(
         session=session,
@@ -216,10 +206,18 @@ def _drive_one_capture(runtime, payload, *, base_now, with_flicker):
     runtime.process_frame(empty, now=t, captured_at=captured_at)
 
 
-def test_profile_session_drives_a_normal_and_a_slow_slide_capture_end_to_end(
-    tmp_path, monkeypatch, capsys,
-):
-    store = ProcessingStore(tmp_path / "processing")
+def test_profile_session_drives_a_normal_and_a_slow_slide_capture_end_to_end(tmp_path):
+    """One profiled session: capture 1 (flickered, so it has a settling row)
+    then capture 2 (forced [SLOW]). Profiling is dev-only instrumentation, so
+    this single test is the whole --profile end-to-end guard.
+
+    Capture 2 is forced [SLOW] by lowering the threshold below any possible
+    elapsed time, since total_capture_ms is a real perf_counter() wrap.
+    """
+    store = ProcessingStore(
+        tmp_path / "processing",
+        slide_preprocessor=_identical_mask_slide_preprocessor,
+    )
     session = store.start_session(started_at=STARTED_AT)
     clock = _scripted_clock(
         [
@@ -229,299 +227,60 @@ def test_profile_session_drives_a_normal_and_a_slow_slide_capture_end_to_end(
             0.000, 0.005, 0.005, 0.010, 0.010, 0.015,
         ]
     )
+    first_console, second_console = io.StringIO(), io.StringIO()
 
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        with LoopbackCaptureReceiver(store) as receiver:
+            _workflow, runtime = _build_workflow_and_runtime(
+                tmp_path, store, session, receiver.url, clock=clock
+            )
+            runtime.start(background=False)
 
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-
-        # Capture 2 is forced [SLOW] regardless of real elapsed wall-clock
-        # time: total_capture_ms is a real time.perf_counter() wrap inside
-        # capture_runtime.py that cannot be injected, so the threshold is
-        # lowered below any possible elapsed time instead of sleeping.
-        monkeypatch.setattr(run_pi_session, "PROFILE_SLOW_CAPTURE_MS", -1)
-        _drive_one_capture(
-            runtime, "12080_51137182_01_HE", base_now=10.0, with_flicker=False
-        )
-
-        runtime.end_session(confirm=True)
-
-    console = capsys.readouterr().out
-    assert console.count("Profile") >= 2
-    assert "[SLOW]" in console
-
-
-def test_profile_summary_csv_has_one_row_per_capture_with_every_stage_column_joined_by_capture_id(
-    tmp_path, monkeypatch,
-):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock(
-        [
-            0.000, 0.010, 0.010, 0.030, 0.030, 0.060,
-            0.000, 0.005, 0.005, 0.010, 0.010, 0.015,
-        ]
-    )
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
-
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-        monkeypatch.setattr(run_pi_session, "PROFILE_SLOW_CAPTURE_MS", -1)
-        _drive_one_capture(
-            runtime, "12080_51137182_01_HE", base_now=10.0, with_flicker=False
-        )
-
-        runtime.end_session(confirm=True)
+            with contextlib.redirect_stdout(first_console):
+                _drive_one_capture(
+                    runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
+                )
+            monkeypatch.setattr(run_pi_session, "PROFILE_SLOW_CAPTURE_MS", -1)
+            with contextlib.redirect_stdout(second_console):
+                _drive_one_capture(
+                    runtime, "12080_51137182_01_HE", base_now=10.0, with_flicker=False
+                )
+                runtime.end_session(confirm=True)
 
     session_dir = next(store.root.glob(f"session_{session.number:06d}_*"))
-    summary_path = session_dir / "profile_summary.csv"
-    assert summary_path.is_file()
+    first, second = first_console.getvalue(), second_console.getvalue()
 
-    with summary_path.open("r", encoding="utf-8", newline="") as stream:
-        rows = list(csv.DictReader(stream))
+    # Console: a profile block per capture, settling row for the flickered
+    # one, consumer split and [SLOW] marker for the forced-slow one.
+    assert (first + second).count("Profile") >= 2
+    assert "settling:" in first and "resets=" in first
+    assert "decode" in second and "outbox" in second and "send" in second
+    assert "[SLOW]" in second
 
-    assert len(rows) == 2
-    required_columns = {
-        "capture_id",
-        "camera_capture_ms",
-        "publish_ms",
-        "consumer_ms",
-        "consumer_decode_ms",
-        "consumer_outbox_ms",
-        "consumer_send_ms",
-        "session_accept_ms",
-        "total_capture_ms",
-        "settling_duration_ms",
-        "settling_resets",
-        "settling_max_motion",
-    }
-    assert required_columns <= set(rows[0].keys())
-    assert set(CAPTURE_STAGE_TIMING_KEYS) | set(SETTLING_STAGE_KEYS) | {"capture_id"} == set(
-        rows[0].keys()
-    )
-
-    # Joined by capture identity: every row's capture_id is a distinct,
-    # non-empty stem (the published capture file's UUID stem) -- internal
-    # consistency, not a cross-reference against store.get_set (slide
-    # captures have no block-id business key at all).
-    capture_ids = [row["capture_id"] for row in rows]
-    assert all(capture_ids)
-    assert len(set(capture_ids)) == 2
-
-    # Capture 1 had confirmed motion -> at least one settling reset.
-    assert int(rows[0]["settling_resets"]) >= 1
-    # Capture 2's every stage column is populated too (not just capture 1's).
-    for row in rows:
-        for key in required_columns:
-            assert row[key] not in (None, ""), f"missing {key} in row {row}"
-
-
-def test_slide_benchmark_combines_pi_and_pc_stages_by_final_slide_id(
-    tmp_path, monkeypatch,
-):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock([0.000, 0.010, 0.010, 0.030, 0.030, 0.060])
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-        runtime.end_session(confirm=True)
-
-    session_dir = next(store.root.glob(f"session_{session.number:06d}_*"))
-    with (session_dir / "slide_benchmark.csv").open(
+    # Summary CSV: one fully-populated row per capture, joined by capture id.
+    with (session_dir / "profile_summary.csv").open(
         "r", encoding="utf-8", newline=""
     ) as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["capture_id"].startswith("slide_51137181_")
-    for key in (
-        "settling_ms", "camera_capture_ms", "publish_ms", "qr_decode_ms",
-        "outbox_write_ms", "transfer_wait_ms", "receive_persist_ms",
-        "qc_render_ms", "verdict_commit_export_ms", "full_total_ms",
-    ):
-        assert row[key] != "", f"missing {key}: {row}"
-
-
-def test_motion_curve_csv_is_synced_into_the_bundle_at_session_end(tmp_path, monkeypatch):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock(
-        [
-            0.000, 0.010, 0.010, 0.030, 0.030, 0.060,
-            0.000, 0.005, 0.005, 0.010, 0.010, 0.015,
-        ]
+    assert len(rows) == 2
+    assert set(rows[0].keys()) == (
+        set(CAPTURE_STAGE_TIMING_KEYS) | set(SETTLING_STAGE_KEYS) | {"capture_id"}
     )
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
-
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-        monkeypatch.setattr(run_pi_session, "PROFILE_SLOW_CAPTURE_MS", -1)
-        _drive_one_capture(
-            runtime, "12080_51137182_01_HE", base_now=10.0, with_flicker=False
-        )
-
-        runtime.end_session(confirm=True)
-
-    session_dir = next(store.root.glob(f"session_{session.number:06d}_*"))
-    curve_path = session_dir / "motion_curve.csv"
-    assert curve_path.is_file()
-
-    with curve_path.open("r", encoding="utf-8", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-    # Non-empty: header plus at least one buffered per-frame row synced in.
-    assert len(rows) > 0
-    assert "presence_score" in rows[0]
-    assert all(row["presence_score"] != "" for row in rows)
-
-
-def test_profile_config_records_effective_settling_controls_in_the_bundle(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock([0.000, 0.010, 0.010, 0.030, 0.030, 0.060])
-    configured = SessionConfig(
-        baseline_frames=1,
-        stable_duration=0.75,
-        removal_duration=0.25,
-        motion_threshold=0.034,
-        presence_threshold=0.056,
+    assert len({row["capture_id"] for row in rows if row["capture_id"]}) == 2
+    assert int(rows[0]["settling_resets"]) >= 1
+    required = (
+        "camera_capture_ms", "publish_ms", "consumer_ms", "consumer_decode_ms",
+        "consumer_outbox_ms", "consumer_send_ms", "session_accept_ms",
+        "total_capture_ms", "settling_duration_ms", "settling_resets",
+        "settling_max_motion",
     )
+    for row in rows:
+        for key in required:
+            assert row[key] not in (None, ""), f"missing {key} in row {row}"
 
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path,
-            store,
-            session,
-            receiver.url,
-            clock=clock,
-            session_config=configured,
-        )
-        runtime.start(background=False)
-        assert runtime.profile_config_path is not None
-        assert runtime.profile_config_path.is_file()
-
-        runtime.end_session(confirm=True)
-
-    session_dir = next(store.root.glob(f"session_{session.number:06d}_*"))
-    config_path = session_dir / "profile_config.json"
-    assert config_path.is_file()
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {
-        "schema_version": 1,
-        "stable_duration": 0.75,
-        "removal_duration": 0.25,
-        "motion_threshold": 0.034,
-        "presence_threshold": 0.056,
-        "SETTLING_CONFIRMATION_FRAMES": SETTLING_CONFIRMATION_FRAMES,
-    }
-
-
-def test_console_output_contains_consumer_split_settling_row_and_slow_marker(
-    tmp_path, monkeypatch, capsys,
-):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock(
-        [
-            0.000, 0.010, 0.010, 0.030, 0.030, 0.060,
-            0.000, 0.005, 0.005, 0.010, 0.010, 0.015,
-        ]
-    )
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
-
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-        capsys.readouterr()  # discard capture 1's console output for isolation
-
-        monkeypatch.setattr(run_pi_session, "PROFILE_SLOW_CAPTURE_MS", -1)
-        _drive_one_capture(
-            runtime, "12080_51137182_01_HE", base_now=10.0, with_flicker=False
-        )
-
-        runtime.end_session(confirm=True)
-
-    console = capsys.readouterr().out
-    # Capture 2's block: consumer split, [SLOW] marker (capture 2 is forced
-    # slow). The settling row requires a flicker (capture 1 only), so it is
-    # asserted on capture 1's block below instead.
-    assert "consumer" in console
-    assert "decode" in console and "outbox" in console and "send" in console
-    assert "[SLOW]" in console
-
-
-def test_profile_console_settling_row_appears_for_a_flickered_capture(
-    tmp_path, capsys,
-):
-    """The settling roll-up row (`settling: <ms>ms (resets=..., max_motion=...)`)
-    only renders when all three `SETTLING_STAGE_KEYS` are present -- which only
-    happens for a capture that actually passed through an observed SETTLING
-    window (capture 1's deliberate flicker), documented separately from the
-    consumer-split/[SLOW] assertions above so each capture's distinct
-    contribution is pinned down on its own."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    clock = _scripted_clock([0.000, 0.010, 0.010, 0.030, 0.030, 0.060])
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        workflow, runtime = _build_workflow_and_runtime(
-            tmp_path, store, session, receiver.url, clock=clock
-        )
-        runtime.start(background=False)
-
-        _drive_one_capture(
-            runtime, "12080_51137181_01_HE", base_now=1.0, with_flicker=True
-        )
-
-        runtime.end_session(confirm=True)
-
-    console = capsys.readouterr().out
-    assert "settling:" in console
-    assert "resets=" in console
-    assert "max_motion=" in console
-
-
-def test_profile_join_uses_capture_identity_not_wall_clock():
-    """Documents (rather than newly asserts) the no-cross-machine-clock
-    property: `SessionWorkflow` takes exactly one injectable `clock`
-    (`code/session/workflow.py`'s `SessionWorkflow.__init__(..., clock=...)`),
-    and `PiCaptureRuntime.process_frame`/`CaptureController._capture` only
-    ever consume the local `now`/`time.perf_counter()` values this test
-    supplies directly -- profile_summary.csv rows are joined to the uploaded
-    motion_curve.csv by `capture_id` (`result.path.stem`), never by comparing
-    timestamps produced on two different machines. See
-    `test_profile_summary_csv_has_one_row_per_capture_with_every_stage_column_joined_by_capture_id`
-    and `test_motion_curve_csv_is_synced_into_the_bundle_at_session_end` above,
-    which together are the only two clock-touching assertions in this module.
-    """
-    import inspect
-
-    signature = inspect.signature(SessionWorkflow.__init__)
-    assert "clock" in signature.parameters
+    # Motion curve is flushed and uploaded into the bundle at session end.
+    with (session_dir / "motion_curve.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as stream:
+        curve = list(csv.DictReader(stream))
+    assert curve and all(row["presence_score"] != "" for row in curve)

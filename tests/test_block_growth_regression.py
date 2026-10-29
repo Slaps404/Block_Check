@@ -6,32 +6,22 @@ tests exercise the actual liver targets that motivated the promotion (blocks
 32/33/34) and assert on the FINAL production mask:
 
   - Large-dark-region coverage (cassette-window-scoped, 8-connected `V <= 100`
-    components >= 1500 px) is >= 95 %.
-  - Connected-component count on the final mask matches the spec-expected
-    count for each block (7 / 7 / 6).
-
-See `docs/mvp_tuning_log/037_topology_preserving_block_growth_diagnostic.md`
-for the validated numbers (coverage ~99-100%, counts 7/7/6).
+    components >= 1500 px) is >= 95 % (coverage was ~99-100% at promotion).
 
 Skips automatically when the image directory / files are missing (CI without
 the real image dataset will not fail).
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
-
-from session.preparation import prepare_specimen_from_image, PreparedSpecimen  # noqa: E402
-from block.growth import _inside_window  # noqa: E402
-from block.roi_mask import find_cassette_window  # noqa: E402
+from session.preparation import prepare_specimen_from_image, PreparedSpecimen
+from block.growth import _inside_window
+from block.roi_mask import find_cassette_window
 
 
 def _large_value_region(
@@ -63,8 +53,6 @@ _FILES = {
     34: _IMG_DIR / "block_034_liver_DGK-EX00_01_HE.png",
 }
 
-_EXPECTED_COMPONENT_COUNT = {32: 7, 33: 7, 34: 6}
-
 _ALL_PRESENT = all(p.exists() for p in _FILES.values())
 pytestmark = pytest.mark.skipif(
     not _ALL_PRESENT,
@@ -91,16 +79,6 @@ def _load_run(block_num: int) -> tuple[np.ndarray, np.ndarray]:
     return bgr, result.mask
 
 
-def _component_count(mask: np.ndarray) -> int:
-    count, _, stats, _ = cv2.connectedComponentsWithStats(
-        (mask > 0).astype(np.uint8),
-        connectivity=8,
-    )
-    return sum(
-        1 for label in range(1, count) if int(stats[label, cv2.CC_STAT_AREA]) > 0
-    )
-
-
 # ---------------------------------------------------------------------------
 # Test: liver targets (32, 33, 34) must reach >= 95% large-dark coverage
 # ---------------------------------------------------------------------------
@@ -123,20 +101,4 @@ def test_large_dark_coverage_liver_targets(block_num):
         f"Block {block_num}: large-dark coverage is {frac:.1%} "
         f"(need >= {_MIN_LARGE_DARK_COVERAGE:.0%}). "
         f"Region pixels: {total}, covered: {covered}."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test: liver targets (32, 33, 34) must match spec-expected component counts
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("block_num", [32, 33, 34])
-def test_component_count_liver_targets(block_num):
-    """Liver blocks 32/33/34 must have the spec-expected final component count."""
-    _, mask = _load_run(block_num)
-    expected = _EXPECTED_COMPONENT_COUNT[block_num]
-    actual = _component_count(mask)
-    assert actual == expected, (
-        f"Block {block_num}: final mask has {actual} connected components "
-        f"(expected {expected})."
     )

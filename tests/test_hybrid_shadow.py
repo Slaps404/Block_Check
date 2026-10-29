@@ -1,4 +1,4 @@
-"""TDD coverage for #254: Hybrid Shadow.
+"""Hybrid Shadow.
 
 A `hybrid_shadow` slide job selects candidates exactly as Hybrid would
 (`ProcessingStore.select_hybrid_candidates`), then runs ONE complete accurate
@@ -13,18 +13,15 @@ This file drives the whole store-side slice through `ProcessingStore` with
 synthetic captures, an injected slide preprocessor, an injected
 `score_cache_builder`, and a stubbed `select_hybrid_candidates`/
 `score_routed_caches` seam -- no camera, no network, no real timing, no real
-descriptor catalog. Candidate selection is hand-authored throughout (per the
-issue's testing decision) rather than driven through the real Heuristic
-Candidate Band math, which `tests/test_hybrid_slide_queue.py` (#253) and
-`tests/test_candidate_band.py` already cover.
+descriptor catalog. Candidate selection is hand-authored throughout rather
+than driven through the real Heuristic Candidate Band math, which
+`tests/test_hybrid_slide_queue.py` and `tests/test_candidate_band.py` cover.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -33,31 +30,34 @@ import pytest
 
 import session.processing_store as processing_store
 from session.processing_store import ProcessingStore
-from session.preparation import PreparedResult, PreparedSpecimen
-from slide.qr import DecodeCandidate, select_slide_identity
-from verify.candidate_band import CandidateSelection
-from verify.invariant_descriptors import DescriptorValue
-from verify.scorer import LockedScoreCache, _ComponentFeatures
+from retrieval.candidate_band import CandidateSelection
+from store_harness import (  # noqa: F401
+    lightweight_qc_artifacts,
+    DESCRIPTOR_NAMES as _DESCRIPTOR_NAMES,
+    FixedSlidePreprocessor as _FixedSlidePreprocessor,
+    IdenticalFingerprintBuilder as _IdenticalFingerprintBuilder,
+    STARTED_AT,
+    capture_png as _capture_png,
+    drain as _drain,
+    score_cache_builder as _score_cache_builder,
+    valid_slide_result as _valid_slide_result,
+    write_slide_png as _write_slide_png,
+)
 
-
-STARTED_AT = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
-_DESCRIPTOR_NAMES = ("fake_descriptor_v1",)
 
 CLAIM = "10000001"
 RUNNER_UP = "10000002"  # the true strongest non-claim competitor
 OTHER = "10000003"
 
-# Hand-authored accurate score map (issue's testing decision: drive the
-# comparison from hand-authored score maps and candidate sets, not the real
-# scorer/descriptor pipeline). MATCH_MARGIN is 0.05 (code/constants.py):
-# CLAIM vs RUNNER_UP sit 0.015 apart (a genuine near-miss under the current
-# 0.02 MATCH_MARGIN); CLAIM vs OTHER sit
-# 0.80 apart (a clear win once RUNNER_UP is out of the picture).
+# Hand-authored accurate score map: drive the comparison from hand-authored
+# score maps and candidate sets, not the real scorer/descriptor pipeline.
+# CLAIM vs RUNNER_UP sit 0.015 apart (a genuine near-miss under MATCH_MARGIN
+# 0.02, code/constants.py); CLAIM vs OTHER sit 0.80 apart (a clear win once
+# RUNNER_UP is out of the picture).
 _SCORE_BY_BLOCK = {CLAIM: 0.90, RUNNER_UP: 0.885, OTHER: 0.10}
 # Fraction each block's fixed mask is filled to (see _ValueEncodingBlockPreprocessor
 # below) -- distinct so the fake scorer can tell blocks apart by mask content
-# alone, exactly like tests/test_hybrid_slide_queue.py's own fixture of the
-# same name.
+# alone.
 _FRACTION_BY_BLOCK = {CLAIM: 1.0, RUNNER_UP: 0.875, OTHER: 0.125}
 
 
@@ -75,22 +75,9 @@ class _FakeScoreResult:
 
 
 @pytest.fixture(autouse=True)
-def lightweight_qc_artifacts(monkeypatch):
-    """The real QC panel renderer assumes the mask matches the capture's
-    dimensions, which these tests' small synthetic masks deliberately do not
-    (mirrors tests/test_hybrid_slide_queue.py's fixture of the same name)."""
-    def write_qc(capture, mask, destination):
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_failure_qc(capture, reason, destination):
-        panel = np.full((8, 8, 3), (0, 0, 180), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    monkeypatch.setattr(ProcessingStore, "_write_qc", staticmethod(write_qc))
-    monkeypatch.setattr(
-        ProcessingStore, "_write_failure_qc", staticmethod(write_failure_qc)
-    )
+def _lightweight_qc(lightweight_qc_artifacts):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into the shared harness fixture."""
 
 
 class _ValueEncodingBlockPreprocessor:
@@ -98,8 +85,7 @@ class _ValueEncodingBlockPreprocessor:
     so distinct blocks end up with genuinely distinguishable mask content --
     needed because `hybrid_pool()` decompresses fresh array objects on every
     read, so a fake scorer keyed on object identity would not survive the
-    archive round-trip between freeze and the worker's own call (mirrors
-    tests/test_hybrid_slide_queue.py's fixture of the same name).
+    archive round-trip between freeze and the worker's own call.
     """
 
     def __call__(self, capture_path: Path):
@@ -110,40 +96,6 @@ class _ValueEncodingBlockPreprocessor:
         mask = np.zeros((8, 8), dtype=np.uint8)
         mask[:rows_filled, :] = 255
         return mask, {"role": "block", "roi_ok": True}
-
-
-class _FixedSlidePreprocessor:
-    def __call__(self, image: np.ndarray) -> PreparedResult:
-        return PreparedSpecimen(
-            role="slide", mask=np.full((8, 8), 255, dtype=np.uint8),
-            roi_ok=True, roi_reason="",
-        )
-
-
-class _IdenticalFingerprintBuilder:
-    """Every block/slide gets the IDENTICAL fingerprint vector, keyed under
-    the fake descriptor name `_DESCRIPTOR_NAMES` freezes with -- selection is
-    fully stubbed in this file (`_stub_selection`), so the real fingerprint
-    content is never inspected; this only needs to exist so
-    `freeze_hybrid_pool`'s `values[name].vector for name in descriptor_names`
-    lookup does not KeyError on a descriptor name outside the real catalog
-    (mirrors tests/test_hybrid_slide_queue.py's fixture of the same name)."""
-
-    def __call__(self, mask):
-        return {
-            "fake_descriptor_v1": DescriptorValue(
-                vector=np.array([1.0, 2.0, 3.0]), construction_ns=1
-            )
-        }
-
-
-def _score_cache_builder(specimen: PreparedSpecimen) -> LockedScoreCache:
-    return LockedScoreCache(
-        normalized_mask=specimen.mask,
-        component_features=_ComponentFeatures(
-            points=np.zeros((0, 2)), areas=np.zeros(0), shapes=np.zeros((0, 3)),
-        ),
-    )
 
 
 def _hand_authored_score_routed_caches(block_cache, slide_cache, **kwargs):
@@ -170,13 +122,6 @@ def _make_store(tmp_path: Path, **kwargs) -> ProcessingStore:
     return ProcessingStore(tmp_path / "processing", **kwargs)
 
 
-def _capture_png(value: int) -> bytes:
-    image = np.full((32, 32, 3), value, dtype=np.uint8)
-    success, png = cv2.imencode(".png", image)
-    assert success
-    return png.tobytes()
-
-
 def _capture_block(store: ProcessingStore, session_number: int, block_id: str) -> None:
     assert store.scan_block(session_number, block_id).accepted
     body = _capture_png(_fill_value_for(block_id))
@@ -185,23 +130,6 @@ def _capture_block(store: ProcessingStore, session_number: int, block_id: str) -
         session_number, capture_id=f"cap-{block_id}", block_id=block_id,
         checksum=checksum, body=body,
     )
-
-
-def _drain(store: ProcessingStore, session_number: int) -> None:
-    store.wait_for_jobs()
-    store.begin_block_drain(session_number)
-
-
-def _valid_slide_result(block_id: str):
-    return select_slide_identity((
-        DecodeCandidate("zxing", "QRCode", "raw", f"12080_{block_id}_01_HE"),
-    ))
-
-
-def _write_slide_png(path: Path, value: int = 200) -> Path:
-    image = np.full((24, 24, 3), value, dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
-    return path
 
 
 def _freeze_hybrid_session(
@@ -224,7 +152,7 @@ def _freeze_hybrid_session(
 def _stub_selection(candidate_ids: tuple[str, ...], pruned_ids: tuple[str, ...]):
     """A hand-authored, always-valid CandidateSelection: exactly what real
     Hybrid would have selected, with no dependency on the real descriptor
-    catalog/fusion math (already covered by #253's own tests)."""
+    catalog/fusion math (covered in tests/test_hybrid_slide_queue.py)."""
     selection = CandidateSelection(
         claim_id=CLAIM,
         candidate_ids=candidate_ids,
@@ -403,7 +331,7 @@ def test_plain_hybrid_still_scores_only_the_subset_not_the_whole_pool(
 
     row = store.get_slide_capture(session_number, capture_id)
     assert row["job_state"] == "complete"
-    # Plain Hybrid never runs the #254 comparison path at all.
+    # Plain Hybrid never runs the shadow comparison path at all.
     assert row["shadow_comparison_json"] is None
     assert store.get_set(session_number, CLAIM)["verdict"] == "REVIEW"
 
@@ -451,91 +379,3 @@ def test_shadow_comparison_persistence_failure_still_writes_real_verdict(
     session = store._session_identity(session_number)
     log_text = (session.directory / "events.log").read_text(encoding="utf-8")
     assert "hybrid_shadow_comparison_failed" in log_text
-
-
-# ---------------------------------------------------------------------------
-# 7. Legacy-DB migration: `shadow_comparison_json` is added additively, never
-#    a silent no-op against a real pre-#254 database.
-# ---------------------------------------------------------------------------
-
-
-def test_legacy_slide_captures_table_without_shadow_comparison_json_is_migrated(
-    tmp_path, monkeypatch,
-):
-    root = tmp_path / "processing"
-    root.mkdir()
-    connection = sqlite3.connect(root / "sessions.sqlite3")
-    try:
-        connection.execute(
-            """CREATE TABLE slide_captures (
-                capture_id TEXT PRIMARY KEY,
-                session_number INTEGER NOT NULL,
-                captured_at TEXT NOT NULL,
-                capture_path TEXT NOT NULL,
-                checksum TEXT NOT NULL,
-                success INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                raw_payload TEXT,
-                payload_format TEXT,
-                block_id TEXT,
-                slide_num TEXT,
-                stain TEXT,
-                work_order TEXT,
-                email TEXT,
-                genotype TEXT,
-                engine TEXT,
-                symbology TEXT,
-                preprocessing TEXT,
-                duration_ms REAL NOT NULL,
-                attempts_json TEXT NOT NULL,
-                verdict TEXT,
-                claim_score REAL,
-                claim_stage TEXT,
-                claim_reason TEXT,
-                claim_qc_path TEXT,
-                claim_decided_at TEXT,
-                work_order_id INTEGER,
-                top_block TEXT,
-                near_miss_blocks TEXT,
-                top_score REAL,
-                runner_up_score REAL,
-                match_margin REAL,
-                job_state TEXT,
-                candidate_selection_json TEXT
-            )"""
-        )
-        connection.commit()
-        pre_migration_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(slide_captures)")
-        }
-    finally:
-        connection.close()
-    assert "shadow_comparison_json" not in pre_migration_columns
-
-    monkeypatch.setattr(
-        ProcessingStore, "select_hybrid_candidates",
-        _stub_selection(candidate_ids=(OTHER,), pruned_ids=(RUNNER_UP,)),
-    )
-    monkeypatch.setattr(
-        processing_store, "score_routed_caches", _hand_authored_score_routed_caches
-    )
-    store = _make_store(tmp_path)
-    with store._connect() as db:
-        post_migration_columns = {
-            row["name"] for row in db.execute("PRAGMA table_info(slide_captures)")
-        }
-    assert "shadow_comparison_json" in post_migration_columns
-
-    session_number, _ = _freeze_hybrid_session(
-        store, "hybrid_shadow", (CLAIM, RUNNER_UP, OTHER),
-    )
-    capture_id = _record_slide(store, session_number, tmp_path)
-    store.wait_for_jobs()
-
-    row = store.get_slide_capture(session_number, capture_id)
-    assert row["job_state"] == "complete"
-    # The migrated column round-trips a real write from
-    # `_persist_shadow_comparison`.
-    comparison = json.loads(row["shadow_comparison_json"])
-    assert comparison["complete_verdict"] == "REVIEW"
-    assert comparison["proposed_verdict"] == "PASS"

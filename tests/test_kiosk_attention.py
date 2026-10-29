@@ -1,6 +1,6 @@
-"""#256: the pure Hybrid attention-banner projection (`kiosk.attention`).
+"""The pure Hybrid attention-banner projection (`kiosk.attention`).
 
-Mirrors `test_kiosk_results_table.py`'s style: synthetic row dicts, no I/O,
+Synthetic row dicts, no I/O,
 no store, no camera. This is the seam `KioskRelay._attention_banner` wraps
 in its own try/except; these tests exercise the pure function directly.
 """

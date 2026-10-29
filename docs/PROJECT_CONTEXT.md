@@ -32,8 +32,8 @@ The system is **not** open retrieval by default: it checks the claimed pair and 
 ## Architecture (public map)
 
 Data flow: capture/session bring images in; block/slide prepare masks; verify
-scores the claimed pair; kiosk/store handle UI and the Pi <-> PC boundary.
-`tools/` is CLI-only (not imported by production).
+scores the claimed pair; kiosk is the UI; transport is the Pi <-> PC boundary.
+`tools/` holds only launchers (not imported by production).
 
 | Area | Role |
 | --- | --- |
@@ -42,17 +42,13 @@ scores the claimed pair; kiosk/store handle UI and the Pi <-> PC boundary.
 | `code/kiosk/` | Touchscreen UI + router |
 | `code/block/`, `code/slide/` | Role-specific prep / segmentation |
 | `code/verify/` | Scoring, gates, work-order evaluation |
-| `code/store/` | Two-machine store / RPC boundary |
-| `tools/setup_check.py` | Pre-flight env check |
-| `tools/capture/` | Pi auto-capture launch + capture tagging |
-| `tools/manifest/` | PNG manifest builders |
-| `tools/identity/` | QR / barcode decode helpers |
-| `tools/scoring_diagnostics/` | Numeric pair diagnostics (CSVs, metrics) |
-| `tools/visual_audit/` | Overlay / contact-sheet PNGs for review |
-| `tools/matching_corpus/` | Matching-pair sync / score / freeze from session DB |
+| `code/retrieval/` | Optional candidate retrieval, Hybrid configuration |
+| `code/transport/` | Pi <-> PC remote store and wire encoding |
+| `code/app/` | Pi session and receiver entry points |
+| `tools/` | `setup_check.py`, `run_receiver.py`, `run_pi_session.py`, `start_*` launchers |
 | `tests/` | Unit/integration tests (image-heavy tests skip without datasets) |
 
-See root `README.md` for the short map and `tools/README.md` for every script.
+See root `README.md` for the short map.
 Durable decisions live in `docs/adr/`. Condensed "do not repeat" lessons live in
 `docs/lessons_learned.md`.
 
@@ -71,5 +67,5 @@ Live two-machine launchers (when hardware is available):
 
 ## What this public repo does not include
 
-Private image corpora, regenerable `outputs/`, archived experiments, MVP tuning
+Private image corpora, trained QuPath model files, research/diagnostic tools, regenerable `outputs/`, archived experiments, MVP tuning
 notebooks, and internal agent/process docs. Those stay in the private lab home.

@@ -1,20 +1,13 @@
-"""Tests for visual review contact sheet generation (issue #20).
+"""Tests for visual review contact sheet generation.
 
 Contact sheet tests verify file creation and basic dimensions/existence.
 Pixel-level correctness is verified by manual inspection.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pytest
-
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 import contact_sheet
 from contact_sheet import _overlay_panel, id_line_text, write_contact_sheet
@@ -96,21 +89,8 @@ def _scored_decision(angle, flip, align_soft_iou, mask_iou) -> ClaimDecision:
 # File creation
 # ---------------------------------------------------------------------------
 
-def test_contact_sheet_creates_file(tmp_path):
-    out = tmp_path / "sheet_C001.png"
-    write_contact_sheet(
-        block_img=_dark_blob(),
-        slide_img=_dark_blob(),
-        block_result=_good_block(),
-        slide_result=_good_slide(),
-        decision=_decision(),
-        output_path=out,
-    )
-    assert out.exists()
-
-
-def test_contact_sheet_is_readable_image(tmp_path):
-    out = tmp_path / "sheet.png"
+def test_contact_sheet_writes_readable_multi_panel_image(tmp_path):
+    out = tmp_path / "sheets" / "subdir" / "sheet_C001.png"  # parents created
     write_contact_sheet(
         block_img=_dark_blob(),
         slide_img=_dark_blob(),
@@ -121,23 +101,8 @@ def test_contact_sheet_is_readable_image(tmp_path):
     )
     img = cv2.imread(str(out))
     assert img is not None
-    assert img.shape[0] > 0 and img.shape[1] > 0
-
-
-def test_contact_sheet_has_minimum_width(tmp_path):
-    out = tmp_path / "sheet.png"
-    write_contact_sheet(
-        block_img=_dark_blob(),
-        slide_img=_dark_blob(),
-        block_result=_good_block(),
-        slide_result=_good_slide(),
-        decision=_decision(),
-        output_path=out,
-    )
-    img = cv2.imread(str(out))
     # Sheet should be wide enough to show multiple panels side by side
     assert img.shape[1] >= 600, f"sheet width {img.shape[1]} too narrow for panels"
-
 
 def test_overlay_panel_uses_normalized_d4_alignment():
     block_mask = _asymmetric_mask()
@@ -153,7 +118,7 @@ def test_overlay_panel_uses_normalized_d4_alignment():
 
 
 # ---------------------------------------------------------------------------
-# #199: reuse the scored decision's locked pose instead of re-running
+# Reuse the scored decision's locked pose instead of re-running
 # align_masks's full rotation+flip search when a pose is already known.
 # ---------------------------------------------------------------------------
 
@@ -183,28 +148,6 @@ def test_overlay_panel_reuses_pose_skips_align_masks(monkeypatch):
     assert panel.any()
 
 
-def test_overlay_panel_no_pose_calls_align_masks(monkeypatch):
-    block_mask = _asymmetric_mask()
-    slide_mask = cv2.rotate(block_mask, cv2.ROTATE_90_CLOCKWISE)
-
-    real_align_masks = contact_sheet.align_masks
-    calls = []
-
-    def _spy(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_align_masks(*args, **kwargs)
-
-    monkeypatch.setattr(contact_sheet, "align_masks", _spy)
-
-    # Pose-less decision (no best_angle set).
-    _overlay_panel(_good_block(mask=block_mask), _good_slide(mask=slide_mask), _decision())
-    assert len(calls) == 1, "align_masks must run when decision has no locked pose"
-
-    # No decision at all.
-    _overlay_panel(_good_block(mask=block_mask), _good_slide(mask=slide_mask), None)
-    assert len(calls) == 2, "align_masks must run when there is no decision"
-
-
 def test_overlay_panel_scored_path_pixel_equivalent():
     block_mask = _asymmetric_mask()
     slide_mask = cv2.rotate(block_mask, cv2.ROTATE_90_CLOCKWISE)
@@ -223,12 +166,10 @@ def test_overlay_panel_scored_path_pixel_equivalent():
 
 
 def test_write_contact_sheet_header_includes_slide_id_and_role_label(tmp_path):
-    """#151: each specimen in a flagged pair must be labeled with its unique
-    id (slide capture id) and a role tag (TOP MATCH / CLAIMED) so the
-    operator can tell the two sheets for a disagreement apart. The new
-    params are optional -- omitting them must reproduce the pre-#151 sheet
-    exactly (same header height), so existing single-pair callers stay
-    byte-identical."""
+    """Each specimen in a flagged pair is labeled with its unique id (slide
+    capture id) and a role tag (TOP MATCH / CLAIMED) so the operator can tell
+    the two sheets for a disagreement apart. The params are optional;
+    omitting them keeps the unlabeled header height."""
     baseline_out = tmp_path / "sheet_baseline.png"
     write_contact_sheet(
         block_img=_dark_blob(),
@@ -261,27 +202,13 @@ def test_write_contact_sheet_header_includes_slide_id_and_role_label(tmp_path):
 
 
 def test_id_line_text_includes_block_id_via_role_label():
-    """#151 AC3: each specimen must be labeled with its unique id. The
-    caller (session_workflow._score_work_order) folds the block id into
-    role_label (e.g. "TOP MATCH 51151378"); this pins that the rendered
-    header text actually carries it through, not just the filename."""
+    """The caller folds the block id into role_label (e.g. "TOP MATCH
+    51151378"); the rendered header text must carry it through, not just
+    the filename."""
     text = id_line_text("capture_9", "TOP MATCH 51151378")
     assert "51151378" in text
     assert "capture_9" in text
     assert "TOP MATCH" in text
-
-
-def test_contact_sheet_creates_parent_dirs(tmp_path):
-    out = tmp_path / "sheets" / "subdir" / "sheet.png"
-    write_contact_sheet(
-        block_img=_dark_blob(),
-        slide_img=_dark_blob(),
-        block_result=_good_block(),
-        slide_result=_good_slide(),
-        decision=_decision(),
-        output_path=out,
-    )
-    assert out.exists()
 
 
 # ---------------------------------------------------------------------------

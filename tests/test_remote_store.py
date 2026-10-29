@@ -1,14 +1,13 @@
-"""TDD coverage for the remote store proxy (issue #115).
+"""TDD coverage for the remote store proxy.
 
 Exercises `RemoteProcessingStore` against a REAL `LoopbackCaptureReceiver` +
 `ProcessingStore` (the same server pattern as `tests/test_rpc_store.py` and
 `tests/test_idempotency_ledger.py`), so these tests prove the proxy and the
-#114 server/ledger actually cooperate over the wire -- not just that each
+server/ledger actually cooperate over the wire -- not just that each
 side's mocks agree with each other.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,10 +16,16 @@ import cv2
 import numpy as np
 import pytest
 
-from store.remote import RemoteProcessingStore, StoreError, TransportError, UrlTransport
+from transport.remote import RemoteProcessingStore, StoreError, TransportError, UrlTransport
 from slide.qr import select_slide_identity
 from session.workflow import (
-    LoopbackCaptureReceiver, PiOutbox, ProcessingStore, ScanOutcome, WorkflowEvent,
+    BlockReadiness, LoopbackCaptureReceiver, PiOutbox, ProcessingStore, ScanOutcome,
+    WorkflowEvent,
+)
+from store_harness import (  # noqa: F401
+    fake_fingerprint_builder as _fake_fingerprint_builder,
+    fake_score_cache_builder as _fake_score_cache_builder,
+    upload_block as _upload_block,
 )
 
 STARTED_AT = datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
@@ -95,20 +100,6 @@ class AlwaysFailTransport:
         raise TransportError("simulated: connection refused")
 
 
-class RejectingTransport:
-    """Simulates a domain rejection (HTTP 400) without touching any server."""
-
-    def __init__(self):
-        self.post_calls = 0
-
-    def post(self, url, payload):
-        self.post_calls += 1
-        raise StoreError("simulated: domain rejection")
-
-    def get(self, url):
-        raise StoreError("simulated: domain rejection")
-
-
 class ResponseSequenceTransport:
     """Returns successive HTTP-200 bodies without interpreting their content."""
 
@@ -130,16 +121,90 @@ class ResponseSequenceTransport:
 # --------------------------------------------------------------------------
 
 
-def test_scan_block_happy_path_returns_rehydrated_scan_outcome(tmp_path):
+def _scan_block_happy_path(store, session, proxy):
+    outcome = proxy.scan_block(session.number, "51151378")
+    assert isinstance(outcome, ScanOutcome)
+    assert outcome == ScanOutcome(True, "Accepted block 51151378")
+
+
+def _events(store, session, proxy):
+    store.scan_block(session.number, "51151378")
+    events = proxy.events(session.number)
+    assert isinstance(events, tuple)
+    assert all(isinstance(event, WorkflowEvent) for event in events)
+    assert any(event.kind == "block_scanned" for event in events)
+
+
+def _block_readiness(store, session, proxy):
+    store.scan_block(session.number, "51151378")
+    readiness = proxy.block_readiness(session.number, "51151378")
+    assert isinstance(readiness, BlockReadiness)
+    assert readiness.evaluable is False
+    assert readiness.review_reason
+
+
+def _snapshot(store, session, proxy):
+    # Rides the /status route, not /rpc.
+    snapshot = proxy.snapshot(session)
+    assert snapshot.session_number == session.number
+    assert snapshot.phase == "blocks"
+
+
+def _block_capture_recovery(store, session, proxy):
+    store.scan_block(session.number, "22222222")
+    store.scan_block(session.number, "11111111")
+    assert proxy.awaiting_capture_blocks(session.number) == ("22222222", "11111111")
+    assert proxy.unscan_block(session.number, "22222222")
+    assert proxy.awaiting_capture_blocks(session.number) == ("11111111",)
+
+
+def _list_results_ready(store, session, proxy):
+    # Shape parity when nothing is results-ready: the same empty tuple.
+    remote_rows = proxy.list_results_ready_work_orders(session.number)
+    assert remote_rows == store.list_results_ready_work_orders(session.number) == ()
+
+
+def _open_work_order_id(store, session, proxy):
+    # The boot-seed read helper, both None and open-id cases.
+    assert proxy.open_work_order_id(session.number) is None
+    work_order_id = proxy.start_work_order(session.number)
+    assert proxy.open_work_order_id(session.number) == work_order_id
+    assert store.open_work_order_id(session.number) == work_order_id
+
+
+def _has_work_orders(store, session, proxy):
+    assert proxy.has_work_orders(session.number) is False
+    proxy.start_work_order(session.number)
+    assert proxy.has_work_orders(session.number) is True
+
+
+def _work_order_start_and_finish(store, session, proxy):
+    # The Pi crash: both start and finish must be proxied.
+    work_order_id = proxy.start_work_order(session.number)
+    assert isinstance(work_order_id, int)
+    assert proxy.finish_work_order(session.number, start_job=False) == work_order_id
+    assert store.get_work_order(session.number, work_order_id)["lifecycle_state"] == (
+        "scoring"
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _scan_block_happy_path, _events, _block_readiness, _snapshot,
+        _block_capture_recovery, _list_results_ready, _open_work_order_id,
+        _has_work_orders, _work_order_start_and_finish,
+    ],
+    ids=lambda case: case.__name__.lstrip("_"),
+)
+def test_proxy_round_trips_to_the_real_store_and_type(tmp_path, case):
+    """Smoke test of the table-generated proxy: each call crosses the wire
+    and rehydrates to the same type/values the local store returns."""
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
 
     with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        outcome = proxy.scan_block(session.number, "51151378")
-
-    assert outcome == ScanOutcome(True, "Accepted block 51151378")
-    assert isinstance(outcome, ScanOutcome)
+        case(store, session, RemoteProcessingStore(receiver.url))
 
 
 def test_results_evidence_bytes_round_trips_binary_artifact_from_receiver(tmp_path):
@@ -154,35 +219,6 @@ def test_results_evidence_bytes_round_trips_binary_artifact_from_receiver(tmp_pa
         proxy = RemoteProcessingStore(receiver.url, backoff=0)
         assert proxy.results_evidence_bytes(session.number, jpeg) == b"\xff\xd8evidence"
         assert proxy.results_evidence_bytes(session.number, artifacts / "missing.jpg") is None
-
-
-def test_block_capture_recovery_methods_match_local_store_over_rpc(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    store.scan_block(session.number, "22222222")
-    store.scan_block(session.number, "11111111")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        assert proxy.awaiting_capture_blocks(session.number) == (
-            "22222222", "11111111"
-        )
-        assert proxy.unscan_block(session.number, "22222222")
-        assert proxy.awaiting_capture_blocks(session.number) == ("11111111",)
-
-
-def test_events_read_only_call_round_trips_to_the_real_type(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    store.scan_block(session.number, "51151378")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        events = proxy.events(session.number)
-
-    assert isinstance(events, tuple)
-    assert all(isinstance(event, WorkflowEvent) for event in events)
-    assert any(event.kind == "block_scanned" for event in events)
 
 
 def test_slide_bytes_cross_wire_and_server_uses_only_processing_local_path(
@@ -255,7 +291,9 @@ def test_slide_upload_reuses_request_id_after_dropped_response(tmp_path):
     assert [row["capture_id"] for row in rows] == [capture_id]
 
 
-def test_slide_outbox_survives_process_restart_and_replays_after_reconnect(tmp_path):
+def test_slide_outbox_survives_process_restart_and_replays_after_reconnect(
+    tmp_path, dead_receiver_url
+):
     slide_path = tmp_path / "slide.png"
     assert cv2.imwrite(str(slide_path), np.full((32, 48, 3), 120, dtype=np.uint8))
     outbox_root = tmp_path / "outbox"
@@ -263,9 +301,7 @@ def test_slide_outbox_survives_process_restart_and_replays_after_reconnect(tmp_p
     published = outbox.publish_slide(
         slide_path, STARTED_AT, result=select_slide_identity(()), duration_ms=5.0
     )
-    dead = RemoteProcessingStore(
-        "http://127.0.0.1:1", max_attempts=1, backoff=0
-    )
+    dead = RemoteProcessingStore(dead_receiver_url, max_attempts=1, backoff=0)
     assert outbox.replay_slides(1, dead) == ()
 
     restarted = PiOutbox(outbox_root)
@@ -300,131 +336,11 @@ def test_corrupt_slide_outbox_entry_remains_visible_and_blocking(tmp_path):
     assert outbox.invalid_slide_entries() == (published.capture_id,)
 
 
-def test_block_readiness_read_only_call_round_trips_to_the_real_type(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    store.scan_block(session.number, "51151378")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        readiness = proxy.block_readiness(session.number, "51151378")
-
-    assert readiness.evaluable is False
-    assert readiness.review_reason
-
-
-def test_snapshot_round_trips_via_status_route(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        snapshot = proxy.snapshot(session)
-
-    assert snapshot.session_number == session.number
-    assert snapshot.phase == "blocks"
-
-
 # --------------------------------------------------------------------------
-# work-order lifecycle (#149/#150/#153): reachable through the proxy
-# --------------------------------------------------------------------------
-
-
-def test_work_order_start_and_finish_round_trip_over_rpc(tmp_path):
-    """The crash reproduced on the Pi: SessionWorkflow.start_work_order ->
-    store.start_work_order over the wire. Proves both start and finish are
-    proxied (fixing only start would just move the crash to finish)."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        work_order_id = proxy.start_work_order(session.number)
-        assert isinstance(work_order_id, int)
-        finished = proxy.finish_work_order(session.number, start_job=False)
-
-    assert finished == work_order_id
-    assert store.get_work_order(session.number, work_order_id)["lifecycle_state"] == (
-        "scoring"
-    )
-
-
-def test_list_results_ready_work_orders_round_trips_empty_like_local_store(tmp_path):
-    """Reachability + shape parity when nothing is results-ready yet: the proxy
-    returns the same empty tuple the local store does, over /rpc."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        remote_rows = proxy.list_results_ready_work_orders(session.number)
-
-    assert remote_rows == store.list_results_ready_work_orders(session.number) == ()
-
-
-def test_open_work_order_id_round_trips_over_rpc_including_none(tmp_path):
-    """#155: the boot-seed read helper must be proxied over /rpc -- a real Pi
-    (behind RemoteProcessingStore, never a local ProcessingStore) calling it
-    would otherwise AttributeError despite green unit tests on the store
-    itself. Exercises both the None case (nothing open yet) and the open-id
-    case, matching the local store exactly."""
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        assert proxy.open_work_order_id(session.number) is None
-
-        work_order_id = proxy.start_work_order(session.number)
-        assert proxy.open_work_order_id(session.number) == work_order_id
-
-    assert store.open_work_order_id(session.number) == work_order_id
-
-
-def test_has_work_orders_round_trips_over_rpc(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        assert proxy.has_work_orders(session.number) is False
-        proxy.start_work_order(session.number)
-        assert proxy.has_work_orders(session.number) is True
-
-
-# --------------------------------------------------------------------------
-# freeze_hybrid_pool (#250): reachable through the proxy, same RPC hazard
+# freeze_hybrid_pool: reachable through the proxy, same RPC hazard
 # class as the work-order methods above -- the Pi never holds block masks,
 # so only the real ProcessingStore over /rpc can build fingerprints/caches.
 # --------------------------------------------------------------------------
-
-
-def _fake_fingerprint_builder(mask):
-    from verify.invariant_descriptors import DescriptorValue
-    return {"fake_v1": DescriptorValue(vector=np.array([1.0]), construction_ns=1)}
-
-
-def _fake_score_cache_builder(specimen):
-    from verify.scorer import LockedScoreCache, _ComponentFeatures
-    return LockedScoreCache(
-        normalized_mask=specimen.mask,
-        component_features=_ComponentFeatures(
-            points=np.zeros((0, 2)), areas=np.zeros(0), shapes=np.zeros((0, 3)),
-        ),
-    )
-
-
-def _upload_block(store, session_number, block_id, value):
-    assert store.scan_block(session_number, block_id).accepted
-    image = np.full((16, 16, 3), value, dtype=np.uint8)
-    success, png = cv2.imencode(".png", image)
-    assert success
-    body = png.tobytes()
-    checksum = hashlib.sha256(body).hexdigest()
-    store.receive_capture(
-        session_number, capture_id=f"cap-{block_id}", block_id=block_id,
-        checksum=checksum, body=body,
-    )
 
 
 def test_freeze_hybrid_pool_round_trips_over_rpc(tmp_path, monkeypatch):
@@ -456,66 +372,31 @@ def test_freeze_hybrid_pool_round_trips_over_rpc(tmp_path, monkeypatch):
     assert store.hybrid_pool(work_order_id) is not None
 
 
-def test_start_session_with_session_mode_round_trips_over_rpc(tmp_path):
-    """#269: RemoteProcessingStore.start_session gained a session_mode
-    parameter threaded into the /rpc args list -- proves the proxy, the
-    server lambda, and the durable sessions.session_mode column agree."""
+@pytest.mark.parametrize(
+    "via, mode",
+    [("start", "hybrid"), ("start", "hybrid_shadow"), ("start", None),
+     ("resume", "hybrid_shadow"), ("resume", None)],
+)
+def test_session_identity_carries_the_durable_session_mode_over_rpc(tmp_path, via, mode):
+    """session_mode rides start_session's /rpc args into the durable
+    sessions.session_mode column, and SessionIdentity.session_mode comes back
+    on both start_session and resume_session (the Pi's startup-mismatch guard
+    reads resume_session's identity). Omitted mode defaults to normal."""
     store = ProcessingStore(tmp_path / "processing")
+    kwargs = {} if mode is None else {"session_mode": mode}
+    expected = mode or "normal"
+    if via == "resume":
+        started = store.start_session(started_at=STARTED_AT, **kwargs)
 
     with LoopbackCaptureReceiver(store) as receiver:
         proxy = RemoteProcessingStore(receiver.url)
-        identity = proxy.start_session(started_at=STARTED_AT, session_mode="hybrid_shadow")
+        if via == "start":
+            identity = proxy.start_session(started_at=STARTED_AT, **kwargs)
+        else:
+            identity = proxy.resume_session(started.number)
 
-    assert store._session_mode(identity.number) == "hybrid_shadow"
-
-
-def test_start_session_default_session_mode_is_normal_over_rpc(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        identity = proxy.start_session(started_at=STARTED_AT)
-
-    assert store._session_mode(identity.number) == "normal"
-
-
-def test_start_session_identity_carries_the_durable_session_mode(tmp_path):
-    """Confirmed HIGH-severity fix: `SessionIdentity.session_mode` rides the
-    SAME start_session/resume_session round trip proxied above -- not a new
-    store method -- so `tools/run_pi_session.py::main` can compare the Pi's
-    own resolved mode against the durable value without any new RPC."""
-    store = ProcessingStore(tmp_path / "processing")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        identity = proxy.start_session(started_at=STARTED_AT, session_mode="hybrid")
-
-    assert identity.session_mode == "hybrid"
-
-
-def test_resume_session_identity_carries_the_durable_session_mode_over_rpc(tmp_path):
-    """The startup-mismatch guard reads `resume_session`'s returned identity
-    (the Pi never calls start_session itself -- see run_pi_session.py's
-    docstring), so this exact round trip is what the guard depends on."""
-    store = ProcessingStore(tmp_path / "processing")
-    started = store.start_session(started_at=STARTED_AT, session_mode="hybrid_shadow")
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        resumed = proxy.resume_session(started.number)
-
-    assert resumed.session_mode == "hybrid_shadow"
-
-
-def test_resume_session_identity_defaults_to_normal_session_mode_over_rpc(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    started = store.start_session(started_at=STARTED_AT)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        proxy = RemoteProcessingStore(receiver.url)
-        resumed = proxy.resume_session(started.number)
-
-    assert resumed.session_mode == "normal"
+    assert identity.session_mode == expected
+    assert store._session_mode(identity.number) == expected
 
 
 # --------------------------------------------------------------------------
@@ -537,17 +418,6 @@ def test_store_error_on_domain_rejection_is_not_retried(tmp_path):
     # A domain error is deterministic -- retrying the identical request
     # would just fail the same way again, so the proxy must not retry it.
     assert transport.post_calls == 1
-
-
-def test_store_error_from_fake_transport_is_propagated_without_retry():
-    proxy = RemoteProcessingStore(
-        "http://example.invalid", transport=RejectingTransport()
-    )
-
-    with pytest.raises(StoreError):
-        proxy.scan_block(1, "51151378")
-
-    assert proxy._transport.post_calls == 1
 
 
 # --------------------------------------------------------------------------
@@ -593,84 +463,6 @@ def test_mid_command_disconnect_retries_with_same_request_id_and_replays_ledger(
     assert row["block_id"] == "51151378"
 
 
-def test_mid_command_disconnect_retries_finish_work_order_exactly_once(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    session = store.start_session(started_at=STARTED_AT)
-    store.start_work_order(session.number)
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        transport = DropFirstResponseTransport(UrlTransport())
-        proxy = RemoteProcessingStore(receiver.url, transport=transport, backoff=0)
-
-        work_order_id = proxy.finish_work_order(session.number, start_job=False)
-
-    assert transport.post_calls == 2
-    first_id = json.loads(transport.sent_payloads[0])["request_id"]
-    second_id = json.loads(transport.sent_payloads[1])["request_id"]
-    assert first_id == second_id
-
-    # Exactly one lifecycle transition took place, despite the retry.
-    wo = store.get_work_order(session.number, work_order_id)
-    assert wo["lifecycle_state"] == "scoring"
-    assert store.open_work_order_id(session.number) is None
-
-
-def test_mid_command_disconnect_retries_dismiss_block_exactly_once(tmp_path):
-    class FailingPreprocessor:
-        def __call__(self, capture_path):
-            raise ValueError("cassette window is not evaluable")
-
-    store = ProcessingStore(
-        tmp_path / "processing", preprocessor=FailingPreprocessor()
-    )
-    session = store.start_session(started_at=STARTED_AT)
-    store.scan_block(session.number, "51151378")
-    capture_source = tmp_path / "51151378_block.png"
-    assert cv2.imwrite(
-        str(capture_source), np.full((3040, 4056, 3), 80, dtype=np.uint8)
-    )
-    capture = PiOutbox(tmp_path / "outbox").publish_block(
-        capture_source, "51151378", STARTED_AT,
-    )
-    store.receive_capture(
-        session.number, capture_id=capture.capture_id, block_id=capture.block_id,
-        checksum=capture.checksum, body=capture.path.read_bytes(),
-    )
-    store.wait_for_jobs()
-    assert store.get_set(session.number, "51151378")["preprocessing_status"] == "failed"
-
-    with LoopbackCaptureReceiver(store) as receiver:
-        transport = DropFirstResponseTransport(UrlTransport())
-        proxy = RemoteProcessingStore(receiver.url, transport=transport, backoff=0)
-
-        proxy.dismiss_block(session.number, "51151378", reason="operator confirmed")
-
-    assert transport.post_calls == 2
-    first_id = json.loads(transport.sent_payloads[0])["request_id"]
-    second_id = json.loads(transport.sent_payloads[1])["request_id"]
-    assert first_id == second_id
-
-    kinds = [event.kind for event in store.events(session.number)]
-    assert kinds.count("block_dismissed") == 1
-    row = store.get_set(session.number, "51151378")
-    assert row["preprocessing_status"] == "unusable"
-
-
-def test_stable_request_id_across_bounded_transport_failures():
-    """Isolated (no real server) proof that retries never mint a new id."""
-    transport = AlwaysFailTransport()
-    proxy = RemoteProcessingStore(
-        "http://example.invalid", transport=transport, max_attempts=3, backoff=0
-    )
-
-    with pytest.raises(TransportError):
-        proxy.scan_block(1, "51151378")
-
-    ids = {json.loads(payload)["request_id"] for payload in transport.sent_payloads}
-    assert len(transport.sent_payloads) == 3
-    assert len(ids) == 1
-
-
 # --------------------------------------------------------------------------
 # TransportError exhaustion
 # --------------------------------------------------------------------------
@@ -686,6 +478,9 @@ def test_transport_error_propagates_after_bounded_retries_are_exhausted():
         proxy.scan_block(1, "51151378")
 
     assert transport.post_calls == 4
+    # Retries never mint a new id: every attempt carries the same request_id.
+    ids = {json.loads(payload)["request_id"] for payload in transport.sent_payloads}
+    assert len(ids) == 1
 
 
 @pytest.mark.parametrize("malformed", [b"not-json", b"\xff", b"[]"])

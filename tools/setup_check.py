@@ -1,12 +1,8 @@
-"""
-setup_check.py — pre-flight verification for the slide QR/DataMatrix
-decoding stack.
+"""Pre-flight check for the slide QR/DataMatrix decoding stack.
 
-zxing-cpp is the primary slide decoder and cv2 (already required for the
-rest of the pipeline) is the fallback. This script runs both imports,
-prints install guidance on failure, and exits non-zero. Intended to run
-BEFORE the Phase 3.5 pipeline so a missing decoder surfaces up front,
-not mid-batch.
+zxing-cpp is the primary slide decoder and cv2 is the fallback. Prints
+install guidance and exits non-zero if either import fails, so a missing
+decoder surfaces before a batch run rather than mid-batch.
 
 Usage:
     python tools/setup_check.py

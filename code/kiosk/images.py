@@ -1,4 +1,4 @@
-"""OpenCV JPEG encode helpers shared by kiosk still routes (#137 / #139)."""
+"""OpenCV JPEG encode helpers shared by kiosk still routes."""
 from __future__ import annotations
 
 from pathlib import Path

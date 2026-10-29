@@ -1,1 +1,1 @@
-"""Package cluster — deepen public seams later."""
+"""Block (cassette) image helpers."""

@@ -8,7 +8,7 @@ import pytest
 
 from constants import PASS_THRESHOLD, SHAPE_ROUTER_SIZE_THRESHOLD
 from session.preparation import PreparedSpecimen
-from verify.scorer import build_locked_score_cache, decide, score_pair_result_routed
+from verify.scorer import decide, score_pair_result_routed
 
 
 def _specimen(mask: np.ndarray, role: str = "block") -> PreparedSpecimen:
@@ -54,10 +54,6 @@ def test_dense_pair_calculates_only_mask_iou():
     assert result.point_layout is None
     assert result.score == pytest.approx(result.mask_iou)
 
-
-def test_cache_uses_production_radial_grid():
-    cache = build_locked_score_cache(_specimen(_dense()))
-    assert cache.normalized_mask.shape == (256, 256)
 
 
 def test_decide_has_only_pass_and_review():

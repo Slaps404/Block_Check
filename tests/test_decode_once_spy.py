@@ -1,10 +1,8 @@
-"""Decode-once regression tests for the slide-claim path (#185 PR2).
+"""Decode-once regression tests for the slide-claim path.
 
-``resolve_claim`` used to decode the same slide raster twice: once inside
-``prepare_specimen`` (path-in) for Specimen Preprocessing, and again inside
-``_finalize_claim`` purely to feed the claim QC contact sheet. The
-decode-once refactor (ADR 0014) makes ``resolve_claim`` own a single
-``cv2.imread`` and thread that frame through both consumers.
+``resolve_claim`` owns a single ``cv2.imread`` of the slide raster and
+threads that frame through both Specimen Preprocessing and the claim QC
+contact sheet (ADR 0014).
 
 These tests spy on ``cv2.imread`` (patched on the shared ``cv2`` module
 object, so every caller -- ``workflow.py``, ``preparation.py`` -- observes
@@ -19,22 +17,31 @@ import pytest
 
 from session.workflow import ProcessingStore
 
-# #185 PR2: reuse test_session_workflow's real-workflow fixtures/helpers
-# rather than re-deriving a second harness. Imported at module level (not
+# Reuse the shared real-workflow fixtures/helpers rather than re-deriving a
+# second harness. Imported at module level (not
 # locally inside the test) so pytest can see ``lightweight_qc_artifacts`` as
 # a requestable fixture -- autouse fixtures don't cross module boundaries,
 # so the test here must ask for it explicitly.
-from tests.test_session_workflow import (  # noqa: F401 -- fixture import
-    STARTED_AT,
+from store_harness import (  # noqa: F401
+    WORKFLOW_STARTED_AT as STARTED_AT,
     FastPreprocessor,
     StubWorkOrderScorer,
-    _capture,
     _drain_to_slides,
     _evaluable_block,
     _identical_mask_slide_preprocessor,
-    _valid_slide_result,
-    lightweight_qc_artifacts,
 )
+from store_harness import (  # noqa: F401
+    full_res_capture as _capture,
+    lightweight_qc_artifacts,
+    valid_slide_result as _valid_slide_result,
+    lightweight_slide_qc,
+)
+
+
+@pytest.fixture(autouse=True)
+def _lightweight_qc(lightweight_qc_artifacts, lightweight_slide_qc):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into both shared harness QC fixtures."""
 
 # Body layout mirrors contact_sheet.py: a 60px header, then five 256x256
 # panels hstacked in order (block, slide, block-mask, slide-mask, overlay).
@@ -77,10 +84,9 @@ def test_resolve_claim_decodes_slide_raster_exactly_once(tmp_path, monkeypatch):
 
 @pytest.mark.usefixtures("lightweight_qc_artifacts")
 def test_resolve_claim_unreadable_slide_fails_closed_to_review(tmp_path):
-    """A slide raster that fails to decode must reproduce the exact
+    """A slide raster that fails to decode must produce
     ``PreparationFailure(role="slide", reason="could not read image: ...")``
-    the old path-in ``prepare_specimen`` produced, and the same fail-closed
-    REVIEW verdict, now that the guard lives in ``resolve_claim`` instead."""
+    and a fail-closed REVIEW verdict from ``resolve_claim``."""
     store = ProcessingStore(
         tmp_path / "processing",
         preprocessor=FastPreprocessor(),
@@ -105,14 +111,12 @@ def test_resolve_claim_unreadable_slide_fails_closed_to_review(tmp_path):
 
 @pytest.mark.usefixtures("lightweight_qc_artifacts")
 def test_score_work_order_pass_verdict_claim_qc_keeps_real_slide_pixels(tmp_path):
-    """#185 regression check: ``_finalize_claim`` writes ``claim_qc.png`` for
-    EVERY work-order verdict, not just REVIEW. A prior draft of the batch
-    decode-once fix gated the loop-2 re-decode on ``verdict == "REVIEW"``,
-    which silently swapped the real slide pixels for the None-placeholder
-    panel on every PASS claim. Guard against that regressing again: build a
-    clear-win PASS verdict through the real (uninjected) contact sheet
-    renderer and assert the slide panel's pixels are the real fill value
-    (120), not the placeholder's (60)."""
+    """Regression: ``_finalize_claim`` writes ``claim_qc.png`` for EVERY
+    work-order verdict, not just REVIEW. Gating the slide decode on
+    ``verdict == "REVIEW"`` would swap the real slide pixels for the
+    None-placeholder panel on every PASS claim. Build a clear-win PASS
+    verdict through the real contact sheet renderer and assert the slide
+    panel's pixels are the real fill value (120), not the placeholder's (60)."""
     root = tmp_path / "processing"
     scorer = StubWorkOrderScorer()
     store = ProcessingStore(

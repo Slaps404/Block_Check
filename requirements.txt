@@ -14,5 +14,10 @@ zxing-cpp>=2.2
 # Test runner.
 pytest>=7.4
 pytest-mock>=3.10
+pytest-xdist>=3.6
+# Pi runtime only: the import is delayed and tests inject a fake output.
+gpiozero>=2.0
+# Linter, run with `python -m flake8 code/`.
+flake8>=7.0
 # Optional — used by QR tests to generate synthetic QR fixtures.
 qrcode>=7.4

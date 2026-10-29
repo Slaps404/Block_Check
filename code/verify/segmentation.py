@@ -1,6 +1,6 @@
 """Role-aware color segmentation for v2 claimed-pair verification.
 
-Spatial ROI masking lives in preparation.py / block_roi_mask.py.
+Spatial ROI masking lives in session/preparation.py / block/roi_mask.py.
 role="slide" → H&E; role="block" → brown/yellow.
 """
 
@@ -79,7 +79,7 @@ def segment_tissue(
     """Binary uint8 mask (0/255) for the given role.
 
     block_window: precomputed cassette-window bbox (x, y, w, h) from
-        block_roi_mask.find_cassette_window, or None. Scopes the dark-tissue
+        block.roi_mask.find_cassette_window, or None. Scopes the dark-tissue
         absorbance gate to the paraffin window so dense (near-black) tissue is
         captured without sweeping in the dark cassette walls. None disables the
         dark gate (chroma-only). Has no effect when role is "slide".
@@ -177,16 +177,16 @@ def _stain_score_masked_otsu(
         scale_area_min(MIN_SLIDE_COMPONENT_AREA, pixel_scale),
         int(h_img * w_img * MIN_AREA_FRACTION),
     )
+    # Reference-resolution kernel; _postprocess scales it with pixel_scale.
     effective_ksize = (
-        slide_close_ksize
-        if slide_close_ksize is not None
-        else scale_odd_length(SLIDE_CLOSE_KERNEL, pixel_scale)
+        slide_close_ksize if slide_close_ksize is not None else SLIDE_CLOSE_KERNEL
     )
     result = _postprocess(
         mask,
         min_area=min_area,
         role="slide",
         close_ksize=effective_ksize,
+        pixel_scale=pixel_scale,
     )
     if SLIDE_IRIDESCENCE_FILTER_ENABLED:
         # `score` is the per-pixel H&E stain map (same formula the guard uses).
@@ -389,10 +389,9 @@ def _component_filter(
             slide_candidates.append((i, area))
 
     if role == "block":
-        # Symmetric with the slide relative floor (issue #78): drop speckle below
-        # SLIDE_MIN_COMPONENT_REL_AREA (1%) of the largest block component so
-        # blocks stop carrying tiny components their slide lacks. Shape gates
-        # (fill / aspect / area-max) above are block-specific and kept.
+        # Mirrors the slide relative floor: drop speckle below
+        # BLOCK_MIN_COMPONENT_REL_AREA of the largest block component so
+        # blocks do not carry tiny components their slide lacks.
         floor = max(
             min_area,
             _block_relative_area_floor([area for _, area in block_candidates]),
@@ -405,11 +404,8 @@ def _component_filter(
         rel_floor = _slide_relative_area_floor([area for _, area in slide_candidates])
         if slide_candidates:
             largest_area = max(area for _, area in slide_candidates)
-            abs_floor = (
-                MIN_SLIDE_COMPONENT_AREA
-                if largest_area >= MIN_SLIDE_COMPONENT_AREA
-                else min_area
-            )
+            slide_floor = scale_area_min(MIN_SLIDE_COMPONENT_AREA, pixel_scale)
+            abs_floor = slide_floor if largest_area >= slide_floor else min_area
         else:
             abs_floor = min_area
         floor = max(rel_floor, abs_floor)
@@ -464,23 +460,6 @@ def _remove_green_iridescence(
             continue  # strongly stained => real tissue, keep
         out[comp] = 0
     return out
-
-
-def _component_area_floor(
-    stats: np.ndarray,
-    num_components: int,
-    min_area: int,
-    role: str,
-) -> int:
-    """Return the role-aware component area floor for post-threshold cleanup."""
-    if role != "slide" or num_components <= 1:
-        return min_area
-    largest_area = max(
-        int(stats[i, cv2.CC_STAT_AREA])
-        for i in range(1, num_components)
-    )
-    relative_floor = int(largest_area * SLIDE_MIN_COMPONENT_REL_AREA)
-    return max(min_area, relative_floor)
 
 
 def clean_tissue_components(

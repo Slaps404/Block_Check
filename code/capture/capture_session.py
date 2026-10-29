@@ -18,6 +18,8 @@ class CaptureState(Enum):
     AWAITING_BASELINE_CONFIRMATION = auto()
     BUILDING_BASELINE = auto()
     CALIBRATION_FAILED = auto()
+    PLACE_CALIBRATION_BLOCK = auto()
+    REMOVE_CALIBRATION_BLOCK = auto()
     EMPTY = auto()
     SETTLING = auto()
     CAPTURE_REQUESTED = auto()
@@ -37,9 +39,14 @@ class SessionConfig:
     baseline_frames: int = 20
     roi: tuple[float, float, float, float] = (0.1, 0.1, 0.9, 0.9)
     presence_threshold: float = 0.04
+    # Occupied-baseline flag: still-there if live vs lock is under this.
+    # 0.04 is too tight under flashlight flicker and blocks Place forever.
+    occupied_match_threshold: float = 0.20
     motion_threshold: float = 0.02
     stable_duration: float = 0.5
     removal_duration: float = 0.5
+    led_presence_fraction: float = 0.01
+    led_motion_fraction: float = 0.005
 
 
 @dataclass(frozen=True)
@@ -85,8 +92,7 @@ class MotionSample:
     """Summary of sampled `motion_score` readings over a fixed window.
 
     Built by `summarize_motion_samples`; rendered by
-    `session.console.render_motion_sample`. See the `motion` console
-    command (#169).
+    `session.console.render_motion_sample` for the `motion` console command.
     """
 
     min_score: float
@@ -144,10 +150,26 @@ class CaptureSession:
         *,
         mode: CaptureMode | str = CaptureMode.SLIDE,
         review_captures: bool = False,
+        match_baseline_as_present: bool = False,
+        skip_removal_wait: bool = False,
+        led_only: bool = False,
     ):
         self.config = config or SessionConfig()
         self.mode = CaptureMode(mode)
+        if led_only and (
+            self.mode is not CaptureMode.BLOCK
+            or skip_removal_wait or match_baseline_as_present
+        ):
+            raise ValueError("LED-only requires empty-baseline blocks with removal wait")
+        self.led_only = led_only
+        self._noise_floor = 8.0
+        self._led_present = False
         self.review_captures = review_captures
+        # Block-only throughput option (--skip-removal-wait): the next scan is
+        # the real gate between blocks, so removal detection only adds a wait.
+        # Slides keep it; their verdict screens hang off WAITING_FOR_REMOVAL.
+        self.skip_removal_wait = skip_removal_wait
+        self.match_baseline_as_present = match_baseline_as_present
         # Both modes calibrate on an empty backlight before any specimen work.
         # Block mode then waits for a scan; slide mode goes straight to EMPTY.
         self.state = CaptureState.AWAITING_BASELINE_CONFIRMATION
@@ -186,9 +208,11 @@ class CaptureSession:
         if self.state not in (
             CaptureState.AWAITING_BASELINE_CONFIRMATION,
             CaptureState.CALIBRATION_FAILED,
+            CaptureState.WAITING_FOR_SCAN,  # recalibrate after the camera moves
         ):
             raise RuntimeError(
-                "empty-backlight setup only from awaiting confirmation or calibration failure"
+                "empty-backlight setup only from awaiting confirmation, "
+                "calibration failure, or waiting for scan"
             )
         self.baseline = None
         self._baseline_frames.clear()
@@ -203,11 +227,26 @@ class CaptureSession:
         self.state = CaptureState.CALIBRATION_FAILED
         self._emit("calibration_failed", "Empty-backlight setup failed")
 
-    def install_locked_baseline(self, frame: np.ndarray) -> None:
+    def install_locked_baseline(
+        self, frame: np.ndarray, *, noise_floor: float = 8.0
+    ) -> None:
         """Install the empty-field baseline collected under locked phase controls."""
         self.baseline = self._roi_gray(frame).astype(np.float32)
         self._baseline_frames.clear()
-        self._previous_normalized = self._normalize(self.baseline)
+        self._noise_floor = max(8.0, float(noise_floor))
+        self._led_present = False
+        self._previous_normalized = (
+            self.baseline / 255.0 if self.led_only else self._normalize(self.baseline)
+        )
+        if self.led_only:
+            self.state = CaptureState.PLACE_CALIBRATION_BLOCK
+            self._stable_since = None
+            self._absence_since = None
+            self._present_frames = 0
+            self._absent_frames = 0
+            self._motion_frames = 0
+            self._emit("baseline_ready", "Place a test block, then withdraw your hand")
+            return
         restored_state = self._restored_state
         self._restored_state = None
         if restored_state is not None:
@@ -235,6 +274,8 @@ class CaptureSession:
         if self.state is CaptureState.BUILDING_BASELINE:
             self._baseline_frames.append(gray)
             if len(self._baseline_frames) >= self.config.baseline_frames:
+                if self.led_only:
+                    raise RuntimeError("LED-only baseline requires locked camera setup")
                 self.baseline = np.mean(self._baseline_frames, axis=0)
                 self._baseline_frames.clear()
                 self._previous_normalized = self._normalize(self.baseline)
@@ -258,25 +299,79 @@ class CaptureSession:
                     self._emit("slide_reposition_required", "Reposition slide")
             return FrameResult()
 
-        normalized = self._normalize(gray)
-        presence_score = self._difference(
-            normalized, self._normalize(self.baseline)
-        )
+        normalized = gray / 255.0 if self.led_only else self._normalize(gray)
+        if self.led_only:
+            presence_score = float(np.mean(
+                np.abs(gray - self.baseline) > self._noise_floor
+            ))
+        else:
+            presence_score = self._difference(
+                normalized, self._normalize(self.baseline)
+            )
         motion_score = 0.0
         if self._previous_normalized is not None:
             current_blurred = cv2.GaussianBlur(normalized, (5, 5), 0)
             previous_blurred = cv2.GaussianBlur(
                 self._previous_normalized, (5, 5), 0
             )
-            motion_score = self._difference(current_blurred, previous_blurred)
+            if self.led_only:
+                motion_score = float(np.mean(
+                    np.abs(current_blurred - previous_blurred)
+                    > self._noise_floor / 255.0
+                ))
+            else:
+                motion_score = self._difference(current_blurred, previous_blurred)
         self._previous_normalized = normalized
 
-        present = presence_score >= self.config.presence_threshold
-        moving = motion_score >= self.config.motion_threshold
+        if self.led_only:
+            # Hysteresis avoids presence chatter at the learned noise boundary.
+            threshold = self.config.led_presence_fraction
+            if self._led_present:
+                threshold *= 0.5
+            present = presence_score >= threshold
+            self._led_present = present
+        elif self.match_baseline_as_present:
+            # Cassette is already on the tray at START SESSION. Do not gate
+            # Place/SETTLING on a tight match-to-baseline score (flashlight
+            # noise sits above 0.04). Wait only for motion to stop, then
+            # capture. Removal still uses a looser "looks like the lock".
+            if self.state in (CaptureState.EMPTY, CaptureState.SETTLING):
+                present = True
+            else:
+                present = (
+                    presence_score < self.config.occupied_match_threshold
+                )
+        else:
+            present = presence_score >= self.config.presence_threshold
+        moving = motion_score >= (
+            self.config.led_motion_fraction if self.led_only
+            else self.config.motion_threshold
+        )
         requested = False
         stable_elapsed = 0.0
 
-        if self.state is CaptureState.EMPTY:
+        if self.state is CaptureState.PLACE_CALIBRATION_BLOCK:
+            if not present or moving:
+                self._stable_since = None
+            elif self._stable_since is None:
+                self._stable_since = now
+            elif now - self._stable_since >= self.config.stable_duration:
+                self.state = CaptureState.REMOVE_CALIBRATION_BLOCK
+                self._stable_since = None
+                self._emit("calibration_block_detected", "Remove the test block")
+        elif self.state is CaptureState.REMOVE_CALIBRATION_BLOCK:
+            if present:
+                self._absence_since = None
+            elif self._absence_since is None:
+                self._absence_since = now
+            elif now - self._absence_since >= self.config.removal_duration:
+                self.state = (
+                    CaptureState.EMPTY if self.pending_block_id
+                    else CaptureState.WAITING_FOR_SCAN
+                )
+                self._absence_since = None
+                self._emit("led_calibration_ready", "LED placement/removal check passed")
+        elif self.state is CaptureState.EMPTY:
             if present:
                 if self._present_frames == 0:
                     # Preserve the existing one-second settling clock from the
@@ -415,7 +510,7 @@ class CaptureSession:
             return
         if self.mode is CaptureMode.BLOCK:
             self.pending_block_id = None
-        self.state = CaptureState.WAITING_FOR_REMOVAL
+        self.state = self._state_after_capture()
         self._absence_since = None
         self._emit("capture_saved", f"Saved {result.path.name}", result.path)
 
@@ -428,10 +523,20 @@ class CaptureSession:
             raise RuntimeError("no pending capture is held for review")
         if self.mode is CaptureMode.BLOCK:
             self.pending_block_id = None
-        self.state = CaptureState.WAITING_FOR_REMOVAL
+        self.state = self._state_after_capture()
         self._absence_since = None
         self._emit("capture_accepted", f"Accepted {self.last_capture.path.name}")
         return self.last_capture
+
+    def _state_after_capture(self) -> CaptureState:
+        """Where a finished capture lands: removal wait, or straight to scan."""
+        if self.skip_removal_wait and self.mode is CaptureMode.BLOCK:
+            self._stable_since = None
+            self._present_frames = 0
+            self._absent_frames = 0
+            self._motion_frames = 0
+            return CaptureState.WAITING_FOR_SCAN
+        return CaptureState.WAITING_FOR_REMOVAL
 
     def mark_slide_unreadable(self) -> None:
         """Require movement before another automatic capture of this slide."""
@@ -480,6 +585,59 @@ class CaptureSession:
         self._absence_since = None
         self._stable_since = None
         self._reposition_movement_seen = False
+
+    def capture_now(self) -> FrameResult:
+        """Skip presence and settling; request a capture immediately.
+
+        Manual override for high-rate data collection: detection is advisory,
+        the operator is looking at the rig. Everything after the request is
+        unchanged, so the capture still gets its block ID, triple set,
+        manifest and checksums.
+        """
+        if self.mode is CaptureMode.BLOCK and self.pending_block_id is None:
+            # Otherwise the override would publish a still with no block ID.
+            # Checked first: without a scan the session sits in
+            # WAITING_FOR_SCAN, and the missing ID is the useful message.
+            raise RuntimeError("scan a block ID before forcing a capture")
+        if self.state not in (CaptureState.EMPTY, CaptureState.SETTLING):
+            raise RuntimeError(
+                "capture now is only valid while placing a specimen"
+            )
+        self.state = CaptureState.CAPTURE_REQUESTED
+        self._stable_since = None
+        self._absence_since = None
+        self._present_frames = 0
+        self._absent_frames = 0
+        self._motion_frames = 0
+        self._emit("capture_requested", "Capture forced by the operator")
+        return FrameResult(capture_requested=True)
+
+    def next_capture(self) -> None:
+        """Override removal detection and make the next capture eligible."""
+        if self.state is not CaptureState.WAITING_FOR_REMOVAL:
+            raise RuntimeError(
+                "next capture is only valid while waiting for removal"
+            )
+        self.state = (
+            CaptureState.WAITING_FOR_SCAN
+            if self.mode is CaptureMode.BLOCK
+            else CaptureState.EMPTY
+        )
+        self._absence_since = None
+        self._stable_since = None
+        self._present_frames = 0
+        self._absent_frames = 0
+        self._motion_frames = 0
+        self._reposition_movement_seen = False
+        next_instruction = (
+            "Scan the next eight-digit block ID"
+            if self.mode is CaptureMode.BLOCK
+            else "Waiting for slide"
+        )
+        self._emit(
+            "removal_overridden",
+            f"Removal overridden; {next_instruction.lower()}",
+        )
 
     def skip_unreadable_slide(self) -> None:
         """Accept the retained unidentified captures and advance after removal."""

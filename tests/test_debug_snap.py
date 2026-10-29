@@ -1,101 +1,36 @@
 """Debug snap: POST /debug/snap + HttpCaptureClient + PiCaptureRuntime.snap."""
 from __future__ import annotations
 
-import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
-from urllib.request import Request, urlopen
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_TOOLS_DIR = _REPO_ROOT / "tools"
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.append(str(_TOOLS_DIR))
-
-from session.workflow import (  # noqa: E402
+from session.workflow import (
     FramingCalibrationStore,
     HttpCaptureClient,
     LoopbackCaptureReceiver,
     PiOutbox,
     ProcessingStore,
     SessionWorkflow,
-    save_debug_snap,
 )
+from illumination import IlluminationController
 
-import run_pi_session  # noqa: E402
+from app import pi_session as run_pi_session
+from capture_fakes import _FakeBacklight, _FakeOutput
 
 
 STARTED_AT = datetime(2026, 7, 9, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def test_save_debug_snap_writes_png_under_dest(tmp_path):
-    body = b"\x89PNG\r\n\x1a\n" + b"fake"
-    path = save_debug_snap(body, dest_dir=tmp_path / "pi_captures")
-    assert path.parent == tmp_path / "pi_captures"
-    assert path.name.startswith("snap_")
-    assert path.suffix == ".png"
-    assert path.read_bytes() == body
-
-
-def test_save_debug_snap_open_image_calls_viewer(tmp_path, monkeypatch):
-    opened: list[str] = []
-    monkeypatch.setattr(
-        "session.outbox_transport.open_saved_image",
-        lambda path: opened.append(str(path)),
-    )
-    path = save_debug_snap(
-        b"\x89PNG\r\n\x1a\n" + b"open-me",
-        dest_dir=tmp_path / "pi_captures",
-        open_image=True,
-    )
-    assert opened == [str(path)]
-
-
-def test_receiver_debug_snap_route_saves_and_returns_path(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    dest = tmp_path / "Desktop" / "pi_captures"
-    png = b"\x89PNG\r\n\x1a\n" + b"debug-body"
-
-    with LoopbackCaptureReceiver(
-        store, debug_snap_dir=dest, open_debug_snaps=False
-    ) as receiver:
-        request = Request(
-            f"{receiver.url}/debug/snap",
-            data=png,
-            method="POST",
-            headers={"Content-Type": "image/png"},
-        )
-        with urlopen(request, timeout=5) as response:
-            payload = response.read().decode("utf-8")
-
-    assert '"path"' in payload
-    saved = list(dest.glob("snap_*.png"))
-    assert len(saved) == 1
-    assert saved[0].read_bytes() == png
-
-
-def test_http_client_debug_snap_round_trip(tmp_path):
-    store = ProcessingStore(tmp_path / "processing")
-    dest = tmp_path / "pi_captures"
-    local = tmp_path / "pending.png"
-    local.write_bytes(b"\x89PNG\r\n\x1a\n" + b"client")
-
-    with LoopbackCaptureReceiver(
-        store, debug_snap_dir=dest, open_debug_snaps=False
-    ) as receiver:
-        client = HttpCaptureClient(receiver.url)
-        saved = client.debug_snap(local)
-
-    assert Path(saved).exists()
-    assert Path(saved).read_bytes() == local.read_bytes()
-
-
 class _FakeCamera:
     def __init__(self):
         self.still_calls = 0
+        self.still_settings = []
         self.resume_calls = 0
 
     def start_preview(self, **_kwargs):
@@ -104,8 +39,9 @@ class _FakeCamera:
     def preview_frame(self):
         return np.full((80, 120, 3), 180, dtype=np.uint8)
 
-    def capture_still(self, path, **_kwargs):
+    def capture_still(self, path, **kwargs):
         self.still_calls += 1
+        self.still_settings.append(kwargs["settings"])
         assert cv2.imwrite(str(path), np.full((100, 120), 90, dtype=np.uint8))
 
     def resume_preview(self):
@@ -115,14 +51,26 @@ class _FakeCamera:
         pass
 
 
-def test_runtime_snap_uploads_deletes_pi_temp_and_resumes(tmp_path):
+def _illumination(**kwargs):
+    kwargs.setdefault("backlight", _FakeBacklight())
+    return IlluminationController(
+        kwargs.pop("output", None) or _FakeOutput(),
+        sleep=lambda _seconds: None,
+        **kwargs,
+    )
+
+
+@contextmanager
+def _runtime(
+    tmp_path, camera, *, illumination=None, open_debug_snaps=False, **runtime_kwargs
+):
+    """Started PiCaptureRuntime posting snaps to <tmp>/pi_captures."""
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=STARTED_AT)
-    dest = tmp_path / "pi_captures"
-    camera = _FakeCamera()
-
     with LoopbackCaptureReceiver(
-        store, debug_snap_dir=dest, open_debug_snaps=False
+        store,
+        debug_snap_dir=tmp_path / "pi_captures",
+        open_debug_snaps=open_debug_snaps,
     ) as receiver:
         workflow = SessionWorkflow(
             session=session,
@@ -134,24 +82,160 @@ def test_runtime_snap_uploads_deletes_pi_temp_and_resumes(tmp_path):
             ),
         )
         runtime = run_pi_session.PiCaptureRuntime(
-            workflow, camera, capture_root=tmp_path / "captures"
+            workflow,
+            camera,
+            capture_root=tmp_path / "captures",
+            illumination=illumination or _illumination(),
+            **runtime_kwargs,
         )
         runtime.start(background=False)
+        try:
+            yield runtime
+        finally:
+            runtime.close()
+
+
+def _leftover_temp_snaps(tmp_path):
+    return list((tmp_path / "captures").rglob("debug-snap-*.png"))
+
+
+@pytest.mark.parametrize("led_already_on", [False, True])
+def test_runtime_snap_takes_one_still_with_led_on(tmp_path, led_already_on):
+    camera = _FakeCamera()
+    output = _FakeOutput()
+    illumination = _illumination(output=output)
+    if led_already_on:
+        illumination.led_on(30)
+
+    with _runtime(tmp_path, camera, illumination=illumination) as runtime:
         message = runtime.snap()
-        runtime.close()
+        led_on_after_snap = output.is_on
 
     assert message.startswith("Saved:")
-    laptop_path = Path(message.split("Saved:", 1)[1].strip())
-    assert laptop_path.exists()
-    assert laptop_path.parent == dest
+    saved = Path(message.split(":", 1)[1].strip())
+    assert saved.exists()
+    assert "_still_" in saved.name
     assert camera.still_calls == 1
+    # Defaults the LED on, and leaves an already-on LED alone.
+    assert led_on_after_snap is True
+    assert _leftover_temp_snaps(tmp_path) == []
+
+
+def test_kiosk_snap_quiet_saves_without_opening_but_console_snap_opens(
+    tmp_path, monkeypatch
+):
+    from session import outbox_transport
+    from session.console import dispatch
+
+    opened = []
+    monkeypatch.setattr(outbox_transport, "open_saved_image", opened.append)
+
+    with _runtime(tmp_path, _FakeCamera(), open_debug_snaps=True) as runtime:
+        quiet = dispatch(runtime, "snap_quiet", "block 123 | note")
+        assert opened == []
+        dispatch(runtime, "snap")
+
+    saved = Path(quiet.split(":", 1)[1].strip())
+    assert saved.with_suffix(".txt").read_text(encoding="utf-8") == "block 123 | note\n"
+    assert len(opened) == 1
+
+
+def _neutral():
+    neutral = _FakeBacklight()
+    neutral.pin = 22
+    return neutral
+
+
+def test_runtime_snap_3_uploads_deletes_pi_temp_and_resumes(tmp_path):
+    dest = tmp_path / "pi_captures"
+    camera = _FakeCamera()
+    backlight = _FakeBacklight()
+    neutral = _neutral()
+    illumination = _illumination(backlight=backlight, neutral_oblique=neutral)
+
+    with _runtime(tmp_path, camera, illumination=illumination) as runtime:
+        message = runtime.snap_3()
+        snap_backlight_value = backlight.value
+
+    assert message.startswith("Saved backlight:")
+    saved_lines = message.splitlines()
+    backlight_path = Path(saved_lines[0].split(":", 1)[1].strip())
+    point_led_path = Path(saved_lines[1].split(":", 1)[1].strip())
+    assert backlight_path.exists()
+    assert point_led_path.exists()
+    assert backlight_path.parent == dest
+    assert point_led_path.parent == dest
+    assert camera.still_calls == 2
     assert camera.resume_calls >= 1
-    leftovers = list((tmp_path / "captures").rglob("debug-snap-*.png"))
-    assert leftovers == []
+    # The preview backlight is the only light detection sees; a snap must hand
+    # it back lit or automatic capture stays blind afterwards.
+    assert snap_backlight_value == 0.5
+    assert neutral.value == 0.0
+    assert len(list(dest.glob("snap_*_backlight_*.png"))) == 1
+    assert len(list(dest.glob("snap_*_point_led_*.png"))) == 1
+    assert _leftover_temp_snaps(tmp_path) == []
 
 
-def test_console_registers_snap_verb():
-    from session.console import COMMAND_HELP, _COMMANDS
+def _write_deskew_config(path, source_size=(120, 100)):
+    path.write_text(json.dumps({
+        "homography": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        "output_size": [60, 40],
+        "source_size": list(source_size),
+        "px_per_mm": 50.0,
+        "grid": "20x20 @ 0.8mm",
+        "matched": 400,
+        "expected": 400,
+        "residual_px": {"median": 0.5, "p95": 1.2, "max": 2.0},
+        "source_image": "board.png",
+        "fitted_at": "2026-10-13T00:00:00Z",
+    }))
+    return path
 
-    assert "snap" in _COMMANDS
-    assert "snap" in COMMAND_HELP
+
+def test_runtime_deskew_without_config_does_not_capture(tmp_path):
+    camera = _FakeCamera()
+
+    with _runtime(
+        tmp_path, camera, deskew_config_path=tmp_path / "missing.json"
+    ) as runtime:
+        with pytest.raises(Exception, match="grid-deskew"):
+            runtime.deskew()
+
+    assert camera.still_calls == 0
+
+
+def test_runtime_deskew_refuses_wrong_resolution_but_keeps_raw(tmp_path):
+    camera = _FakeCamera()
+    config_path = _write_deskew_config(
+        tmp_path / "deskew_grid.json", source_size=(4056, 3040)
+    )
+
+    with _runtime(tmp_path, camera, deskew_config_path=config_path) as runtime:
+        with pytest.raises(Exception, match="4056x3040"):
+            runtime.deskew()
+
+    assert list((tmp_path / "pi_captures").glob("snap_*_deskewed_*.png")) == []
+
+
+def test_kiosk_deskew_quiet_saves_both_with_note_without_opening(
+    tmp_path, monkeypatch
+):
+    from session import outbox_transport
+    from session.console import dispatch
+
+    opened = []
+    monkeypatch.setattr(outbox_transport, "open_saved_image", opened.append)
+    config_path = _write_deskew_config(tmp_path / "deskew_grid.json")
+
+    with _runtime(
+        tmp_path, _FakeCamera(), open_debug_snaps=True, deskew_config_path=config_path
+    ) as runtime:
+        dispatch(runtime, "deskew_quiet", "block 123")
+
+    captures = tmp_path / "pi_captures"
+    raw = list(captures.glob("snap_*_raw_*.png"))
+    warped = list(captures.glob("snap_*_deskewed_*.png"))
+    assert len(raw) == 1 and len(warped) == 1
+    for png in raw + warped:
+        assert png.with_suffix(".txt").read_text(encoding="utf-8") == "block 123\n"
+    assert opened == []

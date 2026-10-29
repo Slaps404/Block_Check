@@ -1,18 +1,13 @@
-"""Tests for manifest loading and validation (issue #16).
+"""Tests for manifest loading and validation.
 
 Tests cover valid manifests, missing fields, duplicate IDs, missing files,
 and repeated-block/multiple-slide claims.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 from session.manifest import ClaimRow, ManifestValidationError, load_manifest
 

@@ -1,12 +1,12 @@
-"""TDD coverage for the #256 follow-up gap: the operator route that ARMS a
+"""The operator route that ARMS a
 running Hybrid session so the NEXT physically captured slide routes through
 `ProcessingStore.recapture_hybrid_slide` (supersession) instead of the
 ordinary `record_slide_capture` path.
 
 `tests/test_hybrid_slide_attention_recapture.py` already proves
 `recapture_hybrid_slide`'s own CAS/identity-match contract directly against
-the store; this file does NOT re-test that. It proves the piece that did not
-exist before: a real `SessionWorkflow` (the SAME `capture_slide` entry point
+the store; this file does NOT re-test that. It proves that a real
+`SessionWorkflow` (the SAME `capture_slide` entry point
 `tools/run_pi_session.py::PiCaptureRuntime._consume_capture` calls for every
 physically captured slide) can be armed for one specific attention item, and
 that arming actually changes which store method the next capture reaches --
@@ -17,45 +17,28 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import cv2
-import numpy as np
 import pytest
 
 from session.console import COMMAND_HELP, _COMMANDS, dispatch
-from session.processing_store import ProcessingStore
 from session.session_mode import SessionMode
 from session.workflow import PiOutbox, SessionWorkflow
-from tests.test_hybrid_slide_queue import (
-    _freeze_hybrid_session,
+from store_harness import (
+    freeze_hybrid_session as _freeze_hybrid_session,
     _make_store,
-    _valid_slide_result,
-    _write_slide_png,
+    valid_slide_result as _valid_slide_result,
+    write_slide_png as _write_slide_png,
+    ToggleTransport,
 )
-from tests.test_session_workflow import FakePhaseCamera, ToggleTransport
+from capture_fakes import FakePhaseCamera
+from store_harness import lightweight_qc_artifacts  # noqa: F401
 
 STARTED_AT = datetime(2026, 7, 29, 9, 0, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
-def lightweight_qc_artifacts(monkeypatch):
-    """Mirrors tests/test_hybrid_slide_queue.py's fixture of the same name:
-    the real QC panel renderer assumes the mask matches the capture's
-    dimensions, which these tests' small synthetic masks deliberately do
-    not. Autouse fixtures do not cross module boundaries, so this file
-    needs its own copy."""
-
-    def write_qc(capture, mask, destination):
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_failure_qc(capture, reason, destination):
-        panel = np.full((8, 8, 3), (0, 0, 180), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    monkeypatch.setattr(ProcessingStore, "_write_qc", staticmethod(write_qc))
-    monkeypatch.setattr(
-        ProcessingStore, "_write_failure_qc", staticmethod(write_failure_qc)
-    )
+def _lightweight_qc(lightweight_qc_artifacts):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into the shared harness fixture."""
 
 
 def _hybrid_workflow(tmp_path, store, session_number) -> SessionWorkflow:

@@ -4,8 +4,9 @@ import ast
 import inspect
 from pathlib import Path
 
-from session import workflow as session_workflow
-from store.remote import RemoteProcessingStore
+from session.processing_store import ProcessingStore
+from transport import rpc_table
+from transport.remote import RemoteProcessingStore
 
 
 def test_code_does_not_import_tools_or_archive():
@@ -31,17 +32,11 @@ def test_code_does_not_import_tools_or_archive():
 def _diagnostics_experiment_dirs(tools_dir: Path) -> list[Path]:
     """Directories under `tools/` that hold diagnostics-experiment modules.
 
-    `tests/conftest.py` appends several `tools/<subdir>` folders straight
-    onto `sys.path` (capture, manifest, identity, scoring_diagnostics,
-    visual_audit, diagnostics, calibration) so their modules are importable
-    by bare name inside the test session. Of those, the ones whose name
-    marks them as diagnostics/experiment tooling -- as opposed to the
-    operational tooling in `capture/`, `manifest/`, and `identity/` that
-    `tools/README.md` documents as a separate category -- are the ones #245
-    and #246 forbid production from depending on. Matching on the
-    "diagnostic" substring (rather than a hardcoded folder list) means a
-    future `tools/diagnostics_v2` or `tools/foo_diagnostics` directory is
-    picked up automatically, with no edit to this test required.
+    `tests/conftest.py` puts several `tools/<subdir>` folders on `sys.path`.
+    Of those, the diagnostics/experiment ones (as opposed to the operational
+    `capture/`, `manifest/`, `identity/` tooling) are what production must
+    never depend on. Matching on the "diagnostic" substring rather than a
+    hardcoded list picks up new diagnostics directories automatically.
     """
     if not tools_dir.is_dir():
         return []
@@ -74,8 +69,7 @@ def _diagnostics_experiment_module_names(tools_dir: Path) -> set[str]:
     bare name (`from candidate_retrieval_analysis import ...`) thanks to the
     sys.path append in conftest.py, bypassing the `tools.`-prefix check in
     `test_code_does_not_import_tools_or_archive`. Rebuilt from disk on every
-    run, so adding a new diagnostic module never requires touching this
-    test to keep the guard current.
+    run.
     """
     return set(_diagnostics_experiment_module_owners(tools_dir))
 
@@ -102,12 +96,9 @@ def _find_diagnostics_import_violations(
     """Scan every `*.py` under `code_dir` for an import of a forbidden name.
 
     `forbidden_owners` maps a forbidden module basename to the `tools/<dir>`
-    it lives under (see `_diagnostics_experiment_module_owners`), so the
-    violation message can name the real diagnostics package the import came
-    from. Parameterized on `code_dir`/`forbidden_owners` (rather than reading
-    the real repo paths directly) so it can be driven against a synthetic
-    temp directory in a unit test, proving the detection logic catches a
-    violation without ever touching the real `code/` tree.
+    it lives under, so the violation message can name its source package.
+    Parameterized (rather than reading real repo paths) so the detection
+    logic can be unit-tested against a synthetic temp directory.
     """
     violations = []
     for path in sorted(code_dir.rglob("*.py")):
@@ -127,21 +118,14 @@ def _find_diagnostics_import_violations(
 
 
 def test_code_does_not_import_diagnostics_experiment_modules_by_bare_name():
-    """#246: no production module may import a diagnostics-experiment module.
+    """No production module may import a diagnostics-experiment module.
 
-    `tests/conftest.py` appends `tools/scoring_diagnostics` (and sibling
-    diagnostics dirs) directly onto sys.path, so every module living there
-    is importable by bare name -- e.g.
-    `from candidate_retrieval_analysis import worst_subgroup` -- with no
-    `tools.` prefix. `test_code_does_not_import_tools_or_archive` above only
-    catches the prefixed form, so a bare-name diagnostics import added to
-    `code/` would otherwise pass every existing test and silently invert
-    the tools -> code dependency arrow that #245/#246 require to stay
-    one-way.
-
-    The forbidden module-name set is derived from the filesystem (see
-    `_diagnostics_experiment_module_owners`) rather than hardcoded, so this
-    test does not rot as diagnostic modules are added, renamed, or removed.
+    `tests/conftest.py` puts the diagnostics dirs on sys.path, so their
+    modules are importable by bare name (e.g.
+    `from candidate_retrieval_analysis import worst_subgroup`).
+    `test_code_does_not_import_tools_or_archive` only catches the
+    `tools.`-prefixed form, so without this test a bare-name import would
+    silently invert the one-way tools -> code dependency arrow.
     """
     repo_root = Path(__file__).resolve().parents[1]
     forbidden_owners = _diagnostics_experiment_module_owners(repo_root / "tools")
@@ -150,19 +134,19 @@ def test_code_does_not_import_diagnostics_experiment_modules_by_bare_name():
 
 
 def test_invariant_descriptor_catalog_is_production_owned_not_duplicated_in_diagnostics():
-    """#246: the Heuristic Descriptor Catalog is production-owned (`code/verify`).
+    """The Heuristic Descriptor Catalog is production-owned (`code/retrieval`).
 
     Diagnostic tooling under `tools/scoring_diagnostics` must import the catalog
     from production rather than keeping its own copy of the math, so the
     dependency arrow points diagnostics -> production and never the reverse.
     """
     repo_root = Path(__file__).resolve().parents[1]
-    production_module = repo_root / "code" / "verify" / "invariant_descriptors.py"
+    production_module = repo_root / "code" / "retrieval" / "invariant_descriptors.py"
     diagnostics_module = (
         repo_root / "tools" / "scoring_diagnostics" / "invariant_descriptors.py"
     )
     assert production_module.is_file(), (
-        "invariant descriptor catalog must live under code/verify"
+        "invariant descriptor catalog must live under code/retrieval"
     )
     assert not diagnostics_module.is_file(), (
         "tools/scoring_diagnostics must not keep its own copy of the descriptor catalog"
@@ -177,7 +161,7 @@ def test_invariant_descriptor_catalog_is_production_owned_not_duplicated_in_diag
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module
     ]
-    assert "verify.invariant_descriptors" in imported_modules, (
+    assert "retrieval.invariant_descriptors" in imported_modules, (
         "diagnostics must import the descriptor catalog from the production module"
     )
     assert "invariant_descriptors" not in imported_modules, (
@@ -185,28 +169,85 @@ def test_invariant_descriptor_catalog_is_production_owned_not_duplicated_in_diag
     )
 
 
-def test_rpc_whitelist_arity_and_proxy_surface_stay_in_sync():
-    """`_RPC_METHODS`, `_RPC_ARITY`, and the `RemoteProcessingStore` proxy are
-    hand-maintained in three places (#195); this is the sole test protecting
-    that they never drift apart. `snapshot` is excluded from the proxy
-    comparison because it keeps its dedicated `/status` route and is
-    deliberately absent from `_RPC_METHODS`.
-    """
-    rpc_methods = set(session_workflow._RPC_METHODS)
-    rpc_arity = set(session_workflow._RPC_ARITY)
-    assert rpc_methods == rpc_arity, (
-        f"_RPC_METHODS/_RPC_ARITY key mismatch: "
-        f"only in _RPC_METHODS={rpc_methods - rpc_arity}, "
-        f"only in _RPC_ARITY={rpc_arity - rpc_methods}"
-    )
+# `summarize` takes a `SessionIdentity`, not a bare session number: the server
+# dispatch resolves it with a nested `resume_session(n)` call, so its table
+# entry deliberately does not mirror the store signature.
+_STORE_SIGNATURE_EXEMPT = frozenset({"summarize"})
 
-    proxy_members = inspect.getmembers(RemoteProcessingStore, predicate=inspect.isfunction)
-    proxy_methods = {
-        name for name, _ in proxy_members
-        if not name.startswith("_") and name not in {"snapshot", "results_evidence_bytes"}
-    }
-    assert proxy_methods == rpc_methods, (
-        f"RemoteProcessingStore proxy surface out of sync with _RPC_METHODS: "
-        f"only on proxy={proxy_methods - rpc_methods}, "
-        f"only in _RPC_METHODS={rpc_methods - proxy_methods}"
+# Store parameters this table entry deliberately does not carry. Both methods
+# are `proxy_override=True`: the Pi reaches them over the dedicated binary
+# `/slides` and `/recapture-slide` routes, not the plain-JSON `/rpc` envelope,
+# so `source_token`, `priority` and `profile` travel in the framed metadata
+# dict (`rpc_server.py` reads them back with `metadata.get(...)`) rather than
+# in the positional `args` list this table describes. They are reachable over
+# the wire; they are just not this table's business.
+#
+# `start_job` is the one genuinely unreachable parameter: nothing sends it for
+# `record_slide_capture` on either route, so a remote caller always gets the
+# default `True`. Listing these here makes each gap an explicit decision.
+_NOT_THREADED_OVER_RPC = {
+    "record_slide_capture": ("source_token", "start_job", "profile"),
+    "recapture_hybrid_slide": ("source_token",),
+}
+
+
+def test_rpc_table_is_the_single_source_for_dispatch_arity_and_proxy():
+    """The `/rpc` contract lives in exactly one table.
+
+    `RPC_METHODS` and `RPC_ARITY` are derived from `RPC_TABLE`, and the
+    `RemoteProcessingStore` proxy is synthesized from it via `__getattr__`.
+    The one seam still hand-maintained is whether each table entry matches
+    the real `ProcessingStore` method it forwards to.
+    """
+    assert set(rpc_table.RPC_METHODS) == set(rpc_table.RPC_ARITY)
+
+    for op in rpc_table.RPC_TABLE:
+        required = sum(1 for name in op.params if name not in op.defaults)
+        assert op.arity == (required, len(op.params)), (
+            f"{op.name}: arity {op.arity} disagrees with params/defaults"
+        )
+
+    # Every op is reachable on the proxy: either synthesized from the table
+    # or deliberately hand-written for a non-`/rpc` route.
+    for op in rpc_table.RPC_TABLE:
+        assert op.name in rpc_table.PROXY_OPS or hasattr(
+            RemoteProcessingStore, op.name
+        ), f"{op.name} has neither a table-synthesized nor a hand-written proxy"
+
+
+def test_rpc_table_params_match_the_real_store_method_signatures():
+    """A new `ProcessingStore` parameter must be threaded through the RPC table.
+
+    Comparing the table to the real store signature (not to other copies of
+    the contract) is what catches a parameter that was never forwarded.
+    """
+    mismatches = []
+    for op in rpc_table.RPC_TABLE:
+        if op.name in _STORE_SIGNATURE_EXEMPT:
+            continue
+        method = getattr(ProcessingStore, op.name, None)
+        if method is None:
+            continue
+        parameters = list(inspect.signature(method).parameters)
+        assert parameters and parameters[0] == "self"
+        expected = parameters[1:]
+        if op.uses_session:
+            if not expected or expected[0] != "session_number":
+                mismatches.append(
+                    f"{op.name}: table says uses_session but store takes {expected}"
+                )
+                continue
+            expected = expected[1:]
+        expected = [name for name in expected if name != "request_id"]
+        expected = [
+            name
+            for name in expected
+            if name not in _NOT_THREADED_OVER_RPC.get(op.name, ())
+        ]
+        if list(op.params) != expected:
+            mismatches.append(
+                f"{op.name}: table params {list(op.params)} != store params {expected}"
+            )
+    assert not mismatches, "RPC table drifted from ProcessingStore:\n" + "\n".join(
+        mismatches
     )

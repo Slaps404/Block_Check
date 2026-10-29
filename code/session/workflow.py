@@ -81,7 +81,7 @@ log = logging.getLogger(__name__)
 
 
 class HybridProfileStatus(TypedDict):
-    """#258: ``hybrid_profile_status``'s return shape -- a plain dict at
+    """``hybrid_profile_status``'s return shape -- a plain dict at
     runtime (so existing callers' ``status["rows"]``/``["queue_count"]`` and
     every test fake's bare dict literal keep working unchanged), but typed
     precisely so callers narrow ``rows``/``queue_count`` correctly instead
@@ -190,14 +190,13 @@ class SessionWorkflow:
         self.camera = camera or _HeadlessPhaseCamera()
         self.slide_decoder = slide_decoder or decode_slide_identity
         self._clock = clock or perf_counter
-        # #250: NORMAL (the default) and OPEN_RETRIEVAL make `poll_drain`
-        # behave exactly as it always has -- only HYBRID/HYBRID_SHADOW take
-        # the Hybrid Candidate Pool freeze branch below.
+        # Only HYBRID/HYBRID_SHADOW take the Hybrid Candidate Pool freeze
+        # branch in `poll_drain`; NORMAL and OPEN_RETRIEVAL do not.
         self.session_mode = session_mode
         self.hybrid_descriptor_names = tuple(hybrid_descriptor_names)
         self.hybrid_candidate_configuration = hybrid_candidate_configuration
         self.last_slide_stage_timings: SlideStageTimings | None = None
-        # #257: pure in-process flag for "View Results while a slide-capture
+        # Pure in-process flag for "View Results while a slide-capture
         # work order is open" -- pause_capture/resume_capture below only ever
         # flip this bool. No store I/O, no job wait/cancel: background
         # scoring and queued jobs are completely unaffected by entering or
@@ -205,8 +204,8 @@ class SessionWorkflow:
         # tools/run_pi_session.py, outside this module) is expected to read
         # this flag before firing an automatic shot; see the methods below.
         self.capture_paused: bool = False
-        # #256 follow-up: the operator-armed recapture target, in-memory
-        # only (no migration -- see `arm_hybrid_recapture` below for why).
+        # The operator-armed recapture target, in-memory only (no
+        # migration -- see `arm_hybrid_recapture` below for why).
         # Read-and-cleared by the NEXT `capture_slide` call, matching or
         # not, so a stale arm can never survive past one physical capture.
         # Lost on restart exactly like `capture_paused` above; the operator
@@ -311,7 +310,7 @@ class SessionWorkflow:
             f"{snapshot.preprocessing_pending} preprocessing jobs pending; "
             f"{snapshot.unresolved_blocks} blocks unresolved",
         )
-        # #250: HYBRID/HYBRID_SHADOW freeze the Hybrid Candidate Pool (or, on
+        # HYBRID/HYBRID_SHADOW freeze the Hybrid Candidate Pool (or, on
         # <2 usable blocks, bounce back to the blocks phase) instead of the
         # unconditional try_enter_slides transition every other mode uses.
         # `freeze_hybrid_pool` never raises at all -- an unknown session
@@ -355,14 +354,14 @@ class SessionWorkflow:
     ) -> SlideQRResult:
         """Persist and decode one still requested by the settled-slide lifecycle.
 
-        ``profile`` (#258) mirrors ``publish_scanned_block``'s own ``profile``
+        ``profile`` mirrors ``publish_scanned_block``'s own ``profile``
         parameter for blocks: threaded straight through to
         ``PiOutbox.publish_slide`` regardless of ``result.success``, so an
         unreadable slide's outbox entry still carries the flag durably (the
         main computer's own ``record_slide_capture`` is what actually gates
         collection on an accepted, in-pool Hybrid claim).
 
-        #256 follow-up: read-and-clear whatever ``arm_hybrid_recapture``
+        Read-and-clear whatever ``arm_hybrid_recapture``
         armed, BEFORE this capture's outcome is even known. This is the ONE
         place a physical capture is routed: the durable outbox entry below
         carries the result as ``supersedes`` so ``PiOutbox.replay_slides``
@@ -381,11 +380,11 @@ class SessionWorkflow:
         if scanned_payload is not None:
             # Intentionally skips both the raster decode and its readability
             # guard: identity resolves from the payload alone, so an
-            # unreadable/missing still no longer raises here. The still is
+            # unreadable/missing still does not raise here. The still is
             # still durably queued to this machine's outbox first; an
             # unreadable image is caught by the main computer's own
             # `record_slide_capture` readability guard when the capture is
-            # replayed (ADR-0014 / #185).
+            # replayed (ADR-0014).
             started = self._clock()
             result = scanner_identity(scanned_payload)
         else:
@@ -457,7 +456,7 @@ class SessionWorkflow:
 
     def _on_slide_capture_event(self, event: CaptureSessionEvent) -> None:
         try:
-            if event.kind == "removal_confirmed":
+            if event.kind in ("removal_confirmed", "removal_overridden"):
                 self.store.mark_waiting_for_slide(self.session.number)
                 self._slide_recovery_state = "waiting"
             elif event.kind == "slide_reposition_required":
@@ -470,7 +469,7 @@ class SessionWorkflow:
             # The stored state remains fail-closed and will be retried/recovered
             # on restart; a transient persistence failure must not stop preview.
             if (
-                event.kind == "removal_confirmed"
+                event.kind in ("removal_confirmed", "removal_overridden")
                 and self._slide_capture_session is not None
             ):
                 if self._slide_recovery_state == "reposition":
@@ -488,19 +487,25 @@ class SessionWorkflow:
         self._slide_recovery_state = "waiting_for_removal"
         capture_session.skip_unreadable_slide()
 
-    def baseline_for(self, mode: str) -> object:
+    def _mode_scoped_value(self, mode: str, store: dict, missing_message: str) -> object:
+        """Shared 'mode must be block or slide, then look it up' validation
+        for baseline_for/calibration_for below; they differ only in which
+        dict backs them and what a missing entry means."""
         if mode not in ("block", "slide"):
             raise ValueError("mode must be 'block' or 'slide'")
-        if mode not in self._baselines:
-            raise RuntimeError(f"no {mode} baseline has been collected")
-        return self._baselines[mode]
+        if mode not in store:
+            raise RuntimeError(missing_message)
+        return store[mode]
+
+    def baseline_for(self, mode: str) -> object:
+        return self._mode_scoped_value(
+            mode, self._baselines, f"no {mode} baseline has been collected"
+        )
 
     def calibration_for(self, mode: str) -> object:
-        if mode not in ("block", "slide"):
-            raise ValueError("mode must be 'block' or 'slide'")
-        if mode not in self._calibrations:
-            raise RuntimeError(f"no {mode} calibration is active")
-        return self._calibrations[mode]
+        return self._mode_scoped_value(
+            mode, self._calibrations, f"no {mode} calibration is active"
+        )
 
     def view_framing_calibration(self) -> FramingCalibration | None:
         return self.framing_calibration.view()
@@ -622,7 +627,7 @@ class SessionWorkflow:
     def retry_hybrid_slide(
         self, capture_id: str, *, request_id: str | None = None,
     ) -> bool:
-        """#256: operator-triggered retry of a Hybrid Processing Error --
+        """Operator-triggered retry of a Hybrid Processing Error --
         re-runs scoring against the durably saved capture, no new photo."""
         return self.store.retry_hybrid_slide(
             self.session.number, capture_id, request_id=request_id,
@@ -639,7 +644,7 @@ class SessionWorkflow:
         request_id: str | None = None,
         source_token: str | None = None,
     ) -> RecaptureOutcome:
-        """#256: an accepted recapture. Supersedes `superseded_capture_id`
+        """An accepted recapture. Supersedes `superseded_capture_id`
         only when `result`'s decoded claim matches its own claimed block."""
         return self.store.recapture_hybrid_slide(
             self.session.number, superseded_capture_id, source,
@@ -648,28 +653,19 @@ class SessionWorkflow:
         )
 
     def arm_hybrid_recapture(self, capture_id: str) -> None:
-        """#256 follow-up: arm the runtime so the NEXT physically captured
-        slide routes through `recapture_hybrid_slide` for `capture_id`
-        instead of the ordinary `record_slide_capture` path -- the missing
-        link between the passive attention banner and a real recapture.
+        """Arm the runtime so the next captured slide routes
+        through `recapture_hybrid_slide` for `capture_id` instead of the
+        ordinary `record_slide_capture` path.
 
-        Eligibility is the EXACT SAME `can_recapture` gate the attention
-        banner itself already computes (`kiosk.attention.
-        project_attention_banner`, over the SAME `kiosk.results_table.
-        project_results_table`-projected rows the kiosk relay builds) --
-        called here, never re-derived, so arming can never diverge from
-        what the operator was shown. Raises ``ValueError`` (never silently
-        no-ops) when `capture_id` is not the current attention item, or
-        when it is but a DIFFERENT work order is actively capturing right
-        now (the same "wait for an available transition" case the banner
-        itself renders as `can_recapture: false`).
+        Eligibility is the same `can_recapture` gate the attention banner
+        computes, called here rather than re-derived, so arming cannot
+        diverge from what the operator was shown. Raises ``ValueError``
+        rather than no-opping when `capture_id` is not the current attention
+        item, or when a different work order is actively capturing.
 
-        Held IN MEMORY ONLY, deliberately -- no migration, no new column
-        (mirrors `capture_paused`'s own in-process-only shape): losing an
-        armed recapture across a restart just means the operator re-arms:
-        arming is a short-lived "the next shot is special" intent, not
-        durable session state. See `capture_slide` for where this is read
-        and cleared, and `disarm_hybrid_recapture` for the cancel path.
+        Held in memory only: losing an armed recapture across a restart just
+        means the operator re-arms. See `capture_slide` for where it is read
+        and cleared, `disarm_hybrid_recapture` for the cancel path.
         """
         from kiosk.attention import project_attention_banner
         from kiosk.results_table import project_results_table
@@ -692,7 +688,7 @@ class SessionWorkflow:
         self._pending_recapture_capture_id = capture_id
 
     def disarm_hybrid_recapture(self) -> None:
-        """Cancel a pending #256 follow-up recapture arm.
+        """Cancel a pending Hybrid recapture arm.
 
         A harmless no-op when nothing is armed -- mirrors `resume_capture`'s
         own unconditional-clear shape. Exists so an operator who armed by
@@ -703,7 +699,7 @@ class SessionWorkflow:
         self._pending_recapture_capture_id = None
 
     def pause_capture(self) -> None:
-        """#257: entering Results while a slide-capture work order is open
+        """Entering Results while a slide-capture work order is open
         pauses AUTOMATIC CAPTURE ONLY. Sets the `capture_paused` in-process
         flag the capture loop is expected to honor before firing an
         automatic shot; touches no store/job state, so background scoring
@@ -711,43 +707,28 @@ class SessionWorkflow:
         self.capture_paused = True
 
     def resume_capture(self) -> None:
-        """Clear the #257 capture pause (Go Back from Results). Does not
+        """Clear the capture pause (Go Back from Results). Does not
         finish the work order, end the session, or otherwise touch the
         durable bracket/session state -- resuming is purely re-arming the
         same flag `pause_capture` set."""
         self.capture_paused = False
 
     def results_status(self) -> dict[str, object]:
-        """#153/#252: the kiosk relay's live-results seam -- wraps the
+        """The kiosk relay's live-results seam. Wraps the
         session's results source into the ``{"work_orders": (...),
-        "rows": [...]}`` shape ``KioskRelay._results_status()`` reads via a
-        degrading getattr+callable call, mirroring ``capture_status``.
-        ``work_orders`` is the sorted set of distinct work order ids (not the
-        raw per-row duplication); ``rows`` is the raw per-slide verdict rows.
+        "rows": [...]}`` shape ``KioskRelay._results_status()`` reads.
 
-        NORMAL keeps reading ``list_results_ready_work_orders``' batch-atomic
-        reveal. Open Retrieval reads ``list_retrieval_results`` and Hybrid
-        modes read their compatibility ``list_hybrid_results`` view: every
-        per-slide retrieval job across every work order this session, scored
-        or not, so the results table -- and the
-        router gate it feeds via ``results_ready_work_orders`` -- is
-        reachable the moment Finish Slides closes the bracket, without
-        waiting on scoring. The mode check reads ``self.session_mode``, the
-        same durable, resume-carried value ``poll_drain`` already branches on
-        for the Hybrid Candidate Pool freeze -- never inferred from whether
-        rows/artifacts happen to exist.
+        NORMAL keeps ``list_results_ready_work_orders``' batch-atomic reveal.
+        Open Retrieval reads ``list_retrieval_results``, Hybrid modes read
+        ``list_hybrid_results``: every per-slide job across every work order,
+        scored or not, so the results table is reachable the moment Finish
+        Slides closes the bracket rather than after scoring. The mode check
+        reads the durable, resume-carried ``self.session_mode``, never an
+        inference from whether rows happen to exist.
 
-        Both store calls are proxied over ``/rpc`` by ``RemoteProcessingStore``
-        (#149 transport fix for the NORMAL/OPEN_RETRIEVAL path; the Hybrid
-        path is proxied the same way), so this reads through to the PC store
-        from the Pi. This method runs on the kiosk's poll path (``relay.state``
-        -> ``results_status``), which reaches ``_camera_loop``'s bare
-        ``except Exception`` if anything escapes -- so both branches degrade
-        to empty rows rather than raise: the ``AttributeError`` degrade is a
-        defensive fallback for any store handle that predates its proxy, and
-        the broad ``except Exception`` around ``list_hybrid_results`` is the
-        same blast-radius guard even though the store contract promises that
-        method never raises on its own poll path."""
+        Runs on the kiosk poll path, which reaches ``_camera_loop``'s bare
+        except if anything escapes, so both branches degrade to empty rows
+        rather than raise."""
         from kiosk.results_table import evidence_paths_for_capture
 
         if self.session_mode == SessionMode.OPEN_RETRIEVAL:
@@ -791,7 +772,7 @@ class SessionWorkflow:
         return {"work_orders": work_orders, "rows": enriched}
 
     def hybrid_profile_status(self, *, now_ns: int) -> HybridProfileStatus:
-        """#258: the ONE shared source both the kiosk relay and the console
+        """The ONE shared source both the kiosk relay and the console
         read for ``--profile`` Hybrid queue/timing display -- projects
         ``ProcessingStore.list_hybrid_profile_rows`` through
         ``session.profile_report.project_profile_rows`` into the display-
@@ -830,14 +811,14 @@ class SessionWorkflow:
         return {"queue_count": queue_count, "rows": rows}
 
     def results_evidence_bytes(self, path: str) -> bytes | None:
-        """Read-only JPEG bytes for ``GET /results-evidence`` (#236)."""
+        """Read-only JPEG bytes for ``GET /results-evidence``."""
         remote_reader = getattr(self.store, "results_evidence_bytes", None)
         if callable(remote_reader):
             return remote_reader(self.session.number, path)
         return self.inspection_sheet_bytes(path)
 
     def inspection_sheet_bytes(self, path: str) -> bytes | None:
-        """#153/#151: read-only contact-sheet PNG bytes for
+        """Read-only contact-sheet PNG bytes for
         ``KioskRelay.inspection_sheet_bytes``'s degrading getattr+callable
         seam. Mirrors the simplicity of ``review_still_jpeg`` -- a bare read,
         None on any OS-level failure (missing file, bad path) rather than

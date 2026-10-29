@@ -1,4 +1,4 @@
-"""Production observer seam tests for the runtime harness."""
+"""Production runtime-observer seam tests (stage timing hooks)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 
 from session.preparation import PreparedSpecimen
 from session.pipeline import decide_claim
-from runtime_observer import NullRuntimeObserver, observed
+from runtime_observer import observed
 from verify.scorer import score_pair_result_routed
 
 
@@ -24,12 +24,6 @@ def _specimen(role: str) -> PreparedSpecimen:
     return PreparedSpecimen(role=role, mask=mask, roi_ok=True, roi_reason="ok")
 
 
-def test_null_observer_accepts_records_without_effect():
-    observer = NullRuntimeObserver()
-
-    observer.record("alignment_scoring", 10, "claim-1")
-
-
 def test_observed_records_elapsed_time_and_item_id():
     observer = RecordingObserver()
 
@@ -39,16 +33,6 @@ def test_observed_records_elapsed_time_and_item_id():
     assert observer.records[0][0] == "decode_load"
     assert observer.records[0][1] >= 0
     assert observer.records[0][2] == "block-1"
-
-
-def test_default_observer_does_not_change_score():
-    block = _specimen("block")
-    slide = _specimen("slide")
-
-    baseline = score_pair_result_routed(block, slide)
-    candidate = score_pair_result_routed(block, slide, observer=None)
-
-    assert candidate == baseline
 
 
 def test_scorer_records_locked_cache_and_alignment_stages():

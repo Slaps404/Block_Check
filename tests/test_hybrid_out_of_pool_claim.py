@@ -1,17 +1,14 @@
-"""TDD coverage for #251: an Out-of-Pool Claim (CONTEXT.md glossary entry) --
-a Hybrid slide whose decoded block id is absent from ITS OWN work order's
-frozen Hybrid Candidate Pool.
+"""Out-of-Pool Claim (CONTEXT.md glossary entry): a Hybrid slide whose
+decoded block id is absent from ITS OWN work order's frozen Hybrid Candidate
+Pool.
 
-Per the product decision superseding the issue's original body: the attempt
-is REJECTED as an identity mismatch (never scored), gets an immediate REVIEW
-verdict with the reason "block id not found in session inventory", and stays
-durably recorded and attributable to the work order it was captured under --
-visible on a per-work-order Results view once #252 wires the results-ready
-gate. This file asserts DB state only, never kiosk/Results screen state
-(`lifecycle_state` only reaches `results_ready` via the scoring pass #252
-adds, which Hybrid never calls today).
+The attempt is REJECTED as an identity mismatch (never scored), gets an
+immediate REVIEW verdict with the reason "block id not found in session
+inventory", and stays durably recorded and attributable to the work order it
+was captured under. This file asserts DB state only, never kiosk/Results
+screen state.
 
-The real point of this issue (see THE ISOLATION TEST below) is closing the
+The key guarantee (see THE ISOLATION TEST below) is closing the
 hole `resolve_claim`'s existing session-wide `get_set` lookup leaves open:
 `sets` is keyed by `(session_number, block_id)` only, so a block captured
 under work order A is still found by `get_set` when a slide in a DIFFERENT
@@ -21,27 +18,31 @@ order B's own frozen `hybrid_pools` row, never the whole-session `sets`
 table.
 
 Drives everything through `ProcessingStore` with synthetic captures, no
-camera, no real segmentation -- mirrors tests/test_hybrid_work_order_bracket.py
-and tests/test_hybrid_pool_freeze.py's testing decision.
+camera, no real segmentation.
 """
 from __future__ import annotations
 
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pytest
 
 from session.workflow import ProcessingStore
-from slide.qr import DecodeCandidate, select_slide_identity
-from verify.invariant_descriptors import DescriptorValue
-from verify.scorer import LockedScoreCache, _ComponentFeatures
+from store_harness import (  # noqa: F401
+    lightweight_qc_artifacts,
+    capture_block as _capture_block,
+    DESCRIPTOR_NAMES as _DESCRIPTOR_NAMES,
+    FixedMaskPreprocessor as _FixedMaskPreprocessor,
+    IdenticalFingerprintBuilder as _IdenticalFingerprintBuilder,
+    capture_png as _capture_png,
+    drain as _drain,
+    score_cache_builder as _score_cache_builder,
+    valid_slide_result as _valid_slide_result,
+    write_slide_png as _write_slide_png,
+)
 
 
 STARTED_AT = datetime(2026, 7, 28, 10, 0, 0, tzinfo=timezone.utc)
-_DESCRIPTOR_NAMES = ("fake_descriptor_v1",)
 
 # The exact, canonical operator-facing reason string (CONTEXT.md "Out-of-Pool
 # Claim"; also `resolve_claim`'s existing KeyError-path wording, reused
@@ -51,54 +52,9 @@ _OUT_OF_POOL_REASON = "block id not found in session inventory"
 
 
 @pytest.fixture(autouse=True)
-def lightweight_qc_artifacts(monkeypatch):
-    """The real QC panel renderer assumes the mask matches the capture's
-    dimensions, which these tests' small synthetic masks deliberately do not
-    (mirrors tests/test_hybrid_work_order_bracket.py's fixture of the same
-    name)."""
-    def write_qc(capture, mask, destination):
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_failure_qc(capture, reason, destination):
-        panel = np.full((8, 8, 3), (0, 0, 180), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    monkeypatch.setattr(ProcessingStore, "_write_qc", staticmethod(write_qc))
-    monkeypatch.setattr(
-        ProcessingStore, "_write_failure_qc", staticmethod(write_failure_qc)
-    )
-
-
-class _FixedMaskPreprocessor:
-    """Every block prepares to the SAME fully-filled mask regardless of
-    pixel content."""
-
-    def __call__(self, capture_path: Path):
-        return np.full((8, 8), 255, dtype=np.uint8), {"role": "block", "roi_ok": True}
-
-
-class _IdenticalFingerprintBuilder:
-    """Every block gets the IDENTICAL fingerprint vector -- the maximally
-    confusable case the isolation test asks for: if isolation only held
-    because descriptor VALUES happened to differ between work orders, this
-    would expose it. Only distinct block_ids ever separate them."""
-
-    def __call__(self, mask):
-        return {
-            "fake_descriptor_v1": DescriptorValue(
-                vector=np.array([1.0, 2.0, 3.0]), construction_ns=1
-            )
-        }
-
-
-def _score_cache_builder(specimen):
-    return LockedScoreCache(
-        normalized_mask=specimen.mask,
-        component_features=_ComponentFeatures(
-            points=np.zeros((0, 2)), areas=np.zeros(0), shapes=np.zeros((0, 3)),
-        ),
-    )
+def _lightweight_qc(lightweight_qc_artifacts):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into the shared harness fixture."""
 
 
 def _make_store(tmp_path: Path, **kwargs) -> ProcessingStore:
@@ -106,42 +62,6 @@ def _make_store(tmp_path: Path, **kwargs) -> ProcessingStore:
     kwargs.setdefault("fingerprint_builder", _IdenticalFingerprintBuilder())
     kwargs.setdefault("score_cache_builder", _score_cache_builder)
     return ProcessingStore(tmp_path / "processing", **kwargs)
-
-
-def _capture_png(value: int) -> bytes:
-    image = np.full((32, 32, 3), value, dtype=np.uint8)
-    success, png = cv2.imencode(".png", image)
-    assert success
-    return png.tobytes()
-
-
-def _capture_block(
-    store: ProcessingStore, session_number: int, block_id: str, value: int = 0
-) -> None:
-    assert store.scan_block(session_number, block_id).accepted
-    body = _capture_png(value)
-    checksum = hashlib.sha256(body).hexdigest()
-    store.receive_capture(
-        session_number, capture_id=f"cap-{block_id}", block_id=block_id,
-        checksum=checksum, body=body,
-    )
-
-
-def _drain(store: ProcessingStore, session_number: int) -> None:
-    store.wait_for_jobs()
-    store.begin_block_drain(session_number)
-
-
-def _valid_slide_result(block_id: str):
-    return select_slide_identity((
-        DecodeCandidate("zxing", "QRCode", "raw", f"12080_{block_id}_01_HE"),
-    ))
-
-
-def _write_slide_png(path: Path, value: int = 200) -> Path:
-    image = np.full((24, 24, 3), value, dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
-    return path
 
 
 def _job_count(store: ProcessingStore) -> int:
@@ -197,8 +117,7 @@ def test_out_of_pool_claim_is_reviewed_pool_unmutated_and_capture_continues(
 
     # A following IN-POOL slide capture still processes normally -- capture
     # continues past the rejection with no operator-visible block. Its
-    # verdict legitimately stays PENDING (NULL): #251 only builds the
-    # reject arm; #252 wires the accept arm's per-slide scoring.
+    # verdict legitimately stays PENDING (NULL) until per-slide scoring runs.
     next_capture_id = store.record_slide_capture(
         session.number, _write_slide_png(tmp_path / "slide_valid.png"),
         captured_at=STARTED_AT, result=_valid_slide_result("11111111"),
@@ -210,7 +129,7 @@ def test_out_of_pool_claim_is_reviewed_pool_unmutated_and_capture_continues(
 
 
 # ---------------------------------------------------------------------------
-# THE ISOLATION TEST -- the actual point of this issue.
+# THE ISOLATION TEST: claims are scoped to their own work order's pool.
 # ---------------------------------------------------------------------------
 
 
@@ -272,15 +191,15 @@ def test_isolation_claim_for_a_different_work_orders_block_is_rejected_not_score
 
 
 # ---------------------------------------------------------------------------
-# Negative controls: NORMAL / OPEN_RETRIEVAL are byte-identical to today.
+# Negative controls: NORMAL / OPEN_RETRIEVAL do not use the pool guard.
 # ---------------------------------------------------------------------------
 
 
 def test_normal_mode_missing_block_claim_is_unaffected_by_the_new_guard(tmp_path):
     """NORMAL mode, no work order bracket at all (`stamped_work_order_id`
-    stays None) -- the pre-#251 immediate `resolve_claim` inline path. This
-    must still fire exactly as it always has: an immediate REVIEW the moment
-    the slide is captured, not deferred."""
+    stays None) -- the immediate `resolve_claim` inline path. This must
+    still fire an immediate REVIEW the moment the slide is captured, not
+    deferred."""
     store = _make_store(tmp_path)
     session = store.start_session(started_at=STARTED_AT, session_mode="normal")
     store.begin_block_drain(session.number)
@@ -304,7 +223,7 @@ def test_open_retrieval_missing_block_claim_resolves_review_in_slide_job(
 ):
     """OPEN_RETRIEVAL, WITH an open work order bracket (`stamped_work_order_id`
     is NOT None, exactly the shape the new guard inspects) -- but the mode
-    is not HYBRID/HYBRID_SHADOW, so the new guard must not fire. Today's
+    is not HYBRID/HYBRID_SHADOW, so the guard must not fire. The
     claim remains an Open scoring outcome, not Hybrid's immediate Out-of-Pool
     rejection. With no candidate block, the per-slide job fails closed to
     REVIEW through the ordinary work-order evaluator."""

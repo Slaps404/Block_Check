@@ -1,17 +1,10 @@
 """Tests for block ROI masking."""
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
-
-import block.roi_mask as block_roi_mask  # noqa: E402
-from block.roi_mask import (  # noqa: E402
+import block.roi_mask as block_roi_mask
+from block.roi_mask import (
     find_cassette_bbox,
     find_cassette_window,
     keep_components_in_window,
@@ -20,17 +13,11 @@ from block.roi_mask import (  # noqa: E402
 )
 
 
-def test_window_masked_uses_layer1_only_even_when_layer2_is_found(monkeypatch):
+def test_window_masked_clips_to_cassette_window(monkeypatch):
     gray = np.zeros((10, 10), dtype=np.uint8)
     mask = np.full((10, 10), 255, dtype=np.uint8)
 
     monkeypatch.setattr(block_roi_mask, "find_cassette_window", lambda _gray: (1, 1, 6, 6))
-    monkeypatch.setattr(
-        block_roi_mask,
-        "find_paraffin_window",
-        lambda _gray: (3, 3, 2, 2),
-        raising=False,
-    )
 
     out = block_roi_mask.window_masked(gray, mask)
 
@@ -40,7 +27,7 @@ def test_window_masked_uses_layer1_only_even_when_layer2_is_found(monkeypatch):
     assert out[:, :1].max() == 0
 
 
-# --- clip_components_in_window: connectivity-aware clip --------------------
+# --- keep_components_in_window: connectivity-aware clip --------------------
 # The hard rectangle clip amputates tissue tips that poke past the inset line.
 # A component-aware clip keeps any component that is mostly inside the window
 # (so a straddling tissue piece is kept WHOLE, tail included) while still

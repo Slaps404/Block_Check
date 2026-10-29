@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from verify.invariant_descriptors import (
+from retrieval.invariant_descriptors import (
     build_descriptor_values,
     compare_descriptor_values,
     descriptor_catalog,

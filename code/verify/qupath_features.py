@@ -1,7 +1,7 @@
 """Parse supported QuPath pixel-classifier recipes and build OpenCV features.
 
 This module deliberately reads only the feature recipe, never QuPath's saved
-classifier.  Fresh OpenCV models are trained on these planes by later slices.
+classifier.  Model training and loading live in ``verify.qupath_rtrees``.
 """
 
 from __future__ import annotations

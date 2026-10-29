@@ -1,5 +1,4 @@
-"""Pure results-table projection (#150, ADR 0009 follow-on; #248 4-state;
-#248-fix per-row degrade).
+"""Pure results-table projection (ADR 0009 follow-on).
 
 ``project_results_table(rows)`` is the sort/color/expand-target seam between
 the durable per-slide row state (``SessionWorkflow.
@@ -9,7 +8,7 @@ unit-tested directly with synthetic dicts.
 
 Each input row carries at least ``capture_id``, ``block_id``, ``verdict``,
 ``claim_reason``, ``claim_score``. ``verdict`` normally carries one of four
-operator-visible states (#248, CONTEXT.md "Hybrid Result State"): the two
+operator-visible states (CONTEXT.md "Hybrid Result State"): the two
 verdicts ``"PASS"``/``"REVIEW"``, plus two non-verdict states Hybrid adds --
 ``"ERROR"`` (a system/artifact failure, never a match failure) and
 ``"PENDING"`` (still scoring). Internal job states (queued, preparing,
@@ -27,16 +26,11 @@ entirely) degrades PER ROW instead of aborting the whole batch: it gets its
 own loud, distinct color (``"purple"``, mirroring the browser's
 ``--rt-unknown`` token) and a sort rank at/above ERROR so it can never hide
 at the bottom of a long table. The raw unexpected value is left on the row
-untouched, and a warning is logged naming the capture_id and the value, so an
-operator or a log line can see exactly what it was. Earlier revisions of this
-projection raised ``UnknownResultStateError`` on the first bad row, which
-discarded every OTHER (good) row from the same call -- the sole production
-caller, ``kiosk.relay.RelayHandle.state``, builds this list outside its
-``TransportError`` guard, so one malformed row used to take down the
-operator's entire results table. Silently rendering the row as REVIEW/red
-(the #150 behavior #248 replaced) would be just as wrong -- a system failure
-disguised as a match failure -- so the fix is a loud per-row fallback, not a
-silent default and not a batch-wide exception.
+untouched, and a warning is logged naming the capture_id and the value. Raising
+instead would discard every OTHER (good) row: the sole production caller,
+``KioskRelay.state``, builds this list outside its ``TransportError`` guard.
+Silently rendering the row as REVIEW/red would disguise a system failure as a
+match failure.
 """
 from __future__ import annotations
 
@@ -53,7 +47,7 @@ _COLOR_BY_VERDICT = {
     "PENDING": "gray",
 }
 
-# Stable sort rank: ERROR, REVIEW, PASS, PENDING (#248).
+# Stable sort rank: ERROR, REVIEW, PASS, PENDING.
 _SORT_RANK_BY_VERDICT = {
     "ERROR": 0,
     "REVIEW": 1,
@@ -61,7 +55,7 @@ _SORT_RANK_BY_VERDICT = {
     "PENDING": 3,
 }
 
-# An unrecognized or missing verdict (#248-fix) is loud, not disguised as
+# An unrecognized or missing verdict is loud, not disguised as
 # REVIEW/red and not batch-aborting: a distinct color, never used by the four
 # known states, and a rank at/above ERROR's (0) so it can never sort to the
 # bottom. Mirrors index.html's RT_UNKNOWN_RANK / rt-unknown.
@@ -84,7 +78,7 @@ def evidence_paths_for_capture(
     capture_id: str,
     verdict: str | None,
 ) -> dict[str, str | None]:
-    """Expected claim_artifact paths for one results row (#236 Seam 2).
+    """Expected claim_artifact paths for one results row.
 
     PASS/REVIEW rows include all five refs; pending/error/unknown verdicts
     omit ``overlay_display``. Paths are always emitted (no existence check).

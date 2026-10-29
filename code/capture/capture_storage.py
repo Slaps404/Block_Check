@@ -54,12 +54,14 @@ class CaptureStore:
         captured_at: datetime,
         block_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        capture_tag: str | None = None,
     ) -> CaptureRecord:
         source_path = Path(source)
         if role == "slide":
             self._downscale_oversized_slide(source_path)
         validated = self._validate_still(source_path, role)
         self._validate_identity(role, block_id)
+        self._validate_capture_tag(capture_tag)
         timestamp = self._utc_timestamp(captured_at)
 
         counter = self._next_counter()
@@ -67,7 +69,7 @@ class CaptureStore:
         try:
             try:
                 final_path, counter = self._link_with_collision_retry(
-                    source_path, counter, role, block_id, timestamp
+                    source_path, counter, role, block_id, timestamp, capture_tag
                 )
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
@@ -75,7 +77,7 @@ class CaptureStore:
                 staging_path = self.output_dir / f".capture-{uuid4().hex}.tmp"
                 shutil.copyfile(source_path, staging_path)
                 final_path, counter = self._link_with_collision_retry(
-                    staging_path, counter, role, block_id, timestamp
+                    staging_path, counter, role, block_id, timestamp, capture_tag
                 )
 
             self._write_counter(counter)
@@ -104,10 +106,11 @@ class CaptureStore:
         role: str,
         block_id: str | None,
         timestamp: str,
+        capture_tag: str | None,
     ) -> tuple[Path, int]:
         while True:
             final_path = self.output_dir / self._filename(
-                counter, role, block_id, timestamp
+                counter, role, block_id, timestamp, capture_tag
             )
             try:
                 os.link(link_source, final_path)
@@ -148,14 +151,10 @@ class CaptureStore:
     def _downscale_oversized_slide(cls, source_path: Path) -> None:
         """Shrink an over-large slide PNG in place before validation.
 
-        Store-time-only shrink: the native sensor contract is unchanged. This
-        exists purely to cut the
-        stored/transmitted slide PNG down to ``CAPTURE_DIMENSIONS["slide"]``
-        so downstream transfer/decode/memory cost drops with it. Dimensions
-        are peeked straight from the PNG header (no pixel decode) so an
-        already-correct-size slide (the current production config, and every
-        block capture) costs nothing extra: ``publish`` still decodes the
-        source exactly once in that case.
+        Store-time only: the native sensor contract is unchanged. Cuts the
+        stored/transmitted slide PNG down to ``CAPTURE_DIMENSIONS["slide"]``.
+        Dimensions are read from the PNG header (no pixel decode), so an
+        already-correct-size still costs nothing extra.
         """
         dims = CAPTURE_DIMENSIONS.get("slide")
         if dims is None:
@@ -178,8 +177,7 @@ class CaptureStore:
         """Read a PNG's width/height from its IHDR chunk, without decoding.
 
         Returns ``None`` for anything not readable as a PNG header; callers
-        fall through to the existing ``_validate_still`` error path, which
-        already reports missing/unreadable/wrong-dimension captures.
+        fall through to ``_validate_still``, which reports the error.
         """
         try:
             with path.open("rb") as stream:
@@ -232,6 +230,13 @@ class CaptureStore:
             raise PublicationError("slide captures cannot carry a block ID")
 
     @staticmethod
+    def _validate_capture_tag(capture_tag: str | None) -> None:
+        if capture_tag is None:
+            return
+        if not re.fullmatch(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*", capture_tag):
+            raise PublicationError("capture tag contains unsafe filename characters")
+
+    @staticmethod
     def _utc_timestamp(captured_at: datetime) -> str:
         if captured_at.tzinfo is None:
             raise PublicationError("captured_at must be timezone-aware")
@@ -239,7 +244,12 @@ class CaptureStore:
 
     @staticmethod
     def _filename(
-        counter: int, role: str, block_id: str | None, timestamp: str
+        counter: int,
+        role: str,
+        block_id: str | None,
+        timestamp: str,
+        capture_tag: str | None = None,
     ) -> str:
         identity = f"{block_id}_" if block_id is not None else ""
-        return f"capture_{counter:06d}_{role}_{identity}{timestamp}.png"
+        sequence = f"{capture_tag}_" if capture_tag else ""
+        return f"capture_{counter:06d}_{role}_{identity}{sequence}{timestamp}.png"

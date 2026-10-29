@@ -1,4 +1,4 @@
-"""Laptop-contract tests for the automatic capture session (issue #82)."""
+"""Laptop-contract tests for the automatic capture session."""
 from __future__ import annotations
 
 import cv2
@@ -47,9 +47,19 @@ def _ready_session(**overrides) -> CaptureSession:
     return session
 
 
+def _requested(session: CaptureSession) -> CaptureSession:
+    """Place a slide and hold it still until the session requests a capture."""
+    session.accept_frame(_slide(), now=3.0)
+    session.accept_frame(_slide(), now=3.1)
+    assert session.accept_frame(_slide(), now=4.0).capture_requested
+    assert session.state is CaptureState.CAPTURE_REQUESTED
+    return session
+
+
 def test_session_config_production_defaults_are_explicit_policy():
     config = SessionConfig()
 
+    assert config.roi == (0.1, 0.1, 0.9, 0.9)
     assert config.baseline_frames == 20
     assert config.presence_threshold == 0.04
     assert config.motion_threshold == 0.02
@@ -195,11 +205,7 @@ def test_brightness_pulse_does_not_reset_stability():
 
 
 def test_success_disarms_until_configured_continuous_absence(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    requested = session.accept_frame(_slide(), now=4.0)
-    assert requested.capture_requested
+    session = _requested(_ready_session())
 
     path = _write_configured_slide(tmp_path)
     session.accept_capture_result(CaptureResult.success(path))
@@ -222,10 +228,7 @@ def test_success_disarms_until_configured_continuous_absence(tmp_path):
 
 
 def test_rearmed_session_can_request_exactly_one_new_capture(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    assert session.accept_frame(_slide(), now=4.0).capture_requested
+    session = _requested(_ready_session())
     path = _write_configured_slide(tmp_path)
     session.accept_capture_result(CaptureResult.success(path))
     session.accept_frame(_empty(), now=5.0)
@@ -241,10 +244,7 @@ def test_rearmed_session_can_request_exactly_one_new_capture(tmp_path):
 
 
 def test_unreadable_slide_requires_movement_then_stability(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    assert session.accept_frame(_slide(), now=4.0).capture_requested
+    session = _requested(_ready_session())
     path = _write_configured_slide(tmp_path)
     session.accept_capture_result(CaptureResult.success(path))
     session.mark_slide_unreadable()
@@ -282,10 +282,7 @@ def test_reposition_ignores_one_motion_frame(monkeypatch):
 
 
 def test_unreadable_slide_removal_returns_to_waiting_for_slide(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
+    session = _requested(_ready_session())
     path = _write_configured_slide(tmp_path)
     session.accept_capture_result(CaptureResult.success(path))
     session.mark_slide_unreadable()
@@ -299,16 +296,10 @@ def test_unreadable_slide_removal_returns_to_waiting_for_slide(tmp_path):
 
 def test_skip_is_only_accepted_during_unreadable_slide_flow(tmp_path):
     session = _ready_session()
-    try:
+    with pytest.raises(RuntimeError, match="only valid"):
         session.skip_unreadable_slide()
-    except RuntimeError as exc:
-        assert "only valid" in str(exc)
-    else:
-        raise AssertionError("Skip must be rejected outside unreadable flow")
 
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
+    _requested(session)
     path = _write_configured_slide(tmp_path)
     session.accept_capture_result(CaptureResult.success(path))
     session.mark_slide_unreadable()
@@ -319,10 +310,7 @@ def test_skip_is_only_accepted_during_unreadable_slide_flow(tmp_path):
 
 
 def test_success_requires_reopenable_configured_size_png(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
+    session = _requested(_ready_session())
     wrong_size = tmp_path / "wrong.png"
     cv2.imwrite(str(wrong_size), np.zeros((30, 40, 3), dtype=np.uint8))
 
@@ -332,10 +320,7 @@ def test_success_requires_reopenable_configured_size_png(tmp_path):
 
 
 def test_typed_validated_still_accepts_without_redecode(tmp_path, monkeypatch):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
+    session = _requested(_ready_session())
     tiny = tmp_path / "tiny.png"
     cv2.imwrite(str(tiny), np.zeros((4, 4, 3), dtype=np.uint8))
     width, height = CAPTURE_DIMENSIONS["slide"]
@@ -356,10 +341,7 @@ def test_typed_validated_still_accepts_without_redecode(tmp_path, monkeypatch):
 
 
 def test_spoofed_metadata_dimensions_do_not_bypass_validation(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
+    session = _requested(_ready_session())
     wrong_size = tmp_path / "wrong.png"
     cv2.imwrite(str(wrong_size), np.zeros((30, 40, 3), dtype=np.uint8))
 
@@ -378,7 +360,7 @@ def test_spoofed_metadata_dimensions_do_not_bypass_validation(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Role-aware capture dimension validation (#186, task B3)
+# Role-aware capture dimension validation
 # ---------------------------------------------------------------------------
 
 
@@ -399,86 +381,50 @@ def test_still_acceptable_dimension_check_is_role_aware(role, tmp_path):
     assert not CaptureSession._still_acceptable(mismatched, role)
 
 
-def test_slide_role_frame_at_capture_dimensions_validates(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
-    width, height = CAPTURE_DIMENSIONS["slide"]
-    path = tmp_path / "capture.png"
-    cv2.imwrite(str(path), np.zeros((height, width, 3), dtype=np.uint8))
-
-    session.accept_capture_result(CaptureResult.success(path))
-
-    assert session.state is CaptureState.WAITING_FOR_REMOVAL
-
-
-def test_slide_role_mismatched_dimensions_is_rejected(tmp_path):
-    session = _ready_session()
-    session.accept_frame(_slide(), now=3.0)
-    session.accept_frame(_slide(), now=3.1)
-    session.accept_frame(_slide(), now=4.0)
-    width, height = CAPTURE_DIMENSIONS["slide"]
-    path = tmp_path / "capture.png"
-    cv2.imwrite(str(path), np.zeros((height + 10, width, 3), dtype=np.uint8))
-
-    session.accept_capture_result(CaptureResult.success(path))
-
-    assert session.state is CaptureState.CAPTURE_ERROR
-
-
 def test_malformed_preview_frame_is_rejected():
     session = _ready_session()
     four_channel = np.zeros((100, 140, 4), dtype=np.uint8)
-    try:
+    with pytest.raises(ValueError, match="3-channel"):
         session.accept_frame(four_channel, now=3.0)
-    except ValueError as exc:
-        assert "3-channel" in str(exc)
-    else:
-        raise AssertionError("expected a ValueError for a 4-channel frame")
 
 
-def test_begin_empty_backlight_setup_moves_awaiting_to_building():
+def test_empty_backlight_setup_transitions_and_calibration_failure():
     session = CaptureSession(mode="block")
     assert session.state is CaptureState.AWAITING_BASELINE_CONFIRMATION
     session.begin_empty_backlight_setup()
     assert session.state is CaptureState.BUILDING_BASELINE
 
-
-def test_mark_calibration_failed_from_building():
-    session = CaptureSession(mode="block")
-    session.begin_empty_backlight_setup()
     session.mark_calibration_failed()
-
     result = session.accept_frame(_empty(), now=1.0)
-
     assert session.state is CaptureState.CALIBRATION_FAILED
     assert not result.capture_requested
 
-
-def test_begin_empty_backlight_setup_from_calibration_failed():
-    session = CaptureSession(mode="block")
-    session.begin_empty_backlight_setup()
-    session.mark_calibration_failed()
     session.begin_empty_backlight_setup()
     assert session.state is CaptureState.BUILDING_BASELINE
 
+    session.install_locked_baseline(np.full((480, 640, 3), 220, dtype=np.uint8))
+    assert session.state is CaptureState.WAITING_FOR_SCAN
 
-def test_begin_empty_backlight_setup_rejects_idle_capture_state():
+
+def test_recalibrate_while_waiting_for_scan_but_not_with_a_block_in_play():
     session = CaptureSession(mode="block")
     session.begin_empty_backlight_setup()
     session.install_locked_baseline(np.full((480, 640, 3), 220, dtype=np.uint8))
+
+    # Camera moved: rebuild the baseline from the idle scan screen.
+    session.begin_empty_backlight_setup()
+    assert session.state is CaptureState.BUILDING_BASELINE
+    session.install_locked_baseline(np.full((480, 640, 3), 90, dtype=np.uint8))
     assert session.state is CaptureState.WAITING_FOR_SCAN
-    try:
+    assert float(session.baseline.mean()) == pytest.approx(90.0)
+
+    assert session.submit_scan("12345678").accepted
+    with pytest.raises(RuntimeError, match="empty-backlight setup"):
         session.begin_empty_backlight_setup()
-    except RuntimeError as exc:
-        assert "empty-backlight setup" in str(exc)
-    else:
-        raise AssertionError("expected RuntimeError from idle capture state")
 
 
 # ---------------------------------------------------------------------------
-# `motion` console command (#169): pure motion-sample summarization
+# `motion` console command: pure motion-sample summarization
 # ---------------------------------------------------------------------------
 
 
@@ -498,3 +444,39 @@ def test_summarize_motion_samples_reports_exact_min_mean_max_and_crossings():
     # >= threshold: 0.03, 0.05, 0.02, 0.10
     assert sample.threshold_crossings == 4
     assert isinstance(sample, MotionSample)
+
+
+def test_match_baseline_as_present_inverts_presence():
+    session = CaptureSession(
+        SessionConfig(removal_duration=0.5),
+        match_baseline_as_present=True,
+    )
+    session.install_locked_baseline(_empty(180))
+    assert session.state is CaptureState.EMPTY
+
+    session.accept_frame(_empty(180), now=3.0)
+    session.accept_frame(_empty(180), now=3.1)
+    assert session.state is CaptureState.SETTLING
+
+    session.state = CaptureState.WAITING_FOR_REMOVAL
+    different = session.accept_frame(_slide(), now=4.0)
+    assert different.presence_score >= session.config.occupied_match_threshold
+    session.accept_frame(_slide(), now=4.6)
+    assert session.state is CaptureState.EMPTY
+
+
+def test_match_baseline_as_present_still_settles_when_score_exceeds_empty_threshold(
+    monkeypatch,
+):
+    session = CaptureSession(
+        SessionConfig(stable_duration=0.5),
+        match_baseline_as_present=True,
+    )
+    session.install_locked_baseline(_empty(180))
+    # Per frame: presence then motion. Presence is noisy (> 0.04); motion is quiet.
+    scores = iter((0.10, 0.0, 0.10, 0.0, 0.10, 0.0))
+    monkeypatch.setattr(session, "_difference", lambda *_args: next(scores))
+    session.accept_frame(_empty(180), now=3.0)
+    session.accept_frame(_empty(180), now=3.1)
+    assert session.state is CaptureState.SETTLING
+    assert session.accept_frame(_empty(180), now=3.6).capture_requested

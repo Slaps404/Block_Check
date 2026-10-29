@@ -1,4 +1,4 @@
-"""JPEG downscale/encode helpers for kiosk still display (#137)."""
+"""JPEG downscale/encode helpers for kiosk still display."""
 from __future__ import annotations
 
 import cv2

@@ -209,9 +209,11 @@ def _header_panel(
 
 
 def id_line_text(slide_id: str | None, role_label: str | None) -> str:
-    """Build the header's id/role text (#151 AC3: each rendered sheet must
-    self-identify its slide capture id and role, which in turn carries the
-    block id -- e.g. ``role_label="TOP MATCH 51151378"``). Extracted so
-    tests can assert on the exact string without OCR-ing the rendered PNG.
+    """Build the header's id/role text.
+
+    Each rendered sheet must self-identify its slide capture id and role,
+    which in turn carries the block id (e.g. ``role_label="TOP MATCH
+    51151378"``). Kept separate so tests can assert on the exact string
+    without OCR-ing the rendered PNG.
     """
     return f"  {slide_id or ''}  [{role_label or ''}]"

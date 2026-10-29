@@ -15,6 +15,14 @@ from capture_telemetry import StatusReporter, TelemetryWriter
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("block", "slide"), required=True)
+    parser.add_argument(
+        "--triple-capture",
+        action="store_true",
+        help=(
+            "Capture each block placement three times. Each still is named "
+            "with capture_01, capture_02, or capture_03 for later metadata."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=Path("captures"))
     parser.add_argument(
         "--telemetry", type=Path, default=Path("outputs/capture_telemetry.csv")
@@ -37,7 +45,10 @@ def _prepare_initial_baseline(session: CaptureSession) -> None:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.triple_capture and args.mode != "block":
+        parser.error("--triple-capture is only supported with --mode block")
     # Delayed import keeps laptop imports/tests free of Pi-only dependencies.
     from picamera2_adapter import Picamera2Adapter
 
@@ -50,6 +61,7 @@ def main(argv=None) -> int:
         store=CaptureStore(args.output),
         working_dir=args.output / ".pending",
         configuration=configuration,
+        triple_capture=args.triple_capture,
     )
     reporter = StatusReporter(print)
     _prepare_initial_baseline(session)
@@ -73,7 +85,14 @@ def main(argv=None) -> int:
                     session=session,
                     frame=result,
                     settings=controller.settings,
-                    capture_path=str(record.path) if record is not None else "",
+                    capture_path=(
+                        ";".join(
+                            str(capture.path)
+                            for capture in controller.last_capture_records
+                        )
+                        if record is not None
+                        else ""
+                    ),
                     event=event,
                 )
                 reporter.publish(now=now, session=session, frame=result)

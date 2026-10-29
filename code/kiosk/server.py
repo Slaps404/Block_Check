@@ -1,7 +1,7 @@
-"""Pi-local HTTP shell that serves the kiosk to Chromium ``--kiosk`` (#121).
+"""Pi-local HTTP shell that serves the kiosk to Chromium ``--kiosk``.
 
 Stdlib only -- a ``ThreadingHTTPServer`` bound to ``localhost`` so a browser on
-the same Pi can render the UI; no framework, no new dependency to deploy. Four
+the same Pi can render the UI; no framework, no new dependency to deploy. The
 routes map onto the two relay seams plus the static screen catalog:
 
 * ``GET  /``        -> the one extracted screen (static HTML, deck runtime stripped)
@@ -9,7 +9,9 @@ routes map onto the two relay seams plus the static screen catalog:
 * ``GET  /catalog`` -> the static :data:`kiosk.screens.CATALOG` (state-free; cache at boot)
 * ``POST /command`` -> ``relay.command(name, *args)`` (write path; one tap)
 * ``GET  /inspection`` -> ``relay.inspection_descriptors(capture_id)`` as JSON
-  (#153: ordered contact-sheet descriptors for one results-ready slide)
+  (ordered contact-sheet descriptors for one results-ready slide)
+* ``GET  /settings`` -> capture settings + per-row editability (gear panel);
+  ``POST /settings {name, value}`` sets one, ``POST /settings/reset`` resets all
 
 The server owns no session logic; it is a thin transport over :class:`KioskRelay`.
 Runs on its own daemon thread so it coexists beside the text console's operator
@@ -25,7 +27,7 @@ from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 from kiosk.screens import CATALOG
-from store.remote import TransportError
+from transport.remote import TransportError
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -89,6 +91,8 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
             self._send_file(self.kiosk.static_dir / "index.html", "text/html")
+        elif parsed.path == "/snap":
+            self._send_file(self.kiosk.static_dir / "snap.html", "text/html")
         elif parsed.path == "/state":
             self._send_json(200, self.kiosk.relay.state(_ui_flags(parsed.query)))
         elif parsed.path == "/catalog":
@@ -104,22 +108,42 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_results_evidence(parse_qs(parsed.query))
         elif parsed.path == "/inspection":
             self._send_inspection_descriptors(parse_qs(parsed.query))
+        elif parsed.path == "/settings":
+            status = self.kiosk.relay.settings_status()
+            if status is None:
+                self._send_json(404, {"error": "capture settings unavailable"})
+            else:
+                self._send_json(200, status)
         else:
             self._send_json(404, {"error": f"not found: {self.path}"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/command":
-            self._send_json(404, {"error": f"not found: {self.path}"})
-            return
+        relay = self.kiosk.relay
         payload = self._read_json_body()
-        name = payload.get("name")
-        args = payload.get("args") or []
-        if not isinstance(name, str) or not isinstance(args, list):
-            self._send_json(400, {"ok": False, "error": "expected {name, args[]}"})
-            return
+        if self.path == "/command":
+            name = payload.get("name")
+            args = payload.get("args") or []
+            if not isinstance(name, str) or not isinstance(args, list):
+                self._send_json(400, {"ok": False, "error": "expected {name, args[]}"})
+                return
+            self._send_write(lambda: str(relay.command(name, *args)))
+        elif self.path == "/settings":
+            name = payload.get("name")
+            if not isinstance(name, str) or "value" not in payload:
+                self._send_json(400, {"ok": False, "error": "expected {name, value}"})
+                return
+            self._send_write(lambda: relay.set_setting(name, payload["value"]))
+        elif self.path == "/settings/reset":
+            self._send_write(relay.reset_settings)
+        else:
+            self._send_json(404, {"error": f"not found: {self.path}"})
+
+    def _send_write(self, call) -> None:
+        """Run one write and map its errors onto the shared response shape."""
         try:
-            result = self.kiosk.relay.command(name, *args)
-        except ValueError as exc:  # unknown verb / bad arity -- deterministic reject
+            result = call()
+        except ValueError as exc:
+            # Unknown verb / bad arity / bad setting value -- deterministic reject.
             self._send_json(400, {"ok": False, "error": str(exc)})
         except TransportError as exc:  # link down: not fatal, surfaced to the UI
             self._send_json(200, {"ok": False, "offline": True, "error": str(exc)})
@@ -131,7 +155,7 @@ class _Handler(BaseHTTPRequestHandler):
             # TransportError, which subclasses RuntimeError.)
             self._send_json(200, {"ok": False, "error": str(exc)})
         else:
-            self._send_json(200, {"ok": True, "result": str(result)})
+            self._send_json(200, {"ok": True, "result": result})
 
     # -- helpers -----------------------------------------------------------
     def _read_json_body(self) -> dict:
@@ -178,7 +202,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_bytes(200, "image/jpeg", jpeg)
 
     def _send_inspection_descriptors(self, params: dict[str, list[str]]) -> None:
-        """#153: ``GET /inspection?capture_id=<id>`` -- the ordered contact-
+        """``GET /inspection?capture_id=<id>`` -- the ordered contact-
         sheet descriptors (``kiosk.inspection.project_inspection``) for one
         results-ready slide, so the client drives ``/inspection-sheet?path=``
         fetches off returned paths rather than reconstructing them itself."""
@@ -191,21 +215,40 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, descriptors)
 
-    def _send_inspection_sheet(self, params: dict[str, list[str]]) -> None:
+    def _send_path_param_bytes(
+        self,
+        params: dict[str, list[str]],
+        *,
+        reader,
+        content_type: str,
+        missing_error: str,
+    ) -> None:
+        """Shared ``?path=`` file-serving shape for the two endpoints below:
+        pull ``path`` from the query params, ask the relay reader for its
+        bytes, and 404 with a JSON error when there is no ``path`` or the
+        reader returns nothing."""
         path = (params.get("path") or [None])[0]
-        png = self.kiosk.relay.inspection_sheet_bytes(path) if path else None
-        if png is None:
-            self._send_json(404, {"error": "no inspection sheet"})
+        data = reader(path) if path else None
+        if data is None:
+            self._send_json(404, {"error": missing_error})
             return
-        self._send_bytes(200, "image/png", png)
+        self._send_bytes(200, content_type, data)
+
+    def _send_inspection_sheet(self, params: dict[str, list[str]]) -> None:
+        self._send_path_param_bytes(
+            params,
+            reader=self.kiosk.relay.inspection_sheet_bytes,
+            content_type="image/png",
+            missing_error="no inspection sheet",
+        )
 
     def _send_results_evidence(self, params: dict[str, list[str]]) -> None:
-        path = (params.get("path") or [None])[0]
-        jpeg = self.kiosk.relay.results_evidence_bytes(path) if path else None
-        if jpeg is None:
-            self._send_json(404, {"error": "no results evidence"})
-            return
-        self._send_bytes(200, "image/jpeg", jpeg)
+        self._send_path_param_bytes(
+            params,
+            reader=self.kiosk.relay.results_evidence_bytes,
+            content_type="image/jpeg",
+            missing_error="no results evidence",
+        )
 
 
 class KioskServer:
@@ -236,7 +279,9 @@ class KioskServer:
         if self._thread is not None:
             return
         self._thread = Thread(
-            target=self._httpd.serve_forever, name="kiosk-http", daemon=True
+            # Short poll so stop() returns fast (stdlib default waits 0.5 s).
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.05},
+            name="kiosk-http", daemon=True,
         )
         self._thread.start()
 

@@ -1,6 +1,6 @@
-"""#256: the Hybrid "slide needs attention" banner projection.
+"""The Hybrid "slide needs attention" banner projection.
 
-A THIRD, non-interrupting layer alongside the existing WS-A offline banner
+A THIRD, non-interrupting layer alongside the existing offline banner
 (``.offline-banner`` in ``code/kiosk/static/index.html``) -- the shape this
 deliberately copies: a static, layered notice that never tears down the
 routed screen beneath it. Explicitly NOT the screen-18 duplicate-scan
@@ -37,8 +37,8 @@ def project_attention_banner(
     output so this stays a stable choice rather than flickering between
     multiple simultaneous errors on every poll.
 
-    ``can_recapture`` is the "waits for an available transition" gate
-    (#256 acceptance criterion): False only when a work order IS actively
+    ``can_recapture`` is the "waits for an available transition" gate:
+    False only when a work order IS actively
     capturing (``work_order_open``) and it is a DIFFERENT work order than
     the one the attention item belongs to. If the attention item's OWN
     work order is the one open, or no work order is open at all,

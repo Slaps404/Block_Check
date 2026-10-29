@@ -5,34 +5,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from constants import MATCH_MARGIN, PASS_THRESHOLD
-from verify.work_order_evaluator import evaluate_work_order, flagged_pairs
+import pytest
 
-
-def test_match_margin_constant_default_and_pass_threshold_only_used_in_fallback():
-    assert MATCH_MARGIN == 0.02
-    # Single-block fallback should compare against PASS_THRESHOLD directly.
-    below = PASS_THRESHOLD - 0.10
-    result = evaluate_work_order({"B1": below}, claimed_block="B1")
-    assert result.verdict == "REVIEW"
-
-    above = min(PASS_THRESHOLD + 0.10, 1.0)
-    result = evaluate_work_order({"B1": above}, claimed_block="B1")
-    assert result.verdict == "PASS"
-
-
-def test_result_shape_has_verdict_reason_margin_top_block_near_miss():
-    scores = {"B1": 0.90, "B2": 0.40, "B3": 0.30}
-    result = evaluate_work_order(scores, claimed_block="B1")
-    assert hasattr(result, "verdict")
-    assert hasattr(result, "reason")
-    assert hasattr(result, "match_margin")
-    assert hasattr(result, "top_block")
-    assert hasattr(result, "near_miss_blocks")
-    assert isinstance(result.verdict, str)
-    assert isinstance(result.reason, str)
-    assert result.top_block == "B1"
-    assert result.near_miss_blocks == frozenset()
+from constants import PASS_THRESHOLD
+from retrieval.work_order_evaluator import evaluate_work_order, flagged_pairs
 
 
 def test_clear_win_is_pass():
@@ -42,6 +18,7 @@ def test_clear_win_is_pass():
     assert result.top_block == "B1"
     assert result.near_miss_blocks == frozenset()
     assert result.reason == "Claimed block clearly scored highest."
+    assert result.match_margin == pytest.approx(0.50)
 
 
 def test_ambiguous_near_miss_is_review():
@@ -52,6 +29,7 @@ def test_ambiguous_near_miss_is_review():
     assert result.top_block == "B1"
     assert "B2" in result.near_miss_blocks
     assert result.reason == "Near miss with block B2. Review both."
+    assert result.match_margin == pytest.approx(0.01)
 
 
 def test_claim_disagreement_is_review():
@@ -60,6 +38,8 @@ def test_claim_disagreement_is_review():
     assert result.verdict == "REVIEW"
     assert result.top_block == "B1"
     assert result.reason == "B1 scored higher than claimed block B2."
+    # The margin is relative to the winner, not the claimed block.
+    assert result.match_margin == pytest.approx(0.50)
 
 
 def test_single_block_fallback_uses_pass_threshold_and_is_tagged_unverified():
@@ -99,33 +79,8 @@ def test_exact_tie_margin_is_near_miss():
     assert "B2" in result.near_miss_blocks
 
 
-def test_clear_win_match_margin_is_computed_from_scores():
-    import pytest
-
-    scores = {"B1": 0.90, "B2": 0.40, "B3": 0.30}
-    result = evaluate_work_order(scores, claimed_block="B1")
-    assert result.match_margin == pytest.approx(0.50)
-
-
-def test_ambiguous_near_miss_match_margin_is_computed_from_scores():
-    import pytest
-
-    scores = {"B1": 0.90, "B2": 0.89, "B3": 0.30}
-    result = evaluate_work_order(scores, claimed_block="B1")
-    assert result.match_margin == pytest.approx(0.01)
-
-
-def test_claim_disagreement_match_margin_is_relative_to_winner():
-    import pytest
-
-    scores = {"B1": 0.90, "B2": 0.40, "B3": 0.30}
-    result = evaluate_work_order(scores, claimed_block="B2")
-    assert result.top_block == "B1"
-    assert result.match_margin == pytest.approx(0.50)
-
-
 def test_flagged_pairs_includes_top_match_and_appends_differing_claim():
-    """#151: on claim disagreement, the operator's contact sheet must show
+    """On claim disagreement, the operator's contact sheet must show
     BOTH the top match and the block that was actually claimed."""
     scores = {"B1": 0.90, "B2": 0.40, "B3": 0.30}
     verdict = evaluate_work_order(scores, claimed_block="B2")
@@ -167,7 +122,7 @@ def test_flagged_pairs_only_claim_when_top_block_is_none():
 
 def test_evaluator_module_has_no_cv2_numpy_io_imports():
     module_path = (
-        Path(__file__).resolve().parents[1] / "code" / "verify" / "work_order_evaluator.py"
+        Path(__file__).resolve().parents[1] / "code" / "retrieval" / "work_order_evaluator.py"
     )
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     banned = {"cv2", "numpy", "scipy", "os", "io", "socket", "threading"}

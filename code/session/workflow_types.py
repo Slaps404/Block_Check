@@ -1,4 +1,4 @@
-"""Shared session-workflow dataclasses, protocols, and wire registration (#201 slice 2)."""
+"""Shared session-workflow dataclasses, protocols, and wire registration."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,7 +8,7 @@ from typing import Mapping, Protocol
 
 from session.pipeline import ClaimDecision
 from slide.qr import DecodeAttempt, SlideQRResult
-import store.wire as store_wire
+import transport.wire as store_wire
 
 
 @dataclass(frozen=True)
@@ -16,12 +16,12 @@ class SessionIdentity:
     number: int
     started_at: datetime
     directory: Path
-    # #269 startup-mismatch fix: the durable ``sessions.session_mode`` value,
+    # The durable ``sessions.session_mode`` value,
     # carried over the SAME `start_session`/`resume_session` round trip that
     # already crosses `/rpc` -- not a new store method. Defaults to "normal"
     # so old callers that still construct `SessionIdentity(number, started,
     # directory)` positionally (and any `decode()` payload from before this
-    # field existed) keep working unchanged (see `store.wire.decode`'s
+    # field existed) keep working unchanged (see `transport.wire.decode`'s
     # "keys absent from data are omitted... dataclass defaults apply").
     # Consumed by `tools/run_pi_session.py::main` to refuse startup when the
     # Pi's own resolved `SessionMode` disagrees with this value.
@@ -84,7 +84,7 @@ class UploadReceipt:
 
 @dataclass(frozen=True)
 class SlideStageTimings:
-    """#171: per-stage slide-capture durations, mirroring the sub-durations
+    """Per-stage slide-capture durations, mirroring the sub-durations
     `PiCaptureRuntime._consume_capture` forwards to `CaptureController`.
 
     ``outbox_ms``/``send_ms`` are ``None`` when decode failed and the
@@ -116,7 +116,7 @@ class SessionSummary:
     pass_count: int
     review_count: int
     missing_slides: tuple[str, ...] = ()
-    # #188: total non-dismissed block captures this session regardless of
+    # Total non-dismissed block captures this session regardless of
     # verdict status -- distinct from sets_processed (verdicted-only). Lets
     # the boot router tell "no work yet" from "blocks captured, none scored
     # yet". Dismissed (resolved-unusable) blocks are excluded: they are not
@@ -156,7 +156,7 @@ class BlockReadiness:
 
 @dataclass(frozen=True)
 class RecaptureOutcome:
-    """#256: result of one accepted-recapture attempt against an existing
+    """Result of one accepted-recapture attempt against an existing
     Hybrid slide capture (``ProcessingStore.recapture_hybrid_slide``).
 
     Supersession of the prior row is gated STRUCTURALLY on decoded-identity
@@ -176,7 +176,7 @@ class RecaptureOutcome:
 
 @dataclass(frozen=True)
 class HybridPoolFreezeResult:
-    """Outcome of one `ProcessingStore.freeze_hybrid_pool` call (#250).
+    """Outcome of one `ProcessingStore.freeze_hybrid_pool` call.
 
     ``frozen`` is the one-way signal: once ``True`` for a session, a repeat
     call returns the identical result (idempotent) and no further freeze
@@ -236,7 +236,7 @@ class OutboxSlide:
     duration_ms: float
     state: str = "pending"
     profile: bool = False
-    # #256 follow-up: the durable "this capture supersedes an existing
+    # The durable "this capture supersedes an existing
     # Hybrid attention item" tag -- set only when `SessionWorkflow.
     # capture_slide` was armed (see `arm_hybrid_recapture`) at the moment
     # THIS capture was taken. Baked into the outbox entry at publish time

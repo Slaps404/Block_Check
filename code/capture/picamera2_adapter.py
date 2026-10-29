@@ -22,7 +22,7 @@ from capture_runtime import (
     CameraSettings,
     camera_settings_for,
 )
-from occupancy import detect_occupancy
+from constants import CALIBRATION_MIN_BACKGROUND_LUMA
 
 
 LOCK_FLUSH_FRAMES = 4
@@ -45,6 +45,10 @@ class Picamera2Adapter:
         self._camera_lock = threading.RLock()
         self._locked_by_mode: dict[str, LockedCameraControls] = {}
         self._active_mode: str | None = None
+        self.led_only_blocks = False
+        self.block_presence_noise_floor = 8.0
+        # Runtime-pushed live role settings; missing roles use the constants.
+        self.role_settings: dict[str, CameraSettings] = {}
 
     def start_preview(self, *, settings, size, fps):
         with self._lock():
@@ -95,6 +99,19 @@ class Picamera2Adapter:
                 return request.make_array("main").copy()
             finally:
                 request.release()
+
+    def set_preview_exposure(self, exposure_us: int) -> None:
+        """Change only the exposure of the running preview stream."""
+        if exposure_us <= 0:
+            raise ValueError("preview exposure must be positive")
+        with self._lock():
+            if not self._started:
+                return
+            self._camera.set_controls({"ExposureTime": exposure_us})
+            if self._preview_config is not None:
+                self._preview_config.setdefault("controls", {})[
+                    "ExposureTime"
+                ] = exposure_us
 
     def capture_still(self, path: Path, *, settings, size):
         with self._lock():
@@ -176,7 +193,7 @@ class Picamera2Adapter:
 
     def activate_mode(self, mode: str) -> ActivatedCameraMode:
         """Configure fixed controls, verify them, then collect the baseline."""
-        settings = camera_settings_for(mode)
+        settings = self._settings_for(mode)
         with self._lock():
             # A fresh role calibration must start from that role's settings.
             # Otherwise _effective_controls can merge the previous role's lock
@@ -186,9 +203,10 @@ class Picamera2Adapter:
                 settings=settings, size=PREVIEW_SIZE, fps=PREVIEW_FPS
             )
             calibration = self._lock_role_controls(mode, settings=settings)
+            led_only = mode == "block" and getattr(self, "led_only_blocks", False)
             frames = [
                 self.preview_frame().astype(np.float32)
-                for _ in range(BASELINE_FRAMES)
+                for _ in range(20 if led_only else BASELINE_FRAMES)
             ]
             stack = np.stack(frames)
             baseline = np.mean(stack, axis=0)
@@ -198,17 +216,32 @@ class Picamera2Adapter:
             luma_median = float(np.median(roi))
             clipped_high = float(np.mean(roi >= 254))
             clipped_low = float(np.mean(roi <= 1))
-            occupancy = detect_occupancy(baseline)
-            if occupancy.occupied:
+            if led_only:
+                # Darkness is expected. Qualify actual block contrast separately.
+                noise = float(np.percentile(np.std(roi, axis=0), 99))
+                self.block_presence_noise_floor = max(8.0, 6.0 * noise)
+                if self.block_presence_noise_floor > 32.0:
+                    self._invalidate_mode(mode)
+                    raise CameraCalibrationError(
+                        mode, "LED background is unstable",
+                        {"noise_floor": self.block_presence_noise_floor},
+                    )
+            if not led_only and luma_median < CALIBRATION_MIN_BACKGROUND_LUMA:
+                # Darkness is neutral, so the occupancy gate below cannot see
+                # it. Without this check a dark field locks a baseline that
+                # detects nothing: no Place Block, and Remove Block never
+                # clears. Usually the preview backlight is off or dead.
                 self._invalidate_mode(mode)
                 raise CameraCalibrationError(
-                    mode, "capture area occupied",
+                    mode, "capture area too dark",
                     {
-                        "chromatic_fraction": occupancy.chromatic_fraction,
-                        "occupancy_sat_min": occupancy.sat_min,
-                        "occupancy_area_frac_max": occupancy.area_frac_max,
+                        "background_luma_median": luma_median,
+                        "minimum_background_luma": (
+                            CALIBRATION_MIN_BACKGROUND_LUMA
+                        ),
                     },
                 )
+            # Whatever the camera sees (e.g. a colored table) becomes "empty".
             calibration = replace(
                 calibration,
                 quality=replace(
@@ -230,6 +263,10 @@ class Picamera2Adapter:
                 return {}
             return {
                 "camera_mode": self._active_mode,
+                "placement_illumination": (
+                    "led_only" if self._active_mode == "block"
+                    and getattr(self, "led_only_blocks", False) else "backlight"
+                ),
                 "exposure_time_us": controls.exposure_time_us,
                 "analogue_gain": controls.analogue_gain,
                 "colour_gains": controls.colour_gains,
@@ -317,13 +354,17 @@ class Picamera2Adapter:
         role_controls = self._controls(settings)
         if (
             self._active_mode is None
-            or settings != camera_settings_for(self._active_mode)
+            or settings != self._settings_for(self._active_mode)
         ):
             return role_controls
         return {
             **role_controls,
             **(self._locked_controls_dict() or {}),
         }
+
+    def _settings_for(self, mode: str) -> CameraSettings:
+        overrides = getattr(self, "role_settings", None) or {}
+        return overrides.get(mode) or camera_settings_for(mode)
 
     def _controls(self, settings: CameraSettings) -> dict:
         return {

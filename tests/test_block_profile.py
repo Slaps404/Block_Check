@@ -5,16 +5,10 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
-import sys
 
 import cv2
 import numpy as np
 
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_CODE_DIR = _REPO_ROOT / "code"
-if str(_CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(_CODE_DIR))
 
 from session.processing_store import ProcessingStore  # noqa: E402
 from session.outbox_transport import HttpCaptureClient  # noqa: E402

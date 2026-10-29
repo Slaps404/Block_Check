@@ -1,4 +1,4 @@
-"""Store-time slide downscale in ``CaptureStore.publish`` (issue #186, Task B4).
+"""Store-time slide downscale in ``CaptureStore.publish``.
 
 The Pi sensor still shoots full resolution (``STILL_SIZE`` unchanged); this
 only shrinks the *stored/sent* slide PNG down to ``CAPTURE_DIMENSIONS["slide"]``
@@ -40,6 +40,7 @@ def test_slide_is_downscaled_to_configured_dims(tmp_path, monkeypatch, out_store
     assert persisted.shape[:2] == (1520, 2028)
 
 
+@pytest.mark.native_resolution
 def test_block_is_not_downscaled(tmp_path, out_store):
     src = _full_png(tmp_path)
     record = out_store.publish(

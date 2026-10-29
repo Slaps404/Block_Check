@@ -1,4 +1,4 @@
-"""#258: pure-formatter tests for `code/session/profile_report.py`.
+"""Pure-formatter tests for `code/session/profile_report.py`.
 
 This module has NO clock, NO I/O, NO store access -- every test here drives
 it with a literal `now_ns` and literal raw row dicts (the shape
@@ -10,16 +10,9 @@ from __future__ import annotations
 
 import json
 import re
-import sys
-from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_CODE_DIR = _REPO_ROOT / "code"
-if str(_CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(_CODE_DIR))
-
-import session.profile_report as profile_report  # noqa: E402
-from session.profile_report import (  # noqa: E402
+import session.profile_report as profile_report
+from session.profile_report import (
     PROFILE_STAGE_ORDER,
     format_profile_console,
     profile_screen_fields,
@@ -29,7 +22,7 @@ from session.profile_report import (  # noqa: E402
 
 # The exact durable-lifecycle strings that must NEVER reach a caller of
 # either renderer -- `sets`/`slide_captures.job_state` values other than the
-# four visible states, plus 'superseded' (#256).
+# four visible states, plus 'superseded'.
 _INTERNAL_LIFECYCLE_STRINGS = ("queued", "preparing", "scoring", "complete", "superseded")
 
 
@@ -244,8 +237,8 @@ def test_no_internal_lifecycle_string_appears_in_any_rendered_value():
 
 
 def test_missing_or_null_stage_values_on_an_old_row_do_not_raise():
-    """A pre-#258 row (or one with a NULL stage_ms_json/queued_ns) must
-    degrade gracefully, never raise."""
+    """A row written before stage timing existed (or one with a NULL
+    stage_ms_json/queued_ns) must degrade gracefully, never raise."""
     raw_rows = [
         {"capture_id": "cap-old", "block_id": "77777777", "job_state": "queued"},
         {

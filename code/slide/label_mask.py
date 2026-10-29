@@ -43,10 +43,6 @@ from constants import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
-
 @dataclass
 class LabelRect:
     """Result of find_label_rect().
@@ -68,10 +64,6 @@ def _null_rect() -> LabelRect:
         box_pts=np.zeros((4, 2), dtype=np.float32), label_side="none",
     )
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _otsu_on_mask(inv_gray: np.ndarray, mask_bool: np.ndarray) -> int:
     """Otsu threshold using only pixels where mask_bool is True."""
@@ -163,10 +155,6 @@ def _border_touch_ok(
     )
     return not bad
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def find_label_rect(bgr_image: np.ndarray) -> LabelRect:
     """Detect frosted/yellow label as rotated rect; fail-safe passthrough."""
@@ -314,8 +302,6 @@ def draw_label_overlay(
     Green contour = detected label rectangle.
     Red contour = expanded fill rectangle (what apply_label_mask() fills).
     Text overlay shows found status, side, and angle.
-
-    Leaf / diagnostic function - no other function calls this; TDD optional.
 
     Args:
         bgr_image: original BGR image

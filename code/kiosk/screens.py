@@ -1,4 +1,4 @@
-"""The screen catalog -- single source of truth for the generic renderer (119).
+"""The screen catalog -- single source of truth for the generic renderer.
 
 Pure static data. Each entry describes how one screen is painted; the client
 picks the active entry with ``/state.screen`` (= :func:`kiosk.router.select_screen`
@@ -12,10 +12,10 @@ from the frozen vocabulary (``dispatch``/``guard``/``back``/``engage``/
 ``disengage``); ``verb`` appears only on ``dispatch`` and ``target`` only on
 ``guard``/``back``.
 
-Copy + render fields are ported from the DesignSync kiosk wireframe (lab
-design artifacts moved out of-repo in #206). Headlines are authored title-case
-and the renderer upper-cases them via ``text-transform``. Two render fields
-beyond the 119a shape carry design-faithful layout signals the renderer reads:
+Copy + render fields are ported from the DesignSync kiosk wireframe.
+Headlines are authored title-case and the renderer upper-cases them via
+``text-transform``. Two extra render fields carry design-faithful layout
+signals the renderer reads:
 
 * ``status_bar`` (bool) -- whether the capture status line shows on this screen.
   The renderer builds the text ("BLOCK CAPTURE ..." / "SLIDE CAPTURE ...") from
@@ -32,6 +32,26 @@ BUTTON_ACTIONS: Final = ("dispatch", "guard", "back", "engage", "disengage")
 
 CATALOG: Final[dict[str, Any]] = {
     "screens": {
+        "led_calibration_place": {
+            "headline": "Check LED Placement Detection",
+            "sub": "Place a test block, then withdraw your hand. No photo is saved.",
+            "variant": "place", "bg": "default", "progress_bar": False,
+            "status_bar": False, "buttons": [],
+        },
+        "led_calibration_remove": {
+            "headline": "Remove Test Block",
+            "sub": "Clear the tray to finish the LED detection check.",
+            "variant": "place", "bg": "default", "progress_bar": False,
+            "status_bar": False, "buttons": [],
+        },
+        "led_calibration_failed": {
+            "headline": "LED Setup Needs Retry",
+            "sub": "Clear the tray. Check the LED and retry setup.",
+            "variant": "error", "bg": "default", "progress_bar": False,
+            "status_bar": False,
+            "buttons": [{"label": "RETRY", "action": "dispatch",
+                         "verb": "confirm_empty", "size": "lg"}],
+        },
         "01": {
             "headline": "LJI Block Check",
             "sub": "Preview",
@@ -140,6 +160,8 @@ CATALOG: Final[dict[str, Any]] = {
             "progress_bar": False,
             "status_bar": True,
             "buttons": [
+                {"label": "RECALIBRATE", "action": "dispatch",
+                 "verb": "confirm_empty"},
                 {"label": "FINISH BLOCKS", "action": "guard",
                  "target": "finish_blocks_guard"},
             ],
@@ -169,10 +191,15 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "default",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "CAPTURE NOW", "action": "dispatch",
+                 "verb": "capture_now"},
+            ],
             "special": (
                 "Router R19: capture_mode == block && capture_state == EMPTY. "
-                "Auto-capture, no button. BLOCK ID sub (38px) reads the scanned "
+                "Auto-capture, plus CAPTURE NOW, which skips presence and "
+                "settling and shoots down the normal capture path (requires a "
+                "scanned block ID). BLOCK ID sub (38px) reads the scanned "
                 "id (pending_block_id / block_scanned event) - note 119a gotcha: "
                 "snapshot.latest_block_id fills at capture time not scan time. "
                 "SETTLING is hold_still (ADR 0005), not this screen."
@@ -185,11 +212,16 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "default",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "CAPTURE NOW", "action": "dispatch",
+                 "verb": "capture_now"},
+            ],
             "special": (
                 "Router ADR 0005: capture_state == SETTLING (block or slide). "
                 "Shared centred Place-style layout (variant place) -- NOT the "
-                "session processing screen. No progress bar, no buttons. BLOCK "
+                "session processing screen. No progress bar. CAPTURE NOW ends "
+                "the settling wait immediately (issue: data-collection "
+                "throughput). BLOCK "
                 "ID sub only in block mode (client clears sub in slide mode)."
             ),
         },
@@ -238,11 +270,15 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "default",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "NEXT CAPTURE", "action": "dispatch",
+                 "verb": "next_capture"},
+            ],
             "special": (
                 "Router R16: capture_mode == block && capture_state == "
                 "WAITING_FOR_REMOVAL. Auto (removal detection), no button. "
-                "BLOCK ID sub persists until Scan Block returns (ADR 0005)."
+                "NEXT CAPTURE overrides removal detection and returns to Scan "
+                "Block. BLOCK ID sub persists until Scan Block returns (ADR 0005)."
             ),
         },
         "10": {
@@ -309,13 +345,36 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "default",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "NEXT CAPTURE", "action": "dispatch",
+                 "verb": "next_capture"},
+            ],
             "special": (
                 "Router R15: capture_mode == slide && capture_state == "
                 "WAITING_FOR_REMOVAL with NO id-matched verdict yet. Design 14 "
                 "shows a 'Remove Slide' sub -- the operator may remove the "
                 "slide while the verdict is pending. Auto; becomes 15/16 once "
-                "latest_verdict.capture_id == current_capture_id."
+                "latest_verdict.capture_id == current_capture_id. NEXT CAPTURE "
+                "overrides removal detection and returns to Place Slide."
+            ),
+        },
+        "hybrid_slide_queued": {
+            "headline": "Slide Captured",
+            "sub": "Remove Slide - scoring queued",
+            "variant": "verify",
+            "bg": "default",
+            "progress_bar": False,
+            "status_bar": True,
+            "buttons": [
+                {"label": "NEXT CAPTURE", "action": "dispatch",
+                 "verb": "next_capture"},
+            ],
+            "special": (
+                "Router: work-order bracket mode (open_retrieval / hybrid / "
+                "hybrid_shadow), phase == slides, capture_mode == slide, "
+                "capture_state == WAITING_FOR_REMOVAL. Scoring runs in the "
+                "background, so no live verdict is shown; results appear in "
+                "the Results table. NEXT CAPTURE overrides removal detection."
             ),
         },
         "15": {
@@ -325,15 +384,18 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "pass-full",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "NEXT CAPTURE", "action": "dispatch",
+                 "verb": "next_capture"},
+            ],
             "special": (
                 "Router R13: slide && WAITING_FOR_REMOVAL && "
                 "latest_verdict.kind == claim_pass && "
                 "latest_verdict.capture_id == current_capture_id. FULL-SCREEN "
                 "GREEN (#20b15a) with white text and a 'Remove Slide' sub. "
                 "Status bar text is rgba(255,255,255,0.82). Auto, awaiting "
-                "removal, no button. Id-match prevents a stale prior-slide PASS "
-                "bleeding onto the next slide."
+                "removal. NEXT CAPTURE overrides removal detection. Id-match "
+                "prevents a stale prior-slide PASS bleeding onto the next slide."
             ),
         },
         "16": {
@@ -344,13 +406,16 @@ CATALOG: Final[dict[str, Any]] = {
             "bg": "review-full",
             "progress_bar": False,
             "status_bar": True,
-            "buttons": [],
+            "buttons": [
+                {"label": "NEXT CAPTURE", "action": "dispatch",
+                 "verb": "next_capture"},
+            ],
             "special": (
                 "Router R14: slide && WAITING_FOR_REMOVAL && "
                 "latest_verdict.kind == claim_review && id-match. FULL-SCREEN "
                 "RED (#c93535) with white text. Two lines: the verdict reason "
                 "(`sub`, 58px) and a smaller 'Remove Slide' line (`sub2`, "
-                "44px). Auto, awaiting removal, no button."
+                "44px). NEXT CAPTURE overrides removal detection."
             ),
         },
         "17": {
@@ -523,6 +588,8 @@ CATALOG: Final[dict[str, Any]] = {
             "progress_bar": False,
             "status_bar": True,
             "buttons": [
+                {"label": "RECALIBRATE", "action": "dispatch",
+                 "verb": "confirm_empty"},
                 {"label": "FINISH BLOCKS", "action": "guard",
                  "target": "finish_blocks_guard"},
             ],

@@ -7,16 +7,11 @@ Covers:
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 from verify import segmentation  # noqa: E402
 from verify.segmentation import segment_tissue  # noqa: E402

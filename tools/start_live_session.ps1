@@ -48,10 +48,15 @@ $NoChromium = $false
 $NoTunnel = $false
 $KeepPiSession = $false
 $ReviewCaptures = $false
+$TripleCapture = $false
+$LedOnlyBlocks = $false
 $OpenRetrieval = $false
 $Hybrid = $false
 $HybridShadow = $false
 $ProfileMode = $false
+$AllowOccupiedBaseline = $false
+$SkipRemovalWait = $false
+$CameraProfile = 'imx477'
 $Resume = $null
 $Session = $null
 $ShowHelp = $false
@@ -83,10 +88,15 @@ Options:
   --no-tunnel              Skip laptop SSH -L tunnel
   --keep-pi-session        Do not kill an existing run_pi_session.py on the Pi
   --review-captures        Enable ADR 0006 debug capture review gate on the Pi
+  --triple-capture         Capture every block as coax + backlight + neutral/oblique (BCM 22)
+  --led-only               LED-only block calibration/detection on a dark tray (slides use backlight)
   --open-retrieval          Enable open-retrieval mode (issue #147-#151) on the Pi
   --hybrid                 Enable Hybrid session scoring mode (#247 mode plumbing only) on the Pi
   --hybrid-shadow          Enable Hybrid Shadow session scoring mode (#247 mode plumbing only) on the Pi
   --profile                Print per-stage capture timings + persist profile_summary.csv (#168) on the Pi
+  --allow-occupied-baseline  Skip empty-tray occupancy check (barcode collection with cassette on tray)
+  --skip-removal-wait      Blocks only: return to Scan Block right after a capture (no removal wait)
+  --camera-profile NAME    Still sizes: imx477 (default HQ) or imx219 / v2.1 (Camera Module v2.1 smoke)
 
   --open-retrieval/--hybrid/--hybrid-shadow are mutually exclusive.
   -h, --help               Show this help
@@ -176,6 +186,14 @@ function Parse-RestArgs {
                 $script:ReviewCaptures = $true
                 $i++
             }
+            '^--triple-capture$' {
+                $script:TripleCapture = $true
+                $i++
+            }
+            '^--led-only(-blocks)?$' {
+                $script:LedOnlyBlocks = $true
+                $i++
+            }
             '^--open-retrieval$' {
                 $script:OpenRetrieval = $true
                 $i++
@@ -191,6 +209,18 @@ function Parse-RestArgs {
             '^--profile$' {
                 $script:ProfileMode = $true
                 $i++
+            }
+            '^--allow-occupied-baseline$' {
+                $script:AllowOccupiedBaseline = $true
+                $i++
+            }
+            '^--skip-removal-wait$' {
+                $script:SkipRemovalWait = $true
+                $i++
+            }
+            '^--camera-profile$' {
+                $script:CameraProfile = Get-NextArg $List $i $a
+                $i += 2
             }
             default {
                 throw "Unknown argument: $a`n$(Show-Usage)"
@@ -213,6 +243,13 @@ function Assert-SafeUrl {
     }
     if ($Value -match "['`"`$\\;|&<>]") {
         throw "$Name contains characters that are not allowed: $Value"
+    }
+}
+
+function Assert-SafeCameraProfile {
+    param([string]$Value, [string]$Name)
+    if ($Value -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "$Name contains unsafe characters: $Value"
     }
 }
 
@@ -540,19 +577,30 @@ function Build-RemotePiCommand {
         [int]$DelaySec,
         [bool]$KillStalePiSession = $true,
         [bool]$ReviewCaptures = $false,
+        [bool]$TripleCapture = $false,
+        [bool]$LedOnlyBlocks = $false,
         [bool]$OpenRetrieval = $false,
         [bool]$Hybrid = $false,
         [bool]$HybridShadow = $false,
-        [bool]$ProfileMode = $false
+        [bool]$ProfileMode = $false,
+        [bool]$AllowOccupiedBaseline = $false,
+        [bool]$SkipRemovalWait = $false,
+        [string]$CameraProfile = 'imx477'
     )
 
     $startChromiumFlag = if ($StartChromium) { '1' } else { '0' }
     $killStaleFlag = if ($KillStalePiSession) { '1' } else { '0' }
     $reviewCapturesFlag = if ($ReviewCaptures) { ' --review-captures' } else { '' }
+    $tripleCaptureFlag = if ($TripleCapture) { ' --triple-capture' } else { '' }
+    $ledOnlyBlocksFlag = if ($LedOnlyBlocks) { ' --led-only' } else { '' }
     $openRetrievalFlag = if ($OpenRetrieval) { ' --open-retrieval' } else { '' }
     $hybridFlag = if ($Hybrid) { ' --hybrid' } else { '' }
     $hybridShadowFlag = if ($HybridShadow) { ' --hybrid-shadow' } else { '' }
     $profileFlag = if ($ProfileMode) { ' --profile' } else { '' }
+    $allowOccupiedBaselineFlag = if ($AllowOccupiedBaseline) { ' --allow-occupied-baseline' } else { '' }
+    $skipRemovalWaitFlag = if ($SkipRemovalWait) { ' --skip-removal-wait' } else { '' }
+    Assert-SafeCameraProfile $CameraProfile 'CameraProfile'
+    $cameraProfileFlag = " --camera-profile $(ConvertTo-BashSingleQuoted $CameraProfile)"
     # Values are embedded inside a single-quoted bash -lc string; validate first.
     $script = @"
 set -e
@@ -630,7 +678,7 @@ if [ "`$START_CHROMIUM" = "1" ]; then
 fi
 echo "NOTE: Pi must have run_pi_session.py --kiosk (KioskServer). Without it, argparse exits immediately."
 echo "Starting Pi session $SessionNumber against $Url (--kiosk)"
-exec ./venv/bin/python tools/run_pi_session.py --receiver-url $(ConvertTo-BashSingleQuoted $Url) --session $SessionNumber --kiosk$reviewCapturesFlag$openRetrievalFlag$hybridFlag$hybridShadowFlag$profileFlag
+exec ./venv/bin/python tools/run_pi_session.py --receiver-url $(ConvertTo-BashSingleQuoted $Url) --session $SessionNumber --kiosk$reviewCapturesFlag$tripleCaptureFlag$ledOnlyBlocksFlag$openRetrievalFlag$hybridFlag$hybridShadowFlag$profileFlag$allowOccupiedBaselineFlag$skipRemovalWaitFlag$cameraProfileFlag
 "@
     return (ConvertTo-UnixNewlines -Text $script)
 }
@@ -763,8 +811,12 @@ try {
         -SessionNumber $Session -ChromiumUrl $KioskUrl `
         -StartChromium (-not $NoChromium) -DelaySec $ChromiumDelaySec `
         -KillStalePiSession (-not $KeepPiSession) -ReviewCaptures $ReviewCaptures `
+        -TripleCapture $TripleCapture `
+        -LedOnlyBlocks $LedOnlyBlocks `
         -OpenRetrieval $OpenRetrieval -Hybrid $Hybrid -HybridShadow $HybridShadow `
-        -ProfileMode $ProfileMode
+        -ProfileMode $ProfileMode -AllowOccupiedBaseline $AllowOccupiedBaseline `
+        -SkipRemovalWait $SkipRemovalWait `
+        -CameraProfile $CameraProfile
 
     Write-Host ""
     Write-Host "Opening interactive SSH. Pi console (pi>) will take over."

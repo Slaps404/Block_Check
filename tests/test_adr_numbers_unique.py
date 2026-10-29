@@ -1,4 +1,4 @@
-"""ADR identifiers must be unique so numeric citations are unambiguous (#198)."""
+"""ADR identifiers must be unique so numeric citations are unambiguous."""
 from __future__ import annotations
 
 import re

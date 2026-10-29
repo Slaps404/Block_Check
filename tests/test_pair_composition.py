@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import inspect
 
 import cv2
 import numpy as np
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
-
-import inspect  # noqa: E402
-
-from verify.pair_composition import compose_pair, compose_prepared_pair  # noqa: E402
-from session.preparation import PreparationFailure, PreparedSpecimen  # noqa: E402
-from verify.scorer import score_pair_result_routed  # noqa: E402
+from verify.pair_composition import compose_pair, compose_prepared_pair
+from session.preparation import PreparationFailure, PreparedSpecimen
+from verify.scorer import score_pair_result_routed
 
 
 def _specimen(mask: np.ndarray, role: str) -> PreparedSpecimen:
@@ -71,15 +64,11 @@ def test_compose_prepared_pair_does_not_score_preparation_failures():
 
 
 # ---------------------------------------------------------------------------
-# Issue #72: the routed scorer is the compose_pair / compose_prepared_pair
+# The routed scorer is the compose_pair / compose_prepared_pair
 # default ScoreFn.
 # ---------------------------------------------------------------------------
 
-def test_compose_pair_default_scorer_is_the_shape_router():
-    default_scorer = inspect.signature(compose_pair).parameters["scorer"].default
-    assert default_scorer is score_pair_result_routed
-
-
-def test_compose_prepared_pair_default_scorer_is_the_shape_router():
-    default_scorer = inspect.signature(compose_prepared_pair).parameters["scorer"].default
-    assert default_scorer is score_pair_result_routed
+def test_compose_default_scorer_is_the_shape_router():
+    for fn in (compose_pair, compose_prepared_pair):
+        default_scorer = inspect.signature(fn).parameters["scorer"].default
+        assert default_scorer is score_pair_result_routed, fn.__name__

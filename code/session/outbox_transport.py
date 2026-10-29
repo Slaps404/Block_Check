@@ -1,4 +1,4 @@
-"""Outbound capture transport: Pi outbox publication and HTTP client (#201 slice 3)."""
+"""Outbound capture transport: Pi outbox publication and HTTP client."""
 from __future__ import annotations
 
 import hashlib
@@ -10,12 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from capture_storage import CaptureStore
 from slide.qr import SlideQRResult
-import store.wire as store_wire
+import transport.wire as store_wire
 from session.atomic_io import atomic_bytes as _atomic_bytes
 from session.atomic_io import atomic_json as _atomic_json
 from session.atomic_io import sha256 as _sha256
@@ -117,7 +118,7 @@ class PiOutbox:
     ) -> OutboxSlide:
         """Durably publish a slide and decode audit before any HTTP attempt.
 
-        ``supersedes`` (#256 follow-up) is the armed-recapture tag: when set,
+        ``supersedes`` is the armed-recapture tag: when set,
         it names the existing Hybrid slide capture this NEW capture should
         replace once replayed (see ``replay_slides``). Baked into the durable
         metadata at publish time so it survives a crash before replay, same
@@ -137,7 +138,7 @@ class PiOutbox:
             "capture_id": capture_id, "path": path.name, "checksum": checksum,
             "captured_at": utc.isoformat(), "result": store_wire.encode(result),
             "duration_ms": float(duration_ms), "state": "pending",
-            # #258: thread the --profile gate across the durable outbox
+            # Thread the --profile gate across the durable outbox
             # entry, mirroring publish_block's own "profile" metadata key,
             # so a crash between this write and replay_slides still recovers
             # the flag from disk rather than silently dropping it to False.
@@ -200,7 +201,7 @@ class PiOutbox:
     def replay_slides(self, session_number: int, store: object) -> tuple[str, ...]:
         """Replay durable slide captures FIFO; leave failures pending.
 
-        A slide durably tagged ``supersedes`` (#256 follow-up -- an
+        A slide durably tagged ``supersedes`` (an
         operator-armed recapture, see ``SessionWorkflow.
         arm_hybrid_recapture``) replays through ``store.
         recapture_hybrid_slide`` instead of the ordinary ``store.
@@ -386,14 +387,27 @@ def open_saved_image(path: Path) -> None:
 
 
 def save_debug_snap(
-    body: bytes, *, dest_dir: Path | None = None, open_image: bool = False
+    body: bytes,
+    *,
+    dest_dir: Path | None = None,
+    open_image: bool = False,
+    label: str | None = None,
+    note: str | None = None,
 ) -> Path:
-    """Write one debug PNG under dest_dir; return the absolute path."""
+    """Write one labeled or unlabeled debug PNG under dest_dir.
+
+    A non-empty ``note`` is saved beside it as ``<same name>.txt``.
+    """
     dest = Path(dest_dir) if dest_dir is not None else default_debug_snap_dir()
     dest.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = dest / f"snap_{stamp}_{uuid4().hex[:8]}.png"
+    if label is not None and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", label) is None:
+        raise ValueError("debug snap label must contain only letters, numbers, _ or -")
+    label_part = f"_{label}" if label is not None else ""
+    path = dest / f"snap_{stamp}{label_part}_{uuid4().hex[:8]}.png"
     path.write_bytes(body)
+    if note:
+        path.with_suffix(".txt").write_text(note + "\n", encoding="utf-8")
     if open_image:
         open_saved_image(path)
     return path.resolve()
@@ -436,13 +450,33 @@ class HttpCaptureClient:
             payload["capture_id"], payload["acknowledged"], payload["checksum"]
         )
 
-    def debug_snap(self, path: Path) -> str:
-        """POST a debug still to /debug/snap; return the laptop saved path."""
+    def debug_snap(
+        self,
+        path: Path,
+        *,
+        label: str | None = None,
+        open_image: bool | None = None,
+        note: str | None = None,
+    ) -> str:
+        """POST a debug still to /debug/snap; return the laptop saved path.
+
+        ``open_image=None`` preserves the receiver's configured default. A
+        caller collecting many training sidecars can explicitly save without
+        opening a desktop viewer for every image.
+        """
+        headers = {"Content-Type": "image/png"}
+        if label is not None:
+            headers["X-Debug-Snap-Label"] = label
+        if open_image is not None:
+            headers["X-Debug-Snap-Open"] = "true" if open_image else "false"
+        if note:
+            # Headers are latin-1 only; percent-encode so any text survives.
+            headers["X-Debug-Snap-Note"] = quote(note)
         request = Request(
             f"{self.base_url}/debug/snap",
             data=Path(path).read_bytes(),
             method="POST",
-            headers={"Content-Type": "image/png"},
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -456,7 +490,7 @@ class HttpCaptureClient:
         return str(saved)
 
     def upload_profile_curve(self, session_number: int, path: str | Path) -> str:
-        """POST the Pi-local motion curve into the session bundle (#172).
+        """POST the Pi-local motion curve into the session bundle.
 
         Mirrors `debug_snap`'s raw-bytes upload idiom; called once from
         `PiCaptureRuntime.end_session` after the local writer is flushed.

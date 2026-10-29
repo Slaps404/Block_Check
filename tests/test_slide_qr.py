@@ -10,18 +10,11 @@ All tests are fast and do NOT depend on pi_images.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
-
-import slide.qr as slide_qr_module  # noqa: E402
-from slide.qr import (  # noqa: E402
+import slide.qr as slide_qr_module
+from slide.qr import (
     DecodeCandidate,
     SlideQRResult,
     decode_slide_identity,
@@ -45,19 +38,11 @@ class TestParseQrPayloadCurrent:
         assert result["block_id"] == "51151378"
         assert result["slide_num"] == "01"
         assert result["stain"] == "HE"
-
-    def test_email_and_genotype_are_none(self):
-        result = parse_qr_payload("7842_51151378_01_HE")
         assert result["email"] is None
         assert result["genotype"] is None
 
-    def test_does_not_raise(self):
-        """Must return a dict, never raise."""
-        result = parse_qr_payload("9999_12345678_02_MT")
-        assert isinstance(result, dict)
-
     def test_result_exposes_lab_work_order_without_renaming_wire_field(self):
-        """#205: the QR number is the lab job, not the local bracket id."""
+        """The QR number is the lab job, not the local bracket id."""
         result = SlideQRResult(
             True, "ok", "12080_51151378_01_HE", "current", "51151378",
             "01", "HE", "12080", None, None, "zxing", "raw",
@@ -81,19 +66,13 @@ class TestParseQrPayloadLegacy:
         assert result["genotype"] == "WT 3"
         assert result["slide_num"] == "01"
         assert result["stain"] == "HE"
-
-    def test_block_id_is_none(self):
-        result = parse_qr_payload("rgupta@lji.org_WT 3_01_HE")
         assert result["block_id"] is None
+        assert result["work_order"] is None
 
     def test_spaced_genotype_preserved_verbatim(self):
         """Internal space in genotype must survive unchanged."""
         result = parse_qr_payload("user@example.com_TWKO 4_03_MT")
         assert result["genotype"] == "TWKO 4"
-
-    def test_work_order_is_none(self):
-        result = parse_qr_payload("user@example.com_TWKO 4_03_MT")
-        assert result["work_order"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -107,29 +86,16 @@ class TestParseQrPayloadMalformed:
         None,        # non-string
         42,          # non-string int
         [],          # non-string list
+        0,           # falsy int
+        "a_b_c_d_e", # too many fields
+        "a_b_c",     # too few fields
+        "x_y",       # too few fields
+        "7842__01_HE",  # empty field
     ])
-    def test_empty_or_non_string_returns_failure(self, bad_input):
+    def test_bad_input_returns_failure(self, bad_input):
         result = parse_qr_payload(bad_input)
         assert result["success"] is False
         assert "reason" in result
-
-    def test_wrong_field_count_too_many(self):
-        result = parse_qr_payload("a_b_c_d_e")
-        assert result["success"] is False
-
-    def test_wrong_field_count_too_few(self):
-        result = parse_qr_payload("a_b_c")
-        assert result["success"] is False
-
-    def test_empty_field_rejected(self):
-        # Third field is empty
-        result = parse_qr_payload("7842__01_HE")
-        assert result["success"] is False
-
-    def test_does_not_raise_on_any_bad_input(self):
-        for bad in ("", None, 0, "x_y", "a_b_c_d_e", "7842__01_HE"):
-            result = parse_qr_payload(bad)
-            assert isinstance(result, dict)
 
     @pytest.mark.parametrize("payload", [
         "abc_51151378_01_HE",
@@ -311,69 +277,34 @@ class TestCandidateSelection:
 # decode_slide_qr — synthetic QR round-trip
 # ---------------------------------------------------------------------------
 
-class TestDecodeSlideQrSynthetic:
-    """Generate a QR image with qrcode, decode it, assert round-trip."""
+def test_decode_slide_qr_synthetic_round_trip():
+    """Render a current-format QR with qrcode, decode it, assert the full result."""
+    qrcode = pytest.importorskip("qrcode")
+    payload = "7842_51151378_01_HE"
+    qr = qrcode.QRCode(
+        version=4,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    rgb = np.array(qr.make_image(fill_color="black", back_color="white").convert("RGB"))
 
-    @pytest.fixture(scope="class")
-    def synthetic_qr_image(self):
-        """Render a current-format QR payload to a BGR numpy array."""
-        try:
-            import qrcode  # noqa: PLC0415
-        except ImportError:
-            pytest.skip("qrcode library not installed")
+    result = decode_slide_qr(rgb[:, :, ::-1].copy())
 
-        payload = "7842_51151378_01_HE"
-        qr = qrcode.QRCode(
-            version=4,
-            error_correction=qrcode.constants.ERROR_CORRECT_H,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(payload)
-        qr.make(fit=True)
-        pil_img = qr.make_image(fill_color="black", back_color="white")
-        # Convert PIL -> numpy BGR
-        import numpy as _np  # noqa: PLC0415
-        arr = _np.array(pil_img.convert("RGB"))
-        bgr = arr[:, :, ::-1].copy()
-        return bgr, payload
-
-    def test_decode_succeeds(self, synthetic_qr_image):
-        bgr, _ = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert result.success is True, f"Expected success but got: {result.reason}"
-
-    def test_payload_round_trips(self, synthetic_qr_image):
-        bgr, payload = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert result.raw_payload == payload
-
-    def test_parsed_fields_correct(self, synthetic_qr_image):
-        bgr, _ = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert result.format == "current"
-        assert result.work_order == "7842"
-        assert result.block_id == "51151378"
-        assert result.slide_num == "01"
-        assert result.stain == "HE"
-
-    def test_engine_is_recorded(self, synthetic_qr_image):
-        bgr, _ = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert result.engine in ("cv2", "zxing")
-
-    def test_preprocessing_is_recorded(self, synthetic_qr_image):
-        bgr, _ = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert isinstance(result.preprocessing, str)
-        assert result.preprocessing != ""
-
-    def test_returns_frozen_dataclass(self, synthetic_qr_image):
-        bgr, _ = synthetic_qr_image
-        result = decode_slide_qr(bgr)
-        assert isinstance(result, SlideQRResult)
-        with pytest.raises((AttributeError, TypeError)):
-            result.success = False  # type: ignore[misc]
+    assert result.success is True, f"Expected success but got: {result.reason}"
+    assert result.raw_payload == payload
+    assert result.format == "current"
+    assert result.work_order == "7842"
+    assert result.block_id == "51151378"
+    assert result.slide_num == "01"
+    assert result.stain == "HE"
+    assert result.engine in ("cv2", "zxing")
+    assert isinstance(result.preprocessing, str) and result.preprocessing
+    assert isinstance(result, SlideQRResult)
+    with pytest.raises((AttributeError, TypeError)):
+        result.success = False  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -489,20 +420,11 @@ class TestDecodeEnginePolicy:
 
 class TestDecodeSlideQrFailure:
 
-    def test_blank_image_returns_failure(self):
+    def test_blank_image_fails_with_reason_and_no_fields(self):
         blank = np.ones((200, 200, 3), dtype=np.uint8) * 255
         result = decode_slide_qr(blank)
         assert result.success is False
-
-    def test_failure_has_reason(self):
-        blank = np.ones((200, 200, 3), dtype=np.uint8) * 255
-        result = decode_slide_qr(blank)
-        assert isinstance(result.reason, str)
-        assert len(result.reason) > 0
-
-    def test_failure_fields_are_none(self):
-        blank = np.ones((200, 200, 3), dtype=np.uint8) * 255
-        result = decode_slide_qr(blank)
+        assert isinstance(result.reason, str) and result.reason
         for field in ("raw_payload", "format", "block_id", "slide_num",
                       "stain", "work_order", "email", "genotype",
                       "engine", "preprocessing"):
@@ -510,25 +432,15 @@ class TestDecodeSlideQrFailure:
                 f"{field} should be None on failure"
             )
 
-    def test_does_not_raise_on_blank(self):
-        blank = np.zeros((100, 100, 3), dtype=np.uint8)
-        result = decode_slide_qr(blank)
+    @pytest.mark.parametrize("image", [
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        np.random.default_rng(42).integers(0, 256, (300, 300, 3), dtype=np.uint8),
+        np.array([]),
+    ], ids=["black", "noise", "empty"])
+    def test_does_not_raise(self, image):
+        result = decode_slide_qr(image)
         assert isinstance(result, SlideQRResult)
-
-    def test_does_not_raise_on_noise(self):
-        rng = np.random.default_rng(42)
-        noise = rng.integers(0, 256, (300, 300, 3), dtype=np.uint8)
-        result = decode_slide_qr(noise)
-        assert isinstance(result, SlideQRResult)
-
-    def test_does_not_raise_on_invalid_input(self):
-        result = decode_slide_qr(np.array([]))
         assert result.success is False
-
-    def test_returns_slideqrresult_type(self):
-        blank = np.ones((200, 200, 3), dtype=np.uint8) * 255
-        result = decode_slide_qr(blank)
-        assert isinstance(result, SlideQRResult)
 
 
 # ---------------------------------------------------------------------------

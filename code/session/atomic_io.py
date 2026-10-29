@@ -1,4 +1,4 @@
-"""Atomic filesystem writes shared by session workflow adapters (#201 slice 2)."""
+"""Atomic filesystem writes shared by session workflow adapters."""
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +18,7 @@ def sha256(path: Path) -> str:
 
 
 def _temporary_name(path: Path) -> Path:
-    """A per-call-unique staging path beside ``path`` (#250 review F4).
+    """A per-call-unique staging path beside ``path``.
 
     A FIXED temp name (e.g. ``.name.tmp``) is safe only when at most one
     writer ever targets ``path`` at a time. `ProcessingStore.freeze_hybrid_

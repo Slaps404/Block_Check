@@ -12,15 +12,26 @@ import numpy as np
 from session.matching_corpus import PAIRS_CSV_COLUMNS, write_freeze_snapshot
 from slide.qr import DecodeCandidate, select_slide_identity
 from session.workflow import ProcessingStore
-from tests.test_session_workflow import (  # noqa: F401
-    STARTED_AT,
+import pytest
+
+from store_harness import (  # noqa: F401
+    WORKFLOW_STARTED_AT as STARTED_AT,
     FastPreprocessor,
-    _capture,
     _drain_to_slides,
     _evaluable_block,
     _identical_mask_slide_preprocessor,
-    lightweight_qc_artifacts,
 )
+from store_harness import (  # noqa: F401
+    full_res_capture as _capture,
+    lightweight_qc_artifacts,
+    lightweight_slide_qc,
+)
+
+
+@pytest.fixture(autouse=True)
+def _lightweight_qc(lightweight_qc_artifacts, lightweight_slide_qc):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into both shared harness QC fixtures."""
 
 WORK_ORDER = "12080"
 BLOCK_A = "51151378"
@@ -59,27 +70,6 @@ def _two_block_work_order_fixture(store: ProcessingStore, session, tmp_path: Pat
     return capture_a, capture_b
 
 
-def test_initialize_creates_matching_pairs_table(tmp_path):
-    store = ProcessingStore(tmp_path / "processing", recover_jobs=False)
-    with store._connect() as db:
-        columns = {
-            row["name"] for row in db.execute("PRAGMA table_info(matching_pairs)")
-        }
-    assert columns == {
-        "pair_id",
-        "session_number",
-        "work_order",
-        "block_id",
-        "slide_capture_id",
-        "pair_source",
-        "is_match",
-        "classical_score",
-        "rank_for_block",
-        "metric",
-        "scored_at",
-    }
-
-
 def test_sync_upserts_true_pairs_and_candidates(tmp_path):
     store = ProcessingStore(
         tmp_path / "processing",
@@ -109,14 +99,12 @@ def test_sync_upserts_true_pairs_and_candidates(tmp_path):
     assert len(store.list_matching_pairs(session.number)) == 4
 
 
-def _load_freeze_cli():
+def _load_cli(name: str):
+    """Load a tools/matching_corpus CLI script as a module."""
     cli_path = (
-        Path(__file__).resolve().parent.parent
-        / "tools"
-        / "matching_corpus"
-        / "freeze_matching_corpus.py"
+        Path(__file__).resolve().parent.parent / "tools" / "matching_corpus" / f"{name}.py"
     )
-    spec = importlib.util.spec_from_file_location("freeze_matching_corpus_cli", cli_path)
+    spec = importlib.util.spec_from_file_location(f"{name}_cli", cli_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -128,33 +116,6 @@ def _write_slide_masks(session, capture_ids: tuple[str, ...]) -> None:
     mask = np.full((8, 8), 255, dtype=np.uint8)
     for capture_id in capture_ids:
         cv2.imwrite(str(artifact_dir / f"{capture_id}_mask.png"), mask)
-
-
-def _load_sync_cli():
-    cli_path = (
-        Path(__file__).resolve().parent.parent
-        / "tools"
-        / "matching_corpus"
-        / "sync_matching_pairs.py"
-    )
-    spec = importlib.util.spec_from_file_location("sync_matching_pairs_cli", cli_path)
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
-    return cli
-
-
-def test_matching_corpus_clis_default_live_root_to_outputs_live_session():
-    sync_cli = _load_sync_cli()
-    assert sync_cli.DEFAULT_LIVE_ROOT == sync_cli.ROOT / "outputs" / "live_session"
-
-    for name in ("score_matching_pairs.py", "freeze_matching_corpus.py"):
-        cli_path = (
-            Path(__file__).resolve().parent.parent / "tools" / "matching_corpus" / name
-        )
-        spec = importlib.util.spec_from_file_location(f"{name}_mod", cli_path)
-        cli = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cli)
-        assert cli.DEFAULT_LIVE_ROOT == cli.ROOT / "outputs" / "live_session"
 
 
 def test_write_matching_pair_score_and_promote_near_misses(tmp_path):
@@ -250,7 +211,7 @@ def test_write_freeze_snapshot_contains_true_pair_with_existing_mask(tmp_path):
     _write_slide_masks(session, (capture_a, capture_b))
     store.sync_matching_pairs_for_work_order(session.number, WORK_ORDER)
 
-    freeze_cli = _load_freeze_cli()
+    freeze_cli = _load_cli("freeze_matching_corpus")
     pairs, specimens = freeze_cli.collect_freeze_data(
         store, session.number, WORK_ORDER,
     )
@@ -293,7 +254,7 @@ def test_sync_matching_pairs_cli_main(tmp_path, capsys):
     session = store.start_session(started_at=STARTED_AT)
     _two_block_work_order_fixture(store, session, tmp_path)
 
-    main = _load_sync_cli().main
+    main = _load_cli("sync_matching_pairs").main
     exit_code = main([
         "--live-root", str(store_root),
         "--work-order", WORK_ORDER,

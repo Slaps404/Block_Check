@@ -1,4 +1,4 @@
-"""Canonical SQLite session state and durable processing artifacts (#201 slice 4)."""
+"""Canonical SQLite session state and durable processing artifacts."""
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -20,6 +20,7 @@ import numpy as np
 
 from capture_runtime import CAPTURE_STAGE_TIMING_KEYS, SETTLING_STAGE_KEYS
 from contact_sheet import ContactSheetRenderer, write_contact_sheet
+from session.slide_processing import evaluate_claimed_slide, prepare_slide_image
 from session.pipeline import ClaimDecision, VERDICT_PASS, VERDICT_REVIEW, decide_claim
 from session.preparation import (
     PreparationFailure,
@@ -30,7 +31,7 @@ from session.preparation import (
 )
 from runtime_observer import RuntimeObserver, observed
 from session.session_mode import SessionMode
-from verify.candidate_band import (
+from retrieval.candidate_band import (
     CandidateSelection,
     SpecimenFingerprint,
     select_candidate_band,
@@ -38,7 +39,7 @@ from verify.candidate_band import (
     validate_selection,
 )
 from verify.gates import _check_mask_quality, check_block_quality
-from verify.invariant_descriptors import DescriptorValue, build_descriptor_values
+from retrieval.invariant_descriptors import DescriptorValue, build_descriptor_values
 from verify.scorer import (
     ProductionScoreResult,
     LockedScoreCache,
@@ -48,7 +49,7 @@ from verify.scorer import (
 )
 from verify.slide_image_overlay import build_slide_image_overlay
 from slide.qr import SlideQRResult
-import store.wire as store_wire
+import transport.wire as store_wire
 from session.atomic_io import (
     atomic_bytes as _atomic_bytes,
     atomic_json as _atomic_json,
@@ -70,7 +71,7 @@ from session.workflow_types import (
     WorkflowSnapshot,
     normalize_work_order_scoring_result as _normalize_work_order_scoring_result,
 )
-from verify.work_order_evaluator import WorkOrderVerdict, evaluate_work_order, flagged_pairs
+from retrieval.work_order_evaluator import WorkOrderVerdict, evaluate_work_order, flagged_pairs
 from session.matching_corpus import (
     ScoredPair,
     TruePairRef,
@@ -80,19 +81,16 @@ from session.matching_corpus import (
 )
 
 
-# #269: durable Hybrid Candidate Pool artifact names, one pair per WORK
-# ORDER (not per session -- #250 was a deliberate v1 simplification the
-# CREATE TABLE comment below explains), living under
+# Durable Hybrid Candidate Pool artifact names, one pair per WORK
+# ORDER (not per session; see the CREATE TABLE comment below), living under
 # ``<session_dir>/work_orders/`` alongside the existing
 # ``work_order_{id:06d}_verdicts.csv``/``_sheets`` artifacts. Schema-versioned
-# so a future format change can be detected on read rather than guessed;
-# bumped to 2 for #269's manifest shape change (work_order_id/session_number
-# now recorded in the manifest body, not just the DB row).
+# so a format change can be detected on read rather than guessed.
 _HYBRID_POOL_SCHEMA_VERSION = 3
 _HYBRID_POOL_MANIFEST_SUFFIX = "_hybrid_pool.json"
 _HYBRID_POOL_ARCHIVE_SUFFIX = "_hybrid_pool.npz"
 
-# #269: the durable string values sessions.session_mode is allowed to hold --
+# The durable string values sessions.session_mode is allowed to hold --
 # exactly SessionMode's own values, so start_session rejects a typo/garbage
 # mode loudly at session-creation time (a startup-shaped call, not a
 # per-poll/per-tick path) rather than persisting a value nothing else
@@ -102,14 +100,13 @@ _VALID_SESSION_MODES = frozenset(mode.value for mode in SessionMode)
 
 @dataclass(frozen=True)
 class HybridCandidatePool:
-    """The immutable, durable Hybrid Candidate Pool for one frozen WORK ORDER
-    (#250, re-keyed per-work-order by #269).
+    """The immutable, durable Hybrid Candidate Pool for one frozen WORK ORDER.
 
     Process-local only -- never crosses the Pi/``RemoteProcessingStore`` wire
-    (fingerprints/score caches are ``numpy`` arrays, and ``store.wire``
+    (fingerprints/score caches are ``numpy`` arrays, and ``transport.wire``
     deliberately refuses to serialize those), so this is not a
-    ``store.wire``-registered type. It is read by ``ProcessingStore.hybrid_pool``
-    for processing-computer-local consumption (the future #251 per-slide job);
+    ``transport.wire``-registered type. It is read by ``ProcessingStore.hybrid_pool``
+    for processing-computer-local consumption (the per-slide Hybrid job);
     nothing that reads it recomputes ``fingerprints``/``score_caches``.
     """
 
@@ -134,8 +131,8 @@ def _save_hybrid_pool_archive(
     """Durably persist every frozen block's cache + fingerprint vectors once.
 
     One compressed archive for the whole pool (not one file per block): the
-    pool is owned by the work order, not by any individual block or pair
-    (#250 acceptance criterion), so one artifact mirrors that ownership.
+    pool is owned by the work order, not by any individual block or pair,
+    so one artifact mirrors that ownership.
     """
     arrays: dict[str, np.ndarray] = {}
     for block_id in block_ids:
@@ -162,7 +159,7 @@ def _save_hybrid_pool_archive(
 def _load_hybrid_pool_archive(
     path: Path, *, block_ids: Sequence[str], descriptor_names: Sequence[str],
 ) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, LockedScoreCache]]:
-    """Read back one pool archive with zero recomputation (#250 durability)."""
+    """Read back one pool archive with zero recomputation."""
     fingerprints: dict[str, dict[str, np.ndarray]] = {}
     score_caches: dict[str, LockedScoreCache] = {}
     with np.load(path) as archive:
@@ -184,16 +181,16 @@ def _load_hybrid_pool_archive(
 def _pool_specimen_fingerprint(
     pool: "HybridCandidatePool", block_id: str,
 ) -> SpecimenFingerprint:
-    """Build one frozen pool block's #253 retrieval fingerprint for FREE.
+    """Build one frozen pool block's retrieval fingerprint for FREE.
 
     ``pool.fingerprints``/``pool.score_caches`` already hold everything
-    needed -- the descriptor vectors and normalized mask #250 built exactly
+    needed -- the descriptor vectors and normalized mask built exactly
     once at freeze time and durably persisted (``hybrid_pools`` row +
     ``.npz`` archive). This is pure reshaping of already-computed,
     already-loaded ``numpy`` arrays into ``SpecimenFingerprint``'s shape: no
     cv2, no I/O, no descriptor recomputation. ``construction_ns=0`` is a
     placeholder (the real per-descriptor build duration was only meaningful
-    once, at freeze time, and is not persisted); nothing #253 reads consults
+    once, at freeze time, and is not persisted); nothing downstream consults
     it (`compare_descriptor_values` only reads ``.vector``).
     """
     return SpecimenFingerprint(
@@ -210,12 +207,12 @@ def _slide_specimen_fingerprint(
     fingerprint_builder: Callable[[np.ndarray], Mapping[str, DescriptorValue]],
     slide_cache: LockedScoreCache,
 ) -> SpecimenFingerprint:
-    """Build one slide's #253 retrieval fingerprint.
+    """Build one slide's retrieval fingerprint.
 
     Unlike ``_pool_specimen_fingerprint``, this genuinely computes something
     new each job: a slide is never frozen ahead of time, so its descriptor
     vectors cannot be precomputed. Reuses the SAME injectable
-    ``fingerprint_builder`` seam #250's ``freeze_hybrid_pool`` already calls
+    ``fingerprint_builder`` seam ``freeze_hybrid_pool`` already calls
     for every pool block, on the same normalized mask shape, rather than a
     second code path.
     """
@@ -299,7 +296,7 @@ class ProcessingStore:
         self._uses_default_block_preprocessor = preprocessor is None
         self.slide_preprocessor = slide_preprocessor or preprocess_slide
         self.work_order_scorer = work_order_scorer or default_work_order_scorer
-        # #250: injectable seams for the Hybrid Candidate Pool freeze, mirroring
+        # Injectable seams for the Hybrid Candidate Pool freeze, mirroring
         # `preprocessor`/`slide_preprocessor` above -- tests inject a counting
         # wrapper to prove fingerprints/caches are built exactly once per
         # usable block, never re-entered on a later read.
@@ -316,7 +313,7 @@ class ProcessingStore:
         self._jobs_lock = Lock()
         self._events: dict[int, list[WorkflowEvent]] = {}
         self._events_lock = Lock()
-        # #250 review F4: serializes the ENTIRE freeze_hybrid_pool body per
+        # Serializes the ENTIRE freeze_hybrid_pool body per
         # session. Freeze does multi-second file/CV work -- well past the
         # RPC client's 10s timeout -- so a retried duplicate request can
         # otherwise run concurrently with the original attempt, corrupting
@@ -325,7 +322,7 @@ class ProcessingStore:
         # locks_guard` only protects the dict's own get-or-create.
         self._hybrid_freeze_locks: dict[int, Lock] = {}
         self._hybrid_freeze_locks_guard = Lock()
-        # #250 review F1/F5: `_emit` alone is in-memory-only (lost on
+        # `_emit` alone is in-memory-only (lost on
         # restart); a handful of call sites additionally need a durable,
         # on-disk trace of "why" (a Finish-Blocks bounce reason, a swallowed
         # per-block exception) that survives a crash/restart.
@@ -349,21 +346,10 @@ class ProcessingStore:
 
     def _initialize(self) -> None:
         with self._connect() as db:
-            # #269 FIX2: `hybrid_pools` was ALREADY COMMITTED (df67237) with a
-            # `session_number INTEGER PRIMARY KEY` shape and no
-            # `work_order_id` column at all -- `CREATE TABLE IF NOT EXISTS`
-            # below is a no-op against a database file that already has that
-            # legacy table, so a real pre-#269 DB would raise
-            # `sqlite3.OperationalError: no such column: work_order_id` out
-            # of every `freeze_hybrid_pool`/`hybrid_pool` call forever,
-            # contradicting `freeze_hybrid_pool`'s own "Never raises"
-            # contract. #269 is dev-only data with nothing worth
-            # preserving (the old rows are session-keyed v1 manifests that
-            # cannot be losslessly converted to per-work-order), so this is a
-            # straight drop-and-recreate rather than a copy-forward migration
-            # like the `request_ledger` PK rebuild below. `PRAGMA
-            # table_info` on a table that does not exist yet returns zero
-            # rows (no error), so a fresh database skips this entirely.
+            # An older `hybrid_pools` table was session-keyed with no
+            # `work_order_id`, so `CREATE TABLE IF NOT EXISTS` below would
+            # no-op and every `hybrid_pool` call would raise. Dev-only data,
+            # so drop and recreate rather than copy forward.
             legacy_hybrid_pool_columns = {
                 row["name"]
                 for row in db.execute("PRAGMA table_info(hybrid_pools)").fetchall()
@@ -508,6 +494,14 @@ class ProcessingStore:
                     scored_at TEXT,
                     FOREIGN KEY (session_number) REFERENCES sessions(session_number)
                 );
+                CREATE TABLE IF NOT EXISTS capture_notes (
+                    session_number INTEGER NOT NULL,
+                    capture_id TEXT NOT NULL,
+                    block_id TEXT,
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_number) REFERENCES sessions(session_number)
+                );
                 CREATE INDEX IF NOT EXISTS matching_pairs_wo
                     ON matching_pairs(session_number, work_order);
                 """
@@ -570,19 +564,11 @@ class ProcessingStore:
             for name, decl in (
                 ("finalized_at", "TEXT"),
                 ("last_finalization_error", "TEXT"),
-                # #269: durable session scoring mode, written once at
-                # start_session so finish_work_order/_recover_work_orders can
+                # Durable session scoring mode, written once at
+                # start_session, so finish_work_order/_recover_work_orders
                 # read it directly instead of inferring it from whether a
-                # hybrid_pools row happens to exist (see the design-gap note
-                # on finish_work_order below). sessions is a long-standing
-                # table with real committed history, so this follows the
-                # additive ALTER TABLE convention already used for
-                # slide_recovery_state/finalized_at/last_finalization_error --
-                # unlike hybrid_pools (brand-new, CREATE TABLE rewritten
-                # outright above). Every pre-#269 row defaults to 'normal',
-                # which correctly answers "is this hybrid/hybrid_shadow?"
-                # (the only question this column controls) regardless of
-                # which pre-Hybrid mode a given historical row actually was.
+                # hybrid_pools row happens to exist. Older rows default to
+                # 'normal', which answers the only question it controls.
                 ("session_mode", "TEXT NOT NULL DEFAULT 'normal'"),
             ):
                 if name not in session_columns:
@@ -618,99 +604,48 @@ class ProcessingStore:
                 ("top_score", "REAL"),
                 ("runner_up_score", "REAL"),
                 ("match_margin", "REAL"),
-                # #252/ADR 0017: the durable retrieval per-slide job queue.
-                # already existed in committed databases before this column, so
-                # (mirroring every other additive ALTER above -- NOT the
-                # `hybrid_pools` drop-and-recreate, which was only safe because
-                # that table was dev-only data) this is an additive ALTER, not
-                # a rewritten CREATE TABLE; a bare `CREATE TABLE IF NOT EXISTS`
-                # would silently no-op against a real pre-existing DB and the
-                # Pi would crash on the first queued retrieval capture.
-                # slice only ever write 'queued'/'preparing'/'scoring'/
-                # 'complete'/'error' (see `_score_hybrid_slide`); 'superseded'
-                # is reserved for #256 and is never written here. NULL means
-                # "not a retrieval job" -- every NORMAL row, Hybrid out-of-pool
-                # row, and every pre-queue row -- and that must stay the read
-                # signal for "no background job exists for this slide".
+                # The durable retrieval per-slide job queue.
+                # States: 'queued'/'preparing'/'scoring'/'complete'/'error',
+                # plus 'superseded'. NULL means "not a retrieval job"
+                # (every NORMAL row, Hybrid out-of-pool row, pre-queue row)
+                # and must stay the read signal for "no background job".
                 ("job_state", "TEXT"),
-                # #253: durable audit evidence for one slide's Heuristic
+                # Durable audit evidence for one slide's Heuristic
                 # Candidate Band selection (`_persist_candidate_selection`).
                 # Additive ALTER, same reasoning as `job_state` immediately
                 # above: `slide_captures` already has real committed rows, so
                 # a bare `CREATE TABLE IF NOT EXISTS` would silently no-op and
                 # every write to this column would raise `OperationalError:
-                # no such column` on a real pre-#253 database. NULL means "no
+                # no such column` on an older database. NULL means "no
                 # selection was ever recorded for this slide" -- every
-                # NORMAL/OPEN_RETRIEVAL row, and every pre-#253 Hybrid row.
+                # NORMAL/OPEN_RETRIEVAL row, and every older Hybrid row.
                 ("candidate_selection_json", "TEXT"),
-                # #254: durable Hybrid Shadow safety-comparison evidence
-                # (`_persist_shadow_comparison`) -- the complete-pool verdict
-                # vs. the proposed-Hybrid-subset verdict, both match margins,
-                # and the candidate/pruned id sets, for one hybrid_shadow
-                # slide job. Additive ALTER, same reasoning as `job_state`/
-                # `candidate_selection_json` immediately above: `slide_captures`
-                # already has real committed rows, so a bare `CREATE TABLE IF
-                # NOT EXISTS` would silently no-op and the first
-                # `_persist_shadow_comparison` write would raise
-                # `OperationalError: no such column` on a real pre-#254
-                # database. NULL means "not a hybrid_shadow slide, a
-                # gate-failed slide (nothing was scored to compare), or a
-                # comparison-persistence failure that was deliberately
-                # degraded rather than turned into job_state='error'" --
-                # every NORMAL/OPEN_RETRIEVAL/plain-Hybrid row, and every
-                # pre-#254 row. Operator-hidden: nothing in `code/kiosk/` or
-                # `_refresh_decisions_export`'s CSV reads this column -- it
-                # is analysis evidence, not a Results field.
+                # Durable Hybrid Shadow safety evidence -- complete-pool
+                # verdict vs. proposed-Hybrid-subset verdict, both margins, and
+                # the candidate/pruned id sets. NULL means not a shadow slide,
+                # a gate-failed slide, or a degraded persist (never an error
+                # job_state). Analysis evidence only: no kiosk screen or CSV
+                # reads it.
                 ("shadow_comparison_json", "TEXT"),
-                # #255: durable scheduling-order key for the Hybrid per-slide
-                # job queue. NULL (every pre-#255 row, and every ordinary
-                # queued job) means "ordinary FIFO" -- ordered only by
-                # captured_at/capture_id, exactly today's behavior. A NON-
-                # NULL value sorts ahead of every NULL row, smallest first;
-                # #256 is the first real writer (an accepted recapture gets a
-                # lower value than any ordinary job, e.g. 0), so recaptures
-                # run ahead of the ordinary FIFO queue both live and after a
-                # restart (`_recover_retrieval_jobs` orders resubmission by
-                # this same column). Nothing in this slice ever writes a
-                # non-NULL value; this is the durable column #256 needs, not
-                # scaffolding to be removed later. Additive ALTER, same
-                # reasoning as `job_state`/`candidate_selection_json`/
-                # `shadow_comparison_json` immediately above.
+                # Scheduling-order key for the Hybrid per-slide job
+                # queue. NULL means ordinary FIFO by captured_at/capture_id.
+                # Non-NULL sorts ahead of every NULL row, smallest first;
+                # an accepted recapture is the only writer, so recaptures
+                # jump the queue live and after restart
+                # (`_recover_retrieval_jobs` orders by this same column).
                 ("priority", "INTEGER"),
-                # #258: durable per-slide Hybrid worker timing, mirroring the
-                # `sets.profile_enabled`/`sets.profile_queued_ns` block
-                # precedent exactly. Additive ALTER, same reasoning as every
-                # other Hybrid column above: `slide_captures` already has real
-                # committed rows, so a bare `CREATE TABLE IF NOT EXISTS` would
-                # silently no-op and the first write would raise
-                # `OperationalError: no such column` on a real pre-#258
-                # database.
-                #
-                # `profile_enabled` is 0 for every row this slice does not
-                # itself set to 1 -- every NORMAL/OPEN_RETRIEVAL/out-of-pool
-                # row, and every pre-#258 Hybrid row -- so `profile_enabled=1`
-                # is the one gate `list_hybrid_profile_rows` filters on: no
-                # `--profile` means no row is ever collected or exposed.
-                # `profile_queued_ns` is this row's enqueue timestamp (taken
-                # via the injectable `self._profile_clock_ns`, never a raw
-                # clock read) and is NULL whenever `profile_enabled=0`.
-                # `profile_current_stage` is the one of `PROFILE_STAGE_ORDER`
-                # (`code/session/profile_report.py`) the WORKER is currently
-                # inside while this row is still pending; NULL once the row
-                # is no longer pending or was never profiled.
-                # `profile_stage_ms_json` is the completed row's five-stage
-                # breakdown (a JSON object keyed by `PROFILE_STAGE_ORDER`
-                # names; a stage that never ran, e.g. a gate-failed slide's
-                # selection/scoring, is simply absent as a key, never a
-                # fabricated zero) and `profile_total_ms` is that same row's
-                # queue-to-complete total; both stay NULL until the worker
-                # finishes, and forever NULL when `profile_enabled=0`.
-                # `profile_shadow` is 1 for a `hybrid_shadow` row, 0 for plain
-                # Hybrid, NULL when `profile_enabled=0` -- written once at
-                # enqueue from the session's own durable `session_mode`
-                # (which cannot change mid-session), so a shadow row's
-                # complete-pool timing can never be mistaken for pruned
-                # Hybrid timing in the PERSISTED data, not only on screen.
+                # Durable per-slide Hybrid worker timing.
+                # `profile_enabled=1` is the one gate `list_hybrid_profile_rows`
+                # filters on, so no `--profile` means nothing is collected or
+                # exposed; every other column here is NULL when it is 0.
+                # `profile_queued_ns` is the enqueue timestamp (always via the
+                # injectable `self._profile_clock_ns`). `profile_current_stage`
+                # is the `PROFILE_STAGE_ORDER` stage the worker is inside while
+                # pending. `profile_stage_ms_json` is the finished breakdown; a
+                # stage that never ran is an absent key, never a zero.
+                # `profile_shadow` is written once at enqueue from the durable
+                # `session_mode`, so shadow timing can never be read as pruned
+                # Hybrid timing in the persisted data.
                 ("profile_enabled", "INTEGER NOT NULL DEFAULT 0"),
                 ("profile_queued_ns", "INTEGER"),
                 ("profile_current_stage", "TEXT"),
@@ -738,7 +673,7 @@ class ProcessingStore:
         # Sessions have no session_number of their own yet (this call MINTS
         # one), so the ledger is keyed on the placeholder session_number 0,
         # which real sessions (autoincrement from 1) never collide with.
-        # #269: session_mode is hashed alongside started_at so a replayed
+        # session_mode is hashed alongside started_at so a replayed
         # request_id with a DIFFERENT mode raises, mirroring the existing
         # started_at-mismatch-raises contract.
         fingerprint = (
@@ -785,12 +720,12 @@ class ProcessingStore:
     def _session_mode(self, session_number: int) -> str:
         """Read the persisted ``sessions.session_mode`` for one session.
 
-        #269: the durable fact ``finish_work_order``/``_recover_work_orders``
+        The durable fact ``finish_work_order``/``_recover_work_orders``
         gate the N-by-N scoring path on, instead of inferring Hybrid-ness from
         whether a ``hybrid_pools`` row happens to exist (see the design-gap
         note on ``finish_work_order``).
 
-        #269 FIX5d: fails CLOSED (raises) for an unknown session number,
+        Fails CLOSED (raises) for an unknown session number,
         rather than defaulting to ``'normal'``. Defaulting to ``'normal'``
         here is a safety-gate failure-OPEN bug: this is the one fact
         ``finish_work_order`` uses to decide whether a work order may run
@@ -877,7 +812,7 @@ class ProcessingStore:
     ) -> None:
         """Durably record one original response inside the caller's transaction.
 
-        Collision-tolerant (#250 review F4): a concurrent duplicate-
+        Collision-tolerant: a concurrent duplicate-
         ``request_id`` retry that raced past its own ``_ledger_hit`` check
         (e.g. a slow mutating call outliving the RPC client's timeout) can
         try to insert this exact ``(session_number, method, request_id)`` row
@@ -998,6 +933,45 @@ class ProcessingStore:
                 )
         return result
 
+    def add_capture_note(
+        self,
+        session_number: int,
+        capture_id: str,
+        note: str,
+        block_id: str | None = None,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        """Save a free-text operator note on one accepted capture."""
+        fingerprint = (
+            self._fingerprint(
+                {"capture_id": capture_id, "note": note, "block_id": block_id}
+            )
+            if request_id is not None else None
+        )
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if request_id is not None:
+                hit, _ = self._ledger_hit(
+                    db, request_id, "add_capture_note", session_number, fingerprint
+                )
+                if hit:
+                    return
+            db.execute(
+                "INSERT INTO capture_notes"
+                " (session_number, capture_id, block_id, note, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_number, capture_id, block_id, note,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            if request_id is not None:
+                self._ledger_record(
+                    db, request_id, "add_capture_note", session_number,
+                    fingerprint, json.dumps(None),
+                )
+
     def begin_block_drain(self, session_number: int) -> None:
         changed = False
         with self._connect() as db:
@@ -1023,27 +997,21 @@ class ProcessingStore:
         self, db: sqlite3.Connection, session_number: int,
         *, work_order_id: int | None = None,
     ) -> tuple[list[tuple[str, str]], int]:
-        """#187 auto-accept-failed-as-unusable + unresolved-count, shared by
+        """Auto-accept-failed-as-unusable + unresolved-count, shared by
         `try_enter_slides` (NORMAL/OPEN_RETRIEVAL) and `freeze_hybrid_pool`
         (HYBRID/HYBRID_SHADOW) so the rule cannot drift between the two drain
-        paths (#250 review F8: this used to be duplicated verbatim in both
-        methods with nothing asserting the copies agreed). Extracted with the
-        exact same SQL/order both callers already used, so neither caller's
-        behavior changes.
+        paths.
 
         Must run inside the caller's own `BEGIN IMMEDIATE` transaction --
         `db` is the caller's connection, never a fresh one -- so the
         auto-accept mutation and the unresolved count it feeds are read and
         written atomically together.
 
-        `work_order_id` is OPTIONAL and defaults to `None`, which preserves
-        `try_enter_slides`'s existing session-only scoping byte-for-byte
-        (NORMAL/OPEN_RETRIEVAL never pass it). #269 review: only
-        `freeze_hybrid_pool` passes a real `work_order_id`, scoping BOTH the
-        auto-accept mutation and the unresolved count to that work order's
-        own rows -- closing, for these two queries, the same cross-work-
-        order-contamination gap #269 already closed for the candidate
-        `SELECT` in `freeze_hybrid_pool` itself.
+        `work_order_id` is OPTIONAL and defaults to `None`, which keeps
+        `try_enter_slides`'s session-only scoping (NORMAL/OPEN_RETRIEVAL never
+        pass it). Only `freeze_hybrid_pool` passes a real `work_order_id`,
+        scoping BOTH the auto-accept mutation and the unresolved count to that
+        work order's own rows so no other work order's rows contaminate them.
         """
         auto_accepted: list[tuple[str, str]] = []
         work_order_clause = "" if work_order_id is None else " AND work_order_id=?"
@@ -1081,7 +1049,7 @@ class ProcessingStore:
     def try_enter_slides(self, session_number: int) -> bool:
         """Atomically enter slides only when every block has a terminal outcome.
 
-        #187: failed preprocessing is auto-accepted as unusable during drain so
+        Failed preprocessing is auto-accepted as unusable during drain so
         one bad segment cannot stall the whole session on Processing… Recapture
         remains available while still in the blocks phase.
         """
@@ -1108,14 +1076,14 @@ class ProcessingStore:
         return entered
 
     def _hybrid_freeze_lock(self, session_number: int) -> Lock:
-        """The per-session in-process lock serializing `freeze_hybrid_pool`
-        (#250 review F4)."""
+        """The per-session in-process lock serializing `freeze_hybrid_pool`."""
         with self._hybrid_freeze_locks_guard:
             return self._hybrid_freeze_locks.setdefault(session_number, Lock())
 
     def _log_durable(self, session_number: int, kind: str, message: str) -> None:
-        """Append one durable line to `<session_dir>/events.log` (#250 review
-        F1/F5). `_emit` alone appends only to `self._events`, an in-memory
+        """Append one durable line to `<session_dir>/events.log`.
+
+        `_emit` alone appends only to `self._events`, an in-memory
         list that is lost on restart -- fine for the kiosk's live poll, not
         fine for "why did Finish Blocks bounce"/"why did every block fail"
         surviving a crash or restart. Best-effort: a logging failure here
@@ -1146,9 +1114,9 @@ class ProcessingStore:
         self, session_number: int, kind: str, message: str, exc: BaseException
     ) -> None:
         """`_log_durable`, with the swallowed exception's full traceback
-        appended (#250 review F5): fail-closed demotion must stay silent to
-        the *drain*, never to the durable record an operator/developer can
-        read after the fact."""
+        appended: fail-closed demotion must stay silent to the *drain*,
+        never to the durable record an operator/developer can read after
+        the fact."""
         rendered = "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         )
@@ -1157,7 +1125,7 @@ class ProcessingStore:
     def _hybrid_pool_block_ids_for_out_of_pool_guard(
         self, db: sqlite3.Connection, session_number: int, work_order_id: int,
     ) -> frozenset[str]:
-        """#251: the narrow membership read `record_slide_capture`'s
+        """The narrow membership read `record_slide_capture`'s
         Out-of-Pool Claim guard needs -- just this ONE work order's frozen
         `block_ids`, on the connection already open in the caller's
         transaction.
@@ -1205,18 +1173,18 @@ class ProcessingStore:
         """CONTEXT.md "Usable Hybrid Block": unique identity (the ``sets``
         primary key already guarantees this), durable capture, successful
         canonical preparation, and passed block quality checks -- judged from
-        the block alone (#250), before any slide exists to pair it with.
+        the block alone, before any slide exists to pair it with.
 
         Returns the loaded ``PreparedResult`` too when usable, so the caller
         never re-reads the mask PNG a second time to build the fingerprint/
-        score cache (#250 review F9).
+        score cache.
 
         Never raises: every failure mode (missing/corrupt files, a bad mask)
         demotes the block to "not usable" with a reason instead of
-        propagating -- durably logged with a full traceback first (#250
-        review F5), so a systemic defect (e.g. a misconfigured descriptor
-        name) is diagnosable instead of merely "0 usable blocks" for every
-        capture. This matters because it runs on the same drain path a
+        propagating -- durably logged with a full traceback first, so a
+        systemic defect (e.g. a misconfigured descriptor name) is diagnosable
+        instead of merely "0 usable blocks" for every capture. This matters
+        because it runs on the same drain path a
         background poll tick can trigger (``SessionWorkflow.poll_drain``),
         where an uncaught exception would stop capture entirely, not just
         this one freeze attempt.
@@ -1258,14 +1226,14 @@ class ProcessingStore:
     ) -> HybridPoolFreezeResult:
         """<2 usable blocks (or a configuration defect caught before ever
         reaching that count): do not freeze, do not abandon -- return to
-        block capture with a clear message (#250 acceptance criterion).
+        block capture with a clear message.
 
         The caller composes ``message``; this helper only performs the
         mechanical bounce: phase repair, the operator-visible event, a
         durable log line (`_emit` alone is in-memory-only and would be lost
-        on restart -- #250 review F1), and ledger-replay stability for a
-        retried ``request_id`` (#250 review F11: without this, a replay took
-        the ``phase != 'draining_blocks'`` branch above and returned a
+        on restart), and ledger-replay stability for a
+        retried ``request_id`` (without this, a replay takes
+        the ``phase != 'draining_blocks'`` branch above and returns a
         DIFFERENT message than the original call, violating the documented
         `_LEDGERED` "replay returns the same response" contract).
         """
@@ -1295,56 +1263,34 @@ class ProcessingStore:
         candidate_configuration: Mapping[str, object] | None = None,
         request_id: str | None = None,
     ) -> HybridPoolFreezeResult:
-        """One-way Finish-Blocks freeze of the Hybrid Candidate Pool (#250),
-        re-keyed per WORK ORDER, not per session (#269).
+        """One-way Finish-Blocks freeze of the Hybrid Candidate Pool,
+        keyed per WORK ORDER, not per session.
 
-        Called (via ``SessionWorkflow.poll_drain``) only while the session is
-        in HYBRID/HYBRID_SHADOW mode and the drain has been started with
-        ``begin_block_drain``. Mirrors ``try_enter_slides``'s "wait for every
-        block to resolve" contract (sharing its ``_resolve_block_drain`` #187
-        auto-accept-failed-as-unusable rule), then adds: resolving the
-        session's currently open (``lifecycle_state='capturing'``) work
-        order -- the SAME lookup ``start_work_order`` itself uses -- and
-        keying every ``hybrid_pools`` lookup/insert and both artifact paths
-        on that work_order_id, never session_number. This is the isolation
-        invariant's structural enforcement point: a pool frozen for work
-        order A is physically addressed by A's id, so a second work order B
-        in the same session cannot read, overwrite, or be silently told
-        "already frozen" against A's pool. On top of that: rejecting an
-        empty ``descriptor_names`` (a configuration defect that must never
-        freeze a pool with zero fingerprints -- #250 review F2); usable-block
-        counting SCOPED to this work order's own candidate rows (never a
-        different work order's already-'complete' blocks lingering in the
-        same session's ``sets`` table); freezing an immutable pool plus its
-        fingerprints/accurate-scoring caches -- built exactly once, ever, per
-        work order -- on >=2 usable; or bouncing phase back to ``'blocks'``
-        (never staying in ``'draining_blocks'``) on <2 so the operator can
-        capture more and click Finish Blocks again.
+        Called via ``SessionWorkflow.poll_drain`` only in HYBRID/HYBRID_SHADOW
+        once ``begin_block_drain`` has started the drain. Waits for every
+        block to resolve like ``try_enter_slides`` (sharing ``_resolve_block_
+        drain``'s auto-accept-failed-as-unusable rule), then keys every
+        ``hybrid_pools`` lookup, insert, and artifact path on the open work
+        order's id. That is the isolation invariant's enforcement point: a
+        pool frozen for order A is physically addressed by A's id, so order B
+        cannot read it, overwrite it, or be told "already frozen" against it.
+        An empty ``descriptor_names`` is rejected rather than freezing a pool
+        with zero fingerprints. Usable-block counting is scoped to this
+        order's own candidate rows. On >=2 usable it freezes an immutable
+        pool plus its caches, built exactly once per order; on <2 it bounces
+        phase back to ``'blocks'`` so the operator can capture more.
 
-        Serialized per-session (``_hybrid_freeze_lock``): freeze does real
-        file I/O (archive write) plus multiple seconds of CV work, well past
-        the RPC client's 10s timeout, so a retried duplicate request can
-        otherwise run concurrently with the original attempt -- corrupting
-        the shared archive staging path and racing the ledger insert (#250
-        review F4). The lock makes this method's entire body run for one
-        session at a time (only one work order can be ``capturing`` per
-        session at once, so this remains correct under #269's re-key);
-        ``_ledger_record`` is additionally collision-tolerant as defense in
-        depth.
+        Serialized per session (``_hybrid_freeze_lock``): freeze does archive
+        I/O plus seconds of CV work, past the RPC client's 10s timeout, so a
+        retried duplicate could otherwise run concurrently, corrupt the shared
+        staging path, and race the ledger insert. ``_ledger_record`` is
+        collision-tolerant as defense in depth.
 
-        Idempotent: once a ``hybrid_pools`` row exists for this work order,
-        every later call returns that identical result without touching
-        ``fingerprint_builder``/``score_cache_builder`` again -- the row's
-        mere existence is the durable one-way marker (its ``work_order_id``
-        primary key also makes a second INSERT impossible at the schema
-        level, a defense-in-depth backstop under the application-level check
-        below). Never raises: an unknown session, or a session with no open
-        work order, returns a not-frozen result (mirroring
-        ``try_enter_slides``'s own ``bool(row and ...)`` contract) rather
-        than raising, because this can run on a background poll tick where a
-        raise would propagate through the RPC layer as a
-        ``store.remote.StoreError`` and kill the Pi camera loop (#250 review
-        F6).
+        Idempotent: once a ``hybrid_pools`` row exists for this order, later
+        calls return that result without rebuilding anything. Never raises:
+        an unknown session, or one with no open order, returns a not-frozen
+        result, because a raise on a background poll tick would reach the Pi
+        camera loop as a ``StoreError`` and kill it.
         """
         descriptor_names = tuple(descriptor_names)
         configuration = (
@@ -1373,7 +1319,7 @@ class ProcessingStore:
                     )
                     if hit:
                         return store_wire.loads_as(HybridPoolFreezeResult, cached)
-                # #269: resolve the pool's real key FIRST -- mirrors
+                # Resolve the pool's real key FIRST -- mirrors
                 # start_work_order's own lifecycle_state='capturing' lookup.
                 open_work_order = db.execute(
                     """SELECT work_order_id FROM work_orders
@@ -1393,12 +1339,12 @@ class ProcessingStore:
                     if work_order_id is not None else None
                 )
                 if existing is not None:
-                    # #250 review F3: repair phase even on the already-frozen
+                    # Repair phase even on the already-frozen
                     # branch. Without this, a session whose phase somehow
                     # re-entered 'draining_blocks' after freezing (proven
                     # reachable; see tests/test_hybrid_pool_freeze.py) would
-                    # stay stuck there forever -- poll_drain calls this every
-                    # second and this branch never used to touch phase.
+                    # stay stuck there forever, since poll_drain calls this
+                    # every second.
                     db.execute(
                         "UPDATE sessions SET phase='slides' "
                         "WHERE session_number=? AND phase='draining_blocks'",
@@ -1427,21 +1373,14 @@ class ProcessingStore:
                             )
                         return result
                     if work_order_id is None:
-                        # No open work-order bracket to freeze: reachable by
-                        # DEFAULT, not merely by a direct/console caller --
-                        # #250's `begin_block_drain` already flipped phase to
-                        # 'draining_blocks' before this method is ever
-                        # called, so returning here WITHOUT bouncing back to
-                        # 'blocks' (as this branch used to) live-locks the
-                        # session forever: `scan_block` refuses once phase
-                        # leaves 'blocks', and `SessionWorkflow.poll_drain`
-                        # calls this every second, so nothing ever moves the
-                        # phase again. Set the flag and fall through to the
-                        # SAME `_bounce_hybrid_pool_to_blocks` helper every
-                        # other insufficient-freeze branch uses, rather than
-                        # returning directly from inside this transaction --
-                        # the bounce opens its own connection/transaction, so
-                        # it must run only after this one has closed.
+                        # No open work-order bracket to freeze, which is the default
+                        # path: `begin_block_drain` already flipped phase to
+                        # 'draining_blocks', so returning without bouncing back to
+                        # 'blocks' live-locks the session (`scan_block` refuses outside
+                        # 'blocks', and `poll_drain` calls this every second). Fall
+                        # through to `_bounce_hybrid_pool_to_blocks` instead of returning:
+                        # the bounce opens its own transaction, so it must run after this
+                        # one closes.
                         no_open_work_order = True
                     else:
                         phase = row["phase"]
@@ -1466,7 +1405,7 @@ class ProcessingStore:
                             auto_accepted, unresolved = self._resolve_block_drain(
                                 db, session_number, work_order_id=work_order_id
                             )
-                            # #269 isolation fix: scoped to THIS work order's
+                            # Scoped to THIS work order's
                             # own rows. Without `AND work_order_id=?`, a
                             # second work order in the same session would
                             # also pick up every earlier (already-'complete')
@@ -1501,7 +1440,7 @@ class ProcessingStore:
                 return already_frozen_result
 
             if no_open_work_order:
-                # #269 FIX1: bounce through the SAME helper every other
+                # Bounce through the SAME helper every other
                 # insufficient-freeze branch uses, so phase returns to
                 # 'blocks' (never stays stuck in 'draining_blocks') with a
                 # durable, emitted, operator-legible reason -- exactly like
@@ -1549,7 +1488,7 @@ class ProcessingStore:
                     )
             if len(usable_block_ids) < 2:
                 if len(candidate_rows) >= 2 and not usable_block_ids:
-                    # #250 review F5: distinguish "every candidate block
+                    # Distinguish "every candidate block
                     # errored" from "not enough blocks were captured" -- both
                     # produced the same misleading "Only 0 usable block(s)"
                     # message before.
@@ -1576,7 +1515,7 @@ class ProcessingStore:
             # order -- normalize once (the cache build), then read
             # descriptors off that SAME normalized mask, never off the raw
             # block mask. Reuses the PreparedResult the usability check
-            # already loaded (#250 review F9): the block mask PNG is decoded
+            # already loaded: the block mask PNG is decoded
             # exactly once per freeze, never twice.
             fingerprints: dict[str, dict[str, np.ndarray]] = {}
             score_caches: dict[str, LockedScoreCache] = {}
@@ -1607,7 +1546,7 @@ class ProcessingStore:
 
             if len(frozen_block_ids) < 2:
                 if usable_block_ids and not frozen_block_ids:
-                    # #250 review F5: every usable block errored identically
+                    # Every usable block errored identically
                     # at fingerprint construction (proven reachable: a
                     # descriptor name absent from the catalog) -- name that,
                     # rather than the generic "Only 0 usable block(s)".
@@ -1632,7 +1571,7 @@ class ProcessingStore:
 
             session = self._session_identity(session_number)
             frozen_at = datetime.now(timezone.utc).isoformat()
-            # #269: artifacts live under <session_dir>/work_orders/, named by
+            # Artifacts live under <session_dir>/work_orders/, named by
             # work_order_id -- the same convention as the existing
             # work_order_{id:06d}_verdicts.csv/_sheets artifacts, and the
             # on-disk half of the isolation invariant (a second work order's
@@ -1717,12 +1656,12 @@ class ProcessingStore:
     def hybrid_pool(self, work_order_id: int) -> HybridCandidatePool | None:
         """Read the frozen Hybrid Candidate Pool back from durable storage.
 
-        #269: keyed by ``work_order_id``, not ``session_number`` -- see the
+        Keyed by ``work_order_id``, not ``session_number`` -- see the
         ``hybrid_pools`` CREATE TABLE comment. Pure read: never calls
         ``fingerprint_builder``/``score_cache_builder``. This is what proves
         the freeze is durable across a restart -- a fresh ``ProcessingStore``
         pointed at the same ``root`` can call this and get the identical pool
-        without recomputing anything (#250's "built once" TDD requirement).
+        without recomputing anything.
         Process-local only (see ``HybridCandidatePool``); not part of the
         ``/rpc`` surface, so it has no ``RemoteProcessingStore`` proxy or
         whitelist entry.
@@ -1730,12 +1669,9 @@ class ProcessingStore:
         The SQLite ``hybrid_pools`` row is authoritative for ``block_ids``/
         ``descriptor_names``/``session_number`` (read straight from it above);
         the manifest JSON is a second, human/audit-readable copy of the same
-        facts. #250 review F7: this method DOES validate the manifest's
-        ``schema_version`` against ``_HYBRID_POOL_SCHEMA_VERSION`` on every
-        read (making that module-level constant's stated purpose -- "a future
-        format change can be detected on read rather than guessed" --
-        actually true, rather than merely claimed) and raises a clear
-        ``ValueError`` if the manifest or archive is missing, corrupt, or the
+        facts. This method validates the manifest's ``schema_version``
+        against ``_HYBRID_POOL_SCHEMA_VERSION`` on every read and raises a
+        clear ``ValueError`` if the manifest or archive is missing, corrupt, or the
         wrong version, rather than silently reading only from the SQLite row
         and the archive.
         """
@@ -1796,12 +1732,12 @@ class ProcessingStore:
         *,
         mask_quality_fallback_reason: str | None = None,
     ) -> CandidateSelection:
-        """#253: rank an already-loaded Hybrid Candidate Pool against one
+        """Rank an already-loaded Hybrid Candidate Pool against one
         already-built slide ``LockedScoreCache`` and return the Heuristic
         Candidate Band selection -- WITHOUT scoring anything.
 
         Selection, separated out from ``_score_hybrid_slide``'s scoring, so
-        it is independently callable: #254 (Hybrid Shadow) calls this exact
+        it is independently callable: Hybrid Shadow calls this exact
         method (``store.select_hybrid_candidates(pool, claim_id,
         slide_cache)``, with its own ``pool = store.hybrid_pool(work_order_id)``
         already in hand) to observe what the band would have selected without
@@ -1809,16 +1745,16 @@ class ProcessingStore:
         calls it, with the SAME already-loaded ``pool`` it needed anyway,
         then goes on to score. Taking ``pool`` rather than ``work_order_id``
         is deliberate: ``self.hybrid_pool`` re-reads the SQLite row + ``.npz``
-        archive from disk on every call (#250's "pure read" contract, no
+        archive from disk on every call (a "pure read" contract, no
         in-memory cache across calls) -- a second internal lookup here would
         silently double that I/O on every scored slide.
 
         Every pool block's fingerprint is built via ``_pool_specimen_fingerprint``
-        from data #250's ``freeze_hybrid_pool`` already computed once and
+        from data ``freeze_hybrid_pool`` already computed once and
         durably persisted (``pool.fingerprints``/``.score_caches``) -- no
         cv2, no recomputation. Only the slide's fingerprint is genuinely
         built here, per job, via the same injectable ``self.fingerprint_builder``
-        seam #250 already uses for pool blocks (``_slide_specimen_fingerprint``).
+        seam the freeze already uses for pool blocks (``_slide_specimen_fingerprint``).
         """
         pool_fingerprints = {
             block_id: _pool_specimen_fingerprint(pool, block_id)
@@ -2177,63 +2113,39 @@ class ProcessingStore:
     def _recover_retrieval_jobs(self) -> None:
         """Restart recovery for the durable per-slide retrieval queue.
 
-        Only `slide_captures.job_state` rows matter here. NORMAL and Hybrid
-        out-of-pool rows never get a job state, so this cannot touch them.
-        `_recover_claims`'s own `sc.work_order_id IS NULL` guard deliberately
-        excludes every work-order-stamped capture from its recovery sweep;
-        this method is what a Retrieval Slide Job gets instead.
+        Only `slide_captures.job_state` rows matter. NORMAL and Hybrid
+        out-of-pool rows never get a job state, and `_recover_claims`
+        deliberately excludes every work-order-stamped capture; this method
+        is what a Retrieval Slide Job gets instead.
 
-        Disposition per durable state, run at `ProcessingStore.__init__`
-        time (startup, before any worker job is running, so no live Future
-        can race this UPDATE):
+        Disposition per durable state, run at `__init__` time, before any
+        worker is running, so no live Future can race this UPDATE:
 
-        - `complete`: PRESERVED, never touched, never rescored. Rescoring an
-          already-decided verdict would silently change a result the
-          operator may already have seen -- the single most important rule
-          here.
-        - `queued`: nothing ever ran; simply resubmitted.
-        - `preparing`/`scoring`: the process restarted mid-job -- nothing
-          about the SLIDE failed, so this returns to `queued` (never
-          `error`) and is resubmitted exactly like a fresh `queued` row.
-          Landing here as `error` would manufacture a phantom system
-          failure out of an ordinary restart.
-        - `error`: LEFT ALONE, deliberately not resubmitted. #256 gives the
-          operator an explicit retry verb for a genuine system failure ("An
-          ERROR retries processing from the durable capture before
-          recapture is offered") -- silently re-running it here would
-          bypass that operator-facing decision and could re-run a job whose
-          failure needs a human to look at it first.
-        - `superseded` (#256 is the first writer of this value; nothing in
-          this slice ever produces it, but a database can already contain
-          one by the time this runs): LEFT ALONE, never resubmitted, never
-          resurrected -- the whole point of supersession is that this
-          capture is no longer the active job for its slide.
+        - `complete`: preserved, never rescored. Rescoring a decided verdict
+          would silently change a result the operator may have seen.
+        - `queued`: nothing ran; resubmitted.
+        - `preparing`/`scoring`: the process restarted mid-job, nothing about
+          the slide failed, so this returns to `queued` and is resubmitted.
+          Landing here as `error` would invent a system failure.
+        - `error`: left alone. The operator has an explicit retry
+          verb; resubmitting here would bypass that decision.
+        - `superseded`: left alone, never resurrected. Supersession means
+          this capture is no longer the active job for its slide.
 
         Resubmission order preserves scheduling order across the restart:
-        `priority` first (NULL sorts last -- see its migration comment),
-        then `captured_at`/`capture_id` FIFO among equal priority (NULL
-        priority is always equal to other NULL priority for this purpose).
-        This is the ONLY mechanism that can reliably re-express "recaptures
-        first, then ordinary FIFO" after a restart, because the
-        single-worker `ThreadPoolExecutor`'s own internal queue has no
-        priority concept -- only the ORDER jobs are submitted in matters,
-        and this method controls that order completely since nothing else
-        has submitted anything yet at startup.
+        `priority` first (NULL last), then `captured_at`/`capture_id` FIFO.
+        This is the only mechanism that can re-express "recaptures first,
+        then ordinary FIFO" after a restart, since the single-worker executor
+        queue has no priority concept and only submission order matters.
 
-        A single bad row must never block every other row from recovering
-        (this runs at startup, so a hard failure here is tolerable for a
-        genuinely corrupt database, but not for one merely-odd row) --
-        `_submit_hybrid_scoring` itself only calls `self._executor.submit`
-        and appends to an in-memory list, neither of which is expected to
-        raise for a well-formed row, but a missing/unreadable
-        `capture_path` or an unknown `session_number` must still degrade
-        this ONE row rather than aborting the whole recovery sweep.
+        A single bad row (an unreadable `capture_path`, an unknown
+        `session_number`) degrades on its own rather than aborting the sweep.
         """
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             # Nothing about an interrupted mid-flight job failed -- the
             # PROCESS restarted -- so it returns to 'queued', never 'error'.
-            # #258: a profiled row's mid-flight stage indicator is reset to
+            # A profiled row's mid-flight stage indicator is reset to
             # 'queue_wait' along with it -- the worker never actually reached
             # 'complete', so its last-recorded stage would otherwise show a
             # phantom "still scoring" for a job that has not even resumed
@@ -2527,16 +2439,16 @@ class ProcessingStore:
     ) -> str:
         """Durably store one slide still and its complete identity audit.
 
-        ``priority`` (#255) is the durable retrieval job scheduling-order key
+        ``priority`` is the durable retrieval job scheduling-order key
         (see the ``slide_captures.priority`` migration comment): ``None``
         (the default) is an ordinary job, scheduled FIFO by
         ``captured_at``/``capture_id`` alongside every other ordinary job.
         A caller that needs its job to run ahead of the ordinary queue --
-        #256's accepted recapture is the one real use -- passes a lower
+        an accepted Hybrid recapture is the one real use -- passes a lower
         integer (e.g. ``0``). Open Retrieval uses the ordinary FIFO priority;
         NORMAL and Hybrid out-of-pool captures do not gain a ``job_state``.
 
-        ``profile`` (#258) is this capture's ``--profile`` gate, mirroring
+        ``profile`` is this capture's ``--profile`` gate, mirroring
         ``receive_capture``'s own ``profile`` parameter for blocks. It is
         only ever meaningful for an accepted, in-pool Hybrid claim (see
         ``accepted_hybrid_claim`` below). Open Retrieval has a job lifecycle
@@ -2628,7 +2540,7 @@ class ProcessingStore:
                 int(open_work_order["work_order_id"])
                 if open_work_order is not None else None
             )
-            # #251: an Out-of-Pool Claim -- a Hybrid slide whose claimed
+            # An Out-of-Pool Claim -- a Hybrid slide whose claimed
             # block is absent from ITS OWN work order's frozen Hybrid
             # Candidate Pool. Decided HERE, inside the same durable
             # transaction that already resolved `stamped_work_order_id`,
@@ -2648,7 +2560,7 @@ class ProcessingStore:
                     db, session_number, stamped_work_order_id,
                 )
             )
-            # #252: the accept branch -- a successful, in-pool Hybrid claim.
+            # The accept branch -- a successful, in-pool Hybrid claim.
             # Neither the `stamped_work_order_id is None` fork above (that's
             # NORMAL/unstamped inline scoring) nor `out_of_pool_claim` (an
             # identity mismatch) covers this shape, so before this it was
@@ -2675,7 +2587,7 @@ class ProcessingStore:
                 accepted_hybrid_claim or accepted_open_retrieval_claim
             )
             job_state = "queued" if accepted_retrieval_claim else None
-            # #258: only an accepted, in-pool Hybrid claim ever gets a
+            # Only an accepted, in-pool Hybrid claim ever gets a
             # `job_state`/worker to profile -- gated identically to
             # `job_state`/`priority` immediately above, by construction, not
             # by a later display filter. `profile_shadow` is stamped from the
@@ -2746,10 +2658,10 @@ class ProcessingStore:
                 request_id=cascade_request_id,
             )
         elif out_of_pool_claim:
-            # #251: identity mismatch alone -- never scoring -- gets its
+            # Identity mismatch alone -- never scoring -- gets its
             # REVIEW immediately, same as the `stamped_work_order_id is
             # None` branch above, instead of deferring like an in-pool
-            # Hybrid claim does today (left untouched for #252).
+            # Hybrid claim does.
             cascade_request_id = (
                 f"{request_id}:claim" if request_id is not None else None
             )
@@ -2758,22 +2670,13 @@ class ProcessingStore:
                 request_id=cascade_request_id,
             )
         elif accepted_retrieval_claim:
-            # #252: the durable `job_state='queued'` row already committed
-            # above; only the disposable in-memory Future is submitted here,
-            # AFTER that transaction closed (mirrors `freeze_hybrid_pool`'s
-            # post-commit call to `_bounce_hybrid_pool_to_blocks`) -- the
-            # station acknowledges as soon as the durable commit lands, never
-            # waiting on preparation/quality-gates/scoring, which all now run
-            # inside `_score_hybrid_slide` instead of on this path.
-            #
-            # Gated on `pending is None`, mirroring `receive_capture`'s own
-            # `prior`-row early return: a request_id retried after an earlier
-            # attempt already inserted this row must not submit a second job.
-            # A genuine process crash between the commit above and this
-            # submit leaves the row `job_state='queued'` with no live Future
-            # -- #255 (restart recovery), not this slice, is what resumes
-            # that; `_recover_jobs` is deliberately left untouched for
-            # `job_state='queued'` rows (see its own docstring).
+            # The durable `job_state='queued'` row is already committed;
+            # only the disposable Future is submitted here, after that
+            # transaction closed, so the station acknowledges on commit rather
+            # than waiting on scoring. Gated on `pending is None` so a retried
+            # request_id cannot submit a second job. A crash between commit and
+            # submit leaves a 'queued' row with no Future; restart
+            # recovery resumes it, not this path.
             if pending is None and start_job:
                 # `accepted_hybrid_claim` already guarantees both are set;
                 # narrow the static types rather than widening the helper's
@@ -2799,7 +2702,7 @@ class ProcessingStore:
     def retry_hybrid_slide(
         self, session_number: int, capture_id: str, *, request_id: str | None = None,
     ) -> bool:
-        """#256: operator-triggered retry of a Hybrid Processing Error.
+        """Operator-triggered retry of a Hybrid Processing Error.
 
         Re-runs `_score_hybrid_slide` against the SAME durably saved capture
         bytes already on disk (`capture_path`) -- never a new photo, exactly
@@ -2841,7 +2744,7 @@ class ProcessingStore:
                 (session_number, capture_id),
             ).fetchone()
             if row is not None:
-                # #258: the row's own durable `profile_enabled` (set once at
+                # The row's own durable `profile_enabled` (set once at
                 # its original enqueue -- see `record_slide_capture`) carries
                 # forward unchanged; a retry re-runs the SAME durable job, it
                 # does not re-decide whether to profile it. Its stage
@@ -2896,60 +2799,37 @@ class ProcessingStore:
         request_id: str | None = None,
         source_token: str | None = None,
     ) -> RecaptureOutcome:
-        """#256: an operator-accepted recapture for one Hybrid slide capture.
+        """An operator-accepted recapture for one Hybrid slide capture.
 
-        Supersession of ``superseded_capture_id`` happens ONLY when
-        ``result``'s decoded claim equals that row's OWN claimed block -- a
-        structural check performed inside this method, never a caller
-        convention -- so a recapture that decodes to a DIFFERENT block can
-        never replace the wrong Results row (#256's explicit safety
-        requirement). On a mismatch (a failed decode, a different
-        ``block_id``, or no such durable capture at all) this method creates
-        NO new job and leaves the superseded row, its ``job_state``, and its
-        verdict completely untouched; it only returns a rejection message.
+        Supersession happens only when ``result``'s decoded claim equals the
+        superseded row's own claimed block, checked structurally here rather
+        than by caller convention, so a recapture that decodes to a different
+        block can never replace the wrong Results row. On a mismatch (failed
+        decode, different block, or no such capture) nothing is created and
+        nothing is touched; only a rejection message is returned.
 
-        On a match: a brand-new ``slide_captures`` row is inserted for the
-        SAME work order the superseded capture belonged to -- deliberately
-        NOT "whichever work order happens to be open right now". The banner
-        that offers this route (`kiosk.attention.project_attention_banner`)
-        only ever makes it actionable when no OTHER work order is actively
-        capturing, so whenever this method is actually reached the currently
-        open work order (if any) is already this same one; stamping to the
-        superseded row's own ``work_order_id`` is what lets a recapture stay
-        correct even once no work order is open at all (results already
-        showing, between orders) -- `record_slide_capture`'s own "whichever
-        work order is open" stamping would silently misfile the job in that
-        case. The identity match also means the new claim is trivially
-        already a member of the SAME frozen pool the superseded row
-        belonged to (a frozen pool cannot change), so no Out-of-Pool Claim
-        check is needed or performed here, unlike `record_slide_capture`.
+        On a match, the new ``slide_captures`` row is stamped with the
+        superseded capture's own ``work_order_id``, not whichever order
+        happens to be open. That is what keeps a recapture correct once no
+        order is open at all, where `record_slide_capture`'s "whichever order
+        is open" stamping would misfile the job. The identity match also
+        means the new claim already belongs to the same frozen pool, so no
+        Out-of-Pool check is needed.
 
-        The new row gets ``job_state='queued'`` and ``priority=0`` -- #255's
-        durable scheduling column -- so it runs ahead of the ordinary FIFO
-        queue once the currently active job (never interrupted; the
-        single-worker executor has no preemption) finishes.
+        The new row gets ``job_state='queued'`` and ``priority=0`` so
+        it runs ahead of the ordinary FIFO queue once the active job
+        finishes; the single-worker executor has no preemption.
 
-        The superseded row is compare-and-set from whatever ``job_state`` it
-        currently holds to ``'superseded'`` in the SAME transaction as the
-        new row's insert, EXCEPT when it is already ``'superseded'`` (never
-        re-fired). This is deliberately not restricted to ``job_state=
-        'error'`` alone: a retry the operator triggered moments earlier may
-        still be genuinely mid-flight (`'preparing'`/`'scoring'`) when the
-        recapture is accepted, and superseding it regardless of its current
-        state is what lets `_score_hybrid_slide`'s EXISTING #255 stale-write
-        CAS (conditioned on `job_state` still being what that worker
-        expects) silently drop that job's late write instead of clobbering
-        the new, active result -- the concrete race #256's own acceptance
-        criteria describes.
+        The superseded row is compare-and-set to ``'superseded'`` in the same
+        transaction, from whatever state it holds, except when it already is.
+        Not restricting this to ``'error'`` is deliberate: a retry may still
+        be mid-flight, and superseding it regardless is what lets
+        `_score_hybrid_slide`'s stale-write CAS drop that job's late
+        write instead of clobbering the new result.
 
-        The new row's background job is submitted only AFTER the
-        transaction commits (mirrors `record_slide_capture`'s commit-then-
-        submit shape).
-
-        Guarded by the request ledger like every other mutating store call:
-        a replayed recapture request (same request_id) returns the
-        identical cached outcome without inserting a second row or
-        re-running the CAS.
+        The background job is submitted only after the transaction commits.
+        Guarded by the request ledger: a replayed request_id returns the
+        cached outcome without a second row or a second CAS.
         """
         fingerprint = (
             self._fingerprint({
@@ -3029,7 +2909,7 @@ class ProcessingStore:
             attempts_json = json.dumps(
                 [asdict(attempt) for attempt in result.attempts], sort_keys=True
             )
-            # #258: the NEW row inherits whether the superseded capture was
+            # The NEW row inherits whether the superseded capture was
             # profiled -- the operator did not get a fresh `--profile` choice
             # for a recapture -- but gets its OWN fresh enqueue timestamp,
             # since this is genuinely a new queue period for a brand-new
@@ -3110,7 +2990,7 @@ class ProcessingStore:
         *,
         request_id: str | None = None,
     ) -> ClaimOutcome:
-        """#251 Out-of-Pool Claim: write the immediate REVIEW verdict for a
+        """Out-of-Pool Claim: write the immediate REVIEW verdict for a
         Hybrid slide whose claimed block is absent from ITS OWN work
         order's frozen Hybrid Candidate Pool (CONTEXT.md "Out-of-Pool
         Claim").
@@ -3123,9 +3003,9 @@ class ProcessingStore:
         isolation test's scenario). That row belongs to the other work
         order and must never be read or written by this claim: doing so
         would either corrupt the other work order's block row or, worse,
-        actually run scoring against it -- reopening the exact
-        cross-work-order leak #269 closed. No CV/preparation ever runs on
-        this path; the REVIEW is reached by identity mismatch alone.
+        actually run scoring against it, leaking across work orders. No
+        CV/preparation ever runs on this path; the REVIEW is reached by
+        identity mismatch alone.
         """
         slide_path = Path(slide_path)
         fingerprint = (
@@ -3233,35 +3113,17 @@ class ProcessingStore:
             return ClaimOutcome(False, "Slide already processed")
 
         readiness = self._readiness_from_row(row)
-        block_result: PreparedResult | None = None
-        if not readiness.evaluable:
-            # No evaluable claimed block means slide preprocessing cannot affect
-            # the fail-closed verdict. Persist a failure artifact without calling
-            # the scorer/preprocessor seam.
-            img: np.ndarray | None = None
-            slide_result: PreparedResult = PreparationFailure(
-                role="slide", reason="slide preparation skipped: block is unusable"
-            )
-            decision = ClaimDecision(
-                claim_id=block_id,
-                block_path=str(row["capture_path"] or ""),
-                slide_path=str(slide_path),
-                verdict=VERDICT_REVIEW,
-                stage="block_unusable",
-                reason=readiness.review_reason or "block is not evaluable",
-            )
-        else:
-            block_result = self._load_block_result(row)
-            preparation_started = perf_counter_ns()
-            img, slide_result = self._prepare_slide_for_artifacts(slide_path, block_id)
-            self._record_slide_profile_stage(
-                slide_capture_id, "slide_preparation_ms", preparation_started
-            )
-            decision = decide_claim(
-                block_id, block_result, slide_result,
-                block_path=str(row["capture_path"] or ""), slide_path=str(slide_path),
-                observer=_SlideBenchmarkObserver(self, slide_capture_id),
-            )
+        evaluated = evaluate_claimed_slide(
+            block_id=block_id, slide_path=slide_path,
+            block_path=str(row["capture_path"] or ""), readiness=readiness,
+            load_block=lambda: self._load_block_result(row),
+            prepare_slide=lambda: self._prepare_slide_for_artifacts(slide_path, block_id),
+            record_preparation=lambda started: self._record_slide_profile_stage(
+                slide_capture_id, "slide_preparation_ms", started
+            ),
+            observer=_SlideBenchmarkObserver(self, slide_capture_id),
+        )
+        block_result, slide_result, img, decision = evaluated
         outcome = self._finalize_claim(
             session_number, block_id, slide_capture_id, slide_path, row, decision,
             block_result=block_result, slide_result=slide_result, slide_img=img,
@@ -3291,24 +3153,10 @@ class ProcessingStore:
         SYSTEM failure `job_state='error'`, not a gate-failure REVIEW. See
         `_score_hybrid_slide`'s docstring for why that split matters there.
         """
-        image: np.ndarray | None = None
-
-        def _decode_and_preprocess() -> tuple[np.ndarray | None, PreparedResult]:
-            nonlocal image
-            image = cv2.imread(str(slide_path))
-            if image is None:
-                return None, PreparationFailure(
-                    role="slide", reason=f"could not read image: {slide_path}"
-                )
-            return image, self.slide_preprocessor(image)
-
-        with observed(self.runtime_observer, "slide_preparation", item_id):
-            if not fail_closed:
-                return _decode_and_preprocess()
-            try:
-                return _decode_and_preprocess()
-            except Exception as exc:  # fail closed: a crash must never skip a verdict
-                return image, PreparationFailure(role="slide", reason=str(exc))
+        return prepare_slide_image(
+            slide_path, item_id, self.slide_preprocessor,
+            observer=self.runtime_observer, fail_closed=fail_closed,
+        )
 
     @staticmethod
     def _load_block_result(row: Mapping[str, object]) -> PreparedResult:
@@ -3382,22 +3230,14 @@ class ProcessingStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if row is not None:
-                # #255 stale-write protection: `expected_job_state` is None
-                # for every caller except `_score_hybrid_slide`, so this is
-                # byte-identical to the pre-#255 single UPDATE for
-                # resolve_claim/_reject_out_of_pool_claim/_score_work_order.
-                # A Hybrid worker passes its own capture's `job_state` at the
-                # moment it started scoring (normally "scoring"); the
-                # correlated subquery re-reads THAT row's current
-                # `job_state` atomically as part of this UPDATE's own WHERE
-                # clause -- if a concurrent supersession (#256) changed it
-                # in the meantime, the subquery no longer matches and this
-                # write affects zero rows, exactly like the existing
-                # `verdict IS NULL` duplicate guard already does for a
-                # genuine double-decide. Without this, a stale (superseded)
-                # job that happens to finish BEFORE the active job could win
-                # the `verdict IS NULL` race and permanently block the
-                # active job's own later, correct write.
+                # Stale-write protection. A Hybrid worker passes the
+                # `job_state` its capture had when it started scoring; the
+                # correlated subquery re-reads that row atomically inside this
+                # UPDATE's WHERE clause, so a concurrent supersession makes
+                # this write affect zero rows. Without it a superseded job that
+                # finishes first wins the `verdict IS NULL` race and permanently
+                # blocks the active job's correct write. `expected_job_state` is
+                # None for every other caller.
                 if expected_job_state is None:
                     updated = db.execute(
                         """UPDATE sets SET verdict=?, score=?, decision_stage=?,
@@ -3503,7 +3343,7 @@ class ProcessingStore:
         slide_result: PreparedResult,
         decision: ClaimDecision,
     ) -> None:
-        # Block/Slide thumbs+display need only raw captures (#236). Overlay
+        # Block/Slide thumbs+display need only raw captures. Overlay
         # PNG/JPEG additionally need prepared masks + a locked pose.
         if block_img is None and slide_img is None:
             return
@@ -3656,7 +3496,7 @@ class ProcessingStore:
         return tuple(captures)
 
     def get_slide_capture(self, session_number: int, capture_id: str) -> dict[str, object]:
-        """Mirror of ``get_set`` for one slide capture row (mirrors #93 pattern)."""
+        """Mirror of ``get_set`` for one slide capture row."""
         with self._connect() as db:
             row = db.execute(
                 "SELECT * FROM slide_captures WHERE session_number=? AND capture_id=?",
@@ -3669,7 +3509,7 @@ class ProcessingStore:
         return capture
 
     # -----------------------------------------------------------------
-    # Work-order-scoped N^2 retrieval mode (#149, ADR 0009).
+    # Work-order-scoped N^2 retrieval mode (ADR 0009).
     #
     # A work order is the operator's explicit start/finish capture bracket.
     # `scan_block`/`record_slide_capture` stamp every row created while one
@@ -3686,7 +3526,7 @@ class ProcessingStore:
         second `capturing` row, mirroring `finish_work_order`'s existing
         SELECT-before-write guard.
 
-        #269 FIX3: `scan_block` stamps a new `sets` row's `work_order_id`
+        `scan_block` stamps a new `sets` row's `work_order_id`
         from whichever work order happens to be open AT SCAN TIME -- `NULL`
         if none is. A block scanned (and even fully captured/prepared)
         before this call has no way back into a bracket on its own:
@@ -3772,18 +3612,18 @@ class ProcessingStore:
         aggregate CSV/results-ready finalizer after those jobs. Hybrid modes
         already own their per-slide result lifecycle and remain finalized.
 
-        #269: HYBRID/HYBRID_SHADOW sessions must never run the full N-by-N
+        HYBRID/HYBRID_SHADOW sessions must never run the full N-by-N
         path -- the whole point of the Hybrid Candidate Pool. The
         `capturing -> finalized` commit always happens (closing the bracket
         is mode-agnostic), but the `finalized -> scoring` commit and the job
         submission are gated on the durable `sessions.session_mode`, read
         directly rather than inferred from whether a `hybrid_pools` row
-        happens to exist (see the design-gap note this fixes: a Hybrid work
+        happens to exist (a Hybrid work
         order that failed to freeze -- fewer than 2 usable blocks -- has no
         `hybrid_pools` row at all, so an existence check would wrongly fall
         through to full N-by-N scoring in exactly the mode that exists to
         avoid it). A Hybrid work order therefore stays `finalized` after this
-        call -- driving it to a scored/results-ready state is #251/#252's job.
+        call; the per-slide Hybrid jobs drive it to results-ready.
         """
         fingerprint = (
             self._fingerprint({"start_job": bool(start_job)})
@@ -3973,10 +3813,10 @@ class ProcessingStore:
     def list_results_ready_work_orders(
         self, session_number: int
     ) -> tuple[dict[str, object], ...]:
-        """The kiosk results table's data source (#150): one row per slide,
+        """The kiosk results table's data source: one row per slide,
         aggregated across EVERY ``results_ready`` work order in the session
         -- not a single-order picker -- so any order finished this session
-        is viewable without re-scanning. Pure read of columns #149's
+        is viewable without re-scanning. Pure read of columns
         ``_finalize_claim`` already populates; no new schema, no CSV
         re-parsing. ``_finalize_claim`` writes the verdict to ``sets`` (the
         canonical home) when a matching set row exists, and only falls back
@@ -4016,68 +3856,39 @@ class ProcessingStore:
         """Live kiosk rows for per-slide retrieval jobs.
 
         One row per successfully decoded Open Retrieval, Hybrid, or Hybrid
-        Shadow slide claim in the session,
-        across EVERY work order (``capturing``, ``finalized``, or
-        ``results_ready``), not just ``results_ready`` ones. Failed/unresolved
-        captures remain durable capture-recovery audit data, not result rows.
+        Shadow slide claim, across every work order rather than only
+        ``results_ready`` ones, which is what separates this from
+        `list_results_ready_work_orders`. Failed/unresolved captures stay
+        capture-recovery audit data, not result rows.
 
-        This is separate from `list_results_ready_work_orders`: live rows are
-        intentionally visible while their work order is still capturing or
-        finalizing, while the older method remains lifecycle-gated.
-
-        Same projected key set as `list_results_ready_work_orders` (so
-        ``code/kiosk/results_table.py:project_results_table`` consumes
-        either unchanged): ``capture_id``, ``block_id``, ``verdict``,
-        ``claim_score``, ``claim_reason``, ``work_order_id``,
-        ``lab_work_order``, ``top_block``, ``contact_sheet_dir``. The legacy
-        ``work_order`` projection remains as a backward-compatible alias for
+        Same projected keys as `list_results_ready_work_orders`, so
+        ``kiosk/results_table.py:project_results_table`` consumes either
+        unchanged. ``work_order`` is a backward-compatible alias for
         ``lab_work_order``.
 
-        ``verdict`` is a PROJECTION of the row's internal ``job_state``,
-        never the durable column itself::
+        ``verdict`` is a projection of the row's internal ``job_state``,
+        never the durable column::
 
-            job_state='error'                             -> "ERROR"
+            job_state='error'                              -> "ERROR"
             job_state in ('queued', 'preparing', 'scoring') -> "PENDING"
-            otherwise (job_state IS NULL, e.g. an Out-of-Pool Claim, or
-            job_state='complete')                         -> the durable
+            otherwise (NULL, or 'complete')                -> the durable
                                                               PASS/REVIEW
-                                                              verdict
 
-        ``sets.verdict``/``slide_captures.verdict`` are NEVER written as
-        ``"ERROR"`` or ``"PENDING"`` -- those two strings exist only in this
-        projection. Internal lifecycle states (``queued``, ``preparing``,
-        ``scoring``, ``superseded``) are durable and must never reach a
-        caller of this method; only ``"ERROR"``/``"PENDING"``/``"PASS"``/
-        ``"REVIEW"`` ever appear under the ``verdict`` key. A row currently
-        ``job_state='superseded'`` (#256 recapture supersession, which
-        deliberately permits superseding an already-``complete`` row too --
-        see ``recapture_hybrid_slide``'s own docstring) is EXCLUDED from
-        this projection entirely by its own ``WHERE`` clause below, rather
-        than being mapped to any of the four strings above: showing its
-        stale ``PASS``/``REVIEW`` verdict would be indistinguishable from
-        the active result and could read as a second, contradictory row for
-        the same block once the recapture's own row lands. A block whose
-        only capture is mid-recapture instead shows no row at all for one
-        moment (until the new capture's row reaches at least ``queued``,
-        which happens in the same transaction) -- a visibly incomplete
-        table an operator will wait out, not a wrong verdict they could act
-        on, so this is the safer of the two failure shapes for this
-        projection.
+        "ERROR"/"PENDING" exist only in this projection and are never
+        written durably; internal lifecycle states must never reach a caller.
+        A ``superseded`` row is excluded by the WHERE clause rather
+        than mapped: its stale verdict would be indistinguishable from the
+        active result. A block mid-recapture therefore shows no row for one
+        moment, which an operator waits out, rather than a wrong verdict they
+        could act on.
 
-        Gated on the durable ``sessions.session_mode`` (`_session_mode`,
-        #269's fail-closed lookup) rather than any per-row signal. NORMAL
-        always returns an empty tuple.
+        Gated on the durable ``sessions.session_mode``; NORMAL returns an
+        empty tuple.
 
-        MUST NOT RAISE. This is polled from the kiosk camera loop
-        (mirrors `_hybrid_pool_block_ids_for_out_of_pool_guard`'s own
-        documented blast-radius rule): a raise here would reach
-        `_camera_loop`'s bare ``except Exception``, set ``self._stop``, and
-        kill the camera loop. Any unexpected failure -- including
-        `_session_mode`'s own deliberate ``ValueError`` for an unknown
-        session, since this method cannot prove no poll path will ever pass
-        a stale/unknown ``session_number`` -- degrades to an empty tuple via
-        `_log_durable_exception`, so the failure stays diagnosable instead
-        of silently swallowed.
+        MUST NOT RAISE. This is polled from the kiosk camera loop, where a
+        raise would reach `_camera_loop`'s bare except and kill the loop. Any
+        failure, including `_session_mode`'s ValueError for an unknown
+        session, degrades to an empty tuple via `_log_durable_exception`.
         """
         try:
             mode = self._session_mode(session_number)
@@ -4147,47 +3958,27 @@ class ProcessingStore:
     def list_hybrid_profile_rows(
         self, session_number: int
     ) -> tuple[dict[str, object], ...]:
-        """#258: the shared pure formatter's (`code/session/profile_report.py`
-        `project_profile_rows`) one durable source -- one row per Hybrid
-        slide capture PROFILED in this session (`profile_enabled=1`), across
-        every work order, exactly like `list_hybrid_results` above but
-        scoped to `--profile` captures only. Copies that method's structure
-        and hardening deliberately, rather than sharing a query, because the
-        two projections diverge (`verdict`/`claim_score`/... vs raw
-        `job_state`/timing columns) and each must stay independently correct.
+        """The one durable source for `profile_report.py`'s
+        `project_profile_rows` -- one row per Hybrid slide capture profiled
+        in this session (`profile_enabled=1`), across every work order.
+        Copies `list_hybrid_results`' structure rather than sharing a query,
+        because the two projections diverge and each must stay independently
+        correct.
 
-        Returns an empty tuple -- never collects, never persists anything
-        additional, never raises -- whenever:
+        Returns an empty tuple, collecting and persisting nothing, when the
+        session is NORMAL/OPEN_RETRIEVAL (gated on the durable
+        `sessions.session_mode`) or when profiling was never on for a row.
+        `profile_enabled=1` is a WHERE clause, not a display filter, which is
+        what makes "no `--profile` means nothing is collected" true by
+        construction.
 
-        - the session is NORMAL/OPEN_RETRIEVAL (gated on the durable
-          `sessions.session_mode`, mirroring `list_hybrid_results`'s own
-          `_session_mode` gate exactly, not a per-row signal);
-        - profiling was never turned on for a given row (`profile_enabled=1`
-          is a WHERE clause here, not a display-time filter) -- this is what
-          makes "no `--profile` means nothing is collected or persisted"
-          true by construction: a row this method would otherwise return
-          simply was never written with its timing columns populated, by
-          `record_slide_capture`/`_score_hybrid_slide` (see their own
-          docstrings).
+        Keys are exactly what `project_profile_rows` reads: `capture_id`,
+        `block_id`, `job_state`, `verdict`, `stage`, `queued_ns`, `total_ms`,
+        `stage_ms_json`, `shadow`.
 
-        Each returned dict has exactly the keys `project_profile_rows`
-        reads: `capture_id`, `block_id`, `job_state`, `verdict`, `stage`
-        (this row's `profile_current_stage` while pending; NULL once
-        complete or if never profiled), `queued_ns` (`profile_queued_ns`),
-        `total_ms` (`profile_total_ms`), `stage_ms_json`
-        (`profile_stage_ms_json`), and `shadow` (`profile_shadow`, stamped at
-        enqueue from the session's own durable `session_mode` -- see the
-        `slide_captures.profile_shadow` migration comment -- so a shadow
-        row's complete-pool timing is unmistakable in this PERSISTED
-        projection, not only once `project_profile_rows` labels it on
-        screen).
-
-        MUST NOT RAISE. This is polled from the kiosk camera loop exactly
-        like `list_hybrid_results` (see that method's own docstring for the
-        concrete blast radius: a raise here would reach `_camera_loop`'s
-        bare ``except Exception``, set ``self._stop``, and kill the camera
-        loop). Any unexpected failure degrades to an empty tuple via
-        `self._log_durable_exception`, same as `list_hybrid_results`.
+        MUST NOT RAISE: polled from the kiosk camera loop, where a raise
+        would kill the loop. Any failure degrades to an empty tuple via
+        `_log_durable_exception`.
         """
         try:
             mode = self._session_mode(session_number)
@@ -4221,7 +4012,7 @@ class ProcessingStore:
     def _recover_work_orders(self) -> None:
         """Recover batch scoring or Open Retrieval audit finalization.
 
-        #269: gated on the persisted `sessions.session_mode`, excluding
+        Gated on the persisted `sessions.session_mode`, excluding
         HYBRID/HYBRID_SHADOW, for the exact reason `finish_work_order` is --
         this runs at `ProcessingStore.__init__`/`_initialize` time, in a
         freshly started process with no in-memory `SessionWorkflow`/
@@ -4339,7 +4130,7 @@ class ProcessingStore:
                         role="slide", reason=str(exc)
                     )
                 # Decoded frame is used only to build slide_results above; it
-                # is never retained past this iteration (#185 -- the batch
+                # is never retained past this iteration (the batch
                 # path must stay O(1) memory, not O(N) frames held across the
                 # N^2 scoring barrier below).
                 del img
@@ -4394,13 +4185,11 @@ class ProcessingStore:
                 # and this finalize/QC step are separated by the N^2 scoring
                 # barrier, so a decode-once frame can't span both without
                 # holding all N captures' frames resident through scoring
-                # (#185 -- no batch-memory buildup). _finalize_claim writes
-                # claim_qc.png for EVERY verdict (not just REVIEW) and no
-                # longer decodes for itself, so this decode is unconditional
-                # -- matching origin/main, where _finalize_claim always
-                # decoded the slide. REVIEW additionally reuses this same
-                # frame for the flagged-pair sheets below instead of a
-                # second decode.
+                # (no batch-memory buildup). _finalize_claim writes
+                # claim_qc.png for EVERY verdict (not just REVIEW) and does
+                # not decode for itself, so this decode is unconditional.
+                # REVIEW additionally reuses this same frame for the
+                # flagged-pair sheets below instead of a second decode.
                 slide_img = cv2.imread(str(slide_path))
                 self._finalize_claim(
                     session.number, claimed_block, capture_id, slide_path, row, decision,
@@ -4513,7 +4302,7 @@ class ProcessingStore:
         profile: bool = False,
         profile_queued_ns: int | None = None,
     ) -> None:
-        """#252: submit one accepted, in-pool Hybrid slide's disposable
+        """Submit one accepted, in-pool Hybrid slide's disposable
         in-memory Future, mirroring `_submit_preprocessing`'s shape exactly so
         `wait_for_jobs()` drains this job too. Runs on the SAME single-worker
         `self._executor` -- no second executor, no second thread; ordinary
@@ -4521,7 +4310,7 @@ class ProcessingStore:
         share one sequential, FIFO queue, per the issue's explicit
         "parallel workers are out of scope" call-out.
 
-        ``profile``/``profile_queued_ns`` (#258) are threaded straight through
+        ``profile``/``profile_queued_ns`` are threaded straight through
         to `_score_hybrid_slide`, mirroring `_submit_preprocessing`'s own
         pass-through of the block equivalents.
         """
@@ -4570,7 +4359,7 @@ class ProcessingStore:
         self, capture_id: str, *, expected: str, new_state: str,
     ) -> bool:
         """CAS entry-transition write for `_score_hybrid_slide`'s own
-        `job_state` advances (the #255-completion/#255-error CAS writes'
+        `job_state` advances (the completion/error CAS writes'
         sibling for the two ENTRY transitions those never covered): the row
         only advances to ``new_state`` when it is still exactly
         ``expected`` -- the state this worker's own submission (a fresh
@@ -4595,7 +4384,7 @@ class ProcessingStore:
         return updated == 1
 
     def _set_hybrid_profile_stage(self, capture_id: str, stage: str) -> None:
-        """#258: durable "which of `PROFILE_STAGE_ORDER` is the worker
+        """Durable "which of `PROFILE_STAGE_ORDER` is the worker
         currently inside" marker for a still-pending profiled row -- the one
         `list_hybrid_profile_rows`/`project_profile_rows` read as a pending
         row's `stage`. Callers gate every call on `profile` themselves (this
@@ -4614,7 +4403,7 @@ class ProcessingStore:
         selection: CandidateSelection | None,
         selection_error: str | None,
     ) -> None:
-        """#253: durable audit evidence for one slide's Heuristic Candidate
+        """Durable audit evidence for one slide's Heuristic Candidate
         Band selection, so a pruned block can never be confused with a block
         that was never scanned in this work order -- ``evaluate_work_order``
         treats a missing key as "not scanned", and without this record that
@@ -4652,7 +4441,7 @@ class ProcessingStore:
         claim_id: str,
         complete_verdict: WorkOrderVerdict,
     ) -> None:
-        """#254: durable Hybrid Shadow safety-comparison evidence.
+        """Durable Hybrid Shadow safety-comparison evidence.
 
         ``complete_scores``/``complete_verdict`` are the SAME map and verdict
         `_score_hybrid_slide` already produced from its one complete accurate
@@ -4919,133 +4708,71 @@ class ProcessingStore:
         profile: bool = False,
         profile_queued_ns: int | None = None,
     ) -> None:
-        """#252: the sequential background worker for one accepted, in-pool
+        """The sequential background worker for one accepted, in-pool
         Hybrid slide claim.
 
-        Slide preparation and quality checks move IN HERE -- they used to run
-        synchronously on the acknowledgment path inside `resolve_claim`
-        (`cv2.imread`, `self.slide_preprocessor`, `decide_claim`'s internal
-        `run_quality_gates`), which is exactly the wait #252 removes from
-        capture's critical path. Decode + prepare now shares
-        `_prepare_slide_for_artifacts` with `resolve_claim` and
-        `claim_out_of_pool_block` (passing `fail_closed=False`, see that
-        method's docstring for why); the gate check and everything after it
-        is this worker's own, and it never calls `resolve_claim`.
+        Slide preparation and quality checks run here rather than
+        synchronously on the acknowledgment path inside `resolve_claim`,
+        keeping that wait off capture's critical path. Decode
+        and prepare share `_prepare_slide_for_artifacts`; the gate check and
+        everything after it is this worker's own, and it never calls
+        `resolve_claim`.
 
-        #253: scores only the Heuristic Candidate Band plus the claim
-        (`self.select_hybrid_candidates`'s `accurate_scoring_ids`), not the
-        entire frozen pool -- via the unchanged `score_routed_caches`, one
-        call per selected pool block against a single slide
-        `LockedScoreCache` built through the existing injectable
-        `self.score_cache_builder` seam. Falls back to scoring the ENTIRE
-        pool (the #252 behavior, unconditionally) whenever selection raises,
-        reports `fallback_required`, or fails its own `validate_selection`
-        self-check -- this is a PERMANENT fallback path, not scaffolding to
-        be removed later. The resulting `block_id -> score | None` map (only
-        selected/scored blocks are present as keys; a pruned block is simply
-        absent, which `evaluate_work_order` reads as "not scanned in this
-        order" -- `self._persist_candidate_selection` records the selection
-        itself so a pruned block is never confused with a never-scanned one)
-        is handed to the unchanged `evaluate_work_order` (verdict authority;
-        no verdict logic lives here), and the verdict is written through the
-        existing `self._finalize_claim`, the same writer `resolve_claim` and
-        `_score_work_order` both use. This is `SessionMode.HYBRID`'s
-        behavior; `SessionMode.HYBRID_SHADOW` diverges only in WHICH ids get
-        handed to `score_routed_caches` -- see below.
+        Scores only the Heuristic Candidate Band plus the claim, not
+        the entire frozen pool. Falls back permanently to the whole pool
+        whenever selection raises, reports `fallback_required`, or fails
+        `validate_selection`. A pruned block is absent from the resulting
+        `block_id -> score | None` map, which `evaluate_work_order` reads as
+        "not scanned in this order"; `_persist_candidate_selection` records
+        the selection so pruned is never confused with never-scanned. The
+        verdict goes through `_finalize_claim`, the same writer
+        `resolve_claim` and `_score_work_order` use.
 
-        #254 (Hybrid Shadow): `select_hybrid_candidates` still runs (so the
-        selection audit and the "what would real Hybrid have scored" set are
-        identical to Hybrid's), but `is_shadow` forces `scoring_ids` to the
-        WHOLE pool (`pool.block_ids`) instead of
-        `hybrid_scoring_ids`/`selection.accurate_scoring_ids`. That single
-        substitution is what guarantees NO PAIR IS EVER SCORED TWICE: the
-        `score_routed_caches` dict comprehension below still runs exactly
-        once per id in whichever `scoring_ids` was chosen, so a shadow slide
-        gets exactly `len(pool.block_ids)` calls and a plain Hybrid slide
-        still gets exactly `len(hybrid_scoring_ids)` calls -- never both.
-        `candidate_scores`/`verdict` (the COMPLETE map/verdict for shadow) is
-        the same variable that reaches `_finalize_claim` for both modes, so
-        the durable, displayed, operator-visible verdict is unconditionally
-        `evaluate_work_order` applied to whatever was actually scored -- for
-        shadow, that is genuinely the complete pool, never the subset.  The
-        PROPOSED Hybrid verdict is derived afterward by
-        `self._persist_shadow_comparison`, which FILTERS `candidate_scores`
-        down to `hybrid_scoring_ids` and calls `evaluate_work_order` a
-        SECOND time on that subset -- a second verdict computation (pure,
-        no I/O, no scorer call), never a second score. A comparison-
-        persistence failure is caught locally (logged via
-        `self._log_durable_exception`, `shadow_comparison_json` stays NULL)
-        so it can never turn the already-decided complete verdict into
-        `job_state='error'` -- only a genuine scoring/IO failure earns ERROR.
+        Hybrid Shadow: selection still runs, so the audit and the
+        "what Hybrid would have scored" set match Hybrid's, but `is_shadow`
+        forces `scoring_ids` to the whole pool. That one substitution is why
+        no pair is ever scored twice: a shadow slide gets exactly
+        `len(pool.block_ids)` calls and a Hybrid slide exactly
+        `len(hybrid_scoring_ids)`, never both. The durable verdict is always
+        `evaluate_work_order` over whatever was actually scored. The proposed
+        Hybrid verdict comes from `_persist_shadow_comparison`, which filters
+        the same scores and evaluates a second time: a second verdict, never
+        a second score. A persistence failure there is logged and leaves
+        `shadow_comparison_json` NULL rather than failing the job.
 
-        #258: when ``profile`` is on, five stages are timed via the
-        injectable ``self._profile_clock_ns`` ONLY -- never a raw clock read
-        -- and persisted to ``slide_captures.profile_stage_ms_json``/
-        ``profile_total_ms`` in the SAME final CAS write that already
-        commits ``top_block``/``near_miss_blocks``/``job_state='complete'``
-        below: queue wait (enqueue to worker start), preparation (worker
-        start through the quality-gate check), heuristic selection
-        (`select_hybrid_candidates` alone -- explicitly stopped before
-        `score_routed_caches` runs, so the selection number is never
-        inflated by scoring time), accurate scoring (`score_routed_caches`
-        alone), and artifact writing (everything from there through this
-        method's own completion, `_persist_hybrid_score_audit`/
-        `_finalize_claim`/the slide overlay). A gate-failed slide never
-        reaches selection or scoring, so those two keys are simply absent
-        from the persisted JSON -- never a fabricated zero (mirrors
-        `code/session/profile_report.py:_stage_ms_breakdown`'s documented
-        tolerance for a stage that never ran). Shadow's row is tagged via
-        the `profile_shadow` column stamped at ENQUEUE time
-        (`record_slide_capture`/`recapture_hybrid_slide`) from the session's
-        own durable `session_mode`, so a shadow slide's complete-pool timing
-        can never be read as pruned Hybrid timing in the PERSISTED data --
-        honoring the warning this docstring used to carry.
+        With ``profile`` on, five stages are timed via the injectable
+        ``self._profile_clock_ns`` and persisted in the same final CAS write
+        that commits `job_state='complete'`: queue wait, preparation,
+        heuristic selection (stopped before scoring, so it is never inflated
+        by scoring time), accurate scoring, and artifact writing. A
+        gate-failed slide never reaches selection or scoring, so those keys
+        are absent rather than zero.
 
-        Never re-raises (mirrors `_preprocess`/`_score_work_order`'s
-        try/except): a single job's failure must not kill this single-worker
-        executor for the next queued slide. A failure here -- an unreadable
-        image the slide_preprocessor itself cannot even attempt, a missing
-        frozen pool, or an injected seam raising -- is a SYSTEM/ARTIFACT
-        failure: durably recorded as `job_state='error'` with NO verdict
-        written (`verdict` stays NULL; `code/kiosk/results_table.py`'s
-        ERROR-vs-REVIEW split is explicit that ERROR means a system failure,
-        never a match failure). `verdict='ERROR'` is never written --
-        `session.pipeline` only ever produces the strings `"PASS"`/
-        `"REVIEW"`. An EXPECTED outcome -- the slide fails quality gates,
-        candidate selection falls back, or scores disagree with the claim --
-        goes through `evaluate_work_order`/`_finalize_claim` normally and
-        lands as REVIEW with `job_state='complete'`, exactly like any other
-        REVIEW. Candidate selection failing is deliberately caught INSIDE
-        this method's own try block (not left to the outer except) so a
-        selection bug can never masquerade as this job's ERROR outcome.
+        Never re-raises: one job's failure must not kill the single-worker
+        executor. A system or artifact failure is recorded as
+        `job_state='error'` with no verdict written; `verdict='ERROR'` is
+        never a value, since the pipeline only produces "PASS"/"REVIEW". An
+        expected outcome (failed gates, selection fallback, scores
+        disagreeing with the claim) lands as REVIEW with
+        `job_state='complete'`. Selection failure is caught inside this
+        method's own try block so a selection bug cannot masquerade as ERROR.
 
-        #255: restart recovery for an interrupted job is `_recover_retrieval_jobs`'s
-        job, run at `ProcessingStore.__init__` -- this method's own
-        `job_state` transitions (`preparing` -> `scoring` -> `complete`/
-        `error`) are exactly what that recovery reads. Stale-write
-        protection is also #255: the final `_finalize_claim` call and the
-        completion/error writes below are all conditioned on `job_state`
-        still being what this worker expects (see the comments at each of
-        those call sites), so a job superseded mid-flight (#256) cannot
-        have its late write clobber the active result.
+        Restart recovery belongs to `_recover_retrieval_jobs`, which
+        reads exactly these `job_state` transitions. Every write below is
+        conditioned on `job_state` still being what this worker expects, so
+        a job superseded mid-flight cannot clobber the active result.
         """
         is_shadow = session.session_mode == SessionMode.HYBRID_SHADOW.value
-        # #258: taken at the very top of the worker, before anything else --
+        # Taken at the very top of the worker, before anything else --
         # this is "queue wait ends, preparation begins" for BOTH the
         # persisted stage breakdown and the durable `profile_current_stage`
         # indicator a pending row's console/screen line reads.
         worker_started_ns = self._profile_clock_ns() if profile else None
-        # CAS entry transition (sibling of the completion/error CAS writes
-        # below, closing the gap those left open): every path that submits
-        # this worker -- a fresh `record_slide_capture`/`recapture_hybrid_
-        # slide` enqueue, `_recover_retrieval_jobs`'s restart requeue, and
-        # `retry_hybrid_slide`'s own CAS -- leaves the row at exactly
-        # 'queued' immediately beforehand, so that is the only prior state
-        # this transition admits. A row a concurrent recapture has already
-        # superseded (or otherwise reassigned) out from under this worker
-        # fails this CAS and must NEVER be resurrected back into 'preparing'
-        # -- abandon quietly (log and return), never raise, never 'error'
-        # (being superseded is a correct, expected outcome, not a failure).
+        # CAS entry transition. Every path that submits this worker leaves
+        # the row at exactly 'queued', so that is the only prior state
+        # admitted. A row a concurrent recapture superseded fails this CAS
+        # and must never be resurrected into 'preparing': abandon quietly,
+        # never raise, never 'error'. Being superseded is expected.
         if not self._cas_slide_job_state(
             capture_id, expected="queued", new_state="preparing"
         ):
@@ -5078,21 +4805,16 @@ class ProcessingStore:
                 mask_gate = _check_mask_quality("slide", slide_result.mask)
                 if mask_gate is not None:
                     gate_failure_reason = mask_gate.reason
-            # #258: preparation ends here for BOTH outcomes -- decode/prepare
+            # Preparation ends here for BOTH outcomes -- decode/prepare
             # plus the quality-gate check itself, whether or not it passed.
             preparation_finished_ns = self._profile_clock_ns() if profile else None
 
-            # CAS entry transition, same shape and reasoning as the
-            # 'queued' -> 'preparing' CAS above: the only legal prior state
-            # here is 'preparing', the state this SAME worker's own CAS just
-            # won. A concurrent recapture superseding this row during the
-            # (potentially long) decode/gate-check window just finished
-            # fails this CAS and must NEVER resurrect the row back into
-            # 'scoring' -- this is precisely the corruption this fix closes:
-            # without it, a superseded job that reaches this line can win
-            # `sets.verdict` out from under the job that actually superseded
-            # it. Abandon quietly on a loss: log and return, never raise,
-            # never 'error'.
+            # CAS entry transition, same shape as the 'queued' -> 'preparing'
+            # CAS above: the only legal prior state is 'preparing', which this
+            # same worker just won. A recapture that superseded this row during
+            # the decode/gate window fails this CAS; without it a superseded job
+            # wins `sets.verdict` out from under the job that superseded it.
+            # Abandon quietly.
             if not self._cas_slide_job_state(
                 capture_id, expected="preparing", new_state="scoring"
             ):
@@ -5110,10 +4832,10 @@ class ProcessingStore:
             score_results: dict[str, ProductionScoreResult] = {}
             # Populated only in the no-gate-failure branch below; stays None
             # for a gate-failed slide (nothing was scored, so there is no
-            # subset to derive a #254 shadow comparison from -- mirrors
+            # subset to derive a shadow comparison from -- mirrors
             # `candidate_selection_json` staying NULL on gate failure too).
             hybrid_scoring_ids: tuple[str, ...] | None = None
-            # #258: only populated in the no-gate-failure branch below -- a
+            # Only populated in the no-gate-failure branch below -- a
             # gate-failed slide never reaches selection or scoring, so both
             # stay None and both stage keys are simply absent from the
             # persisted breakdown (never a fabricated zero).
@@ -5133,17 +4855,11 @@ class ProcessingStore:
                 assert isinstance(slide_result, PreparedSpecimen)
                 slide_cache = self.score_cache_builder(slide_result)
 
-                # #253: rank the frozen pool cheaply first -- BOTH modes need
-                # this: Hybrid uses it to choose what to score; Hybrid Shadow
-                # (#254) uses it only to know what real Hybrid WOULD have
-                # scored (`hybrid_scoring_ids`), never to choose what it
-                # itself scores. `accurate_scoring_ids` structurally always
-                # includes the claim, regardless of the claim's heuristic
-                # rank. Selection failing (raising, or failing its own
-                # `validate_selection` self-check) is a PERMANENT fallback to
-                # complete pool scoring, never this job's `job_state='error'`
-                # outcome: only a genuine scoring/IO failure earns ERROR (see
-                # this method's docstring on that split).
+                # Rank the frozen pool cheaply first. Hybrid uses the ranking
+                # to choose what to score; Hybrid Shadow uses it only to
+                # record what Hybrid would have scored. `accurate_scoring_ids`
+                # always includes the claim. A failed selection is a permanent
+                # fallback to complete-pool scoring, never `job_state='error'`.
                 selection: CandidateSelection | None
                 selection_error: str | None = None
                 try:
@@ -5168,20 +4884,20 @@ class ProcessingStore:
                     hybrid_scoring_ids = pool.block_ids
                 else:
                     hybrid_scoring_ids = selection.accurate_scoring_ids
-                # #258: heuristic selection ends here, BEFORE `score_routed_
+                # Heuristic selection ends here, BEFORE `score_routed_
                 # caches` runs below -- this is what keeps the selection
                 # timing honest; it must never include scoring time.
                 selection_finished_ns = self._profile_clock_ns() if profile else None
                 if profile:
                     self._set_hybrid_profile_stage(capture_id, "accurate_scoring")
 
-                # #254: Hybrid Shadow always scores the WHOLE frozen pool --
+                # Hybrid Shadow always scores the WHOLE frozen pool --
                 # one complete accurate pass -- instead of the Heuristic
                 # Candidate Band subset. This is the ONLY behavioral fork
                 # between the two modes; everything else (selection,
                 # gate-checking, audit persistence, `_finalize_claim`) is
                 # identical code for both. Plain Hybrid's `scoring_ids` is
-                # unchanged from #253: exactly `hybrid_scoring_ids`.
+                # exactly `hybrid_scoring_ids`.
                 scoring_ids: tuple[str, ...] = (
                     pool.block_ids if is_shadow else hybrid_scoring_ids
                 )
@@ -5192,7 +4908,7 @@ class ProcessingStore:
                     )
                     for pool_block_id in scoring_ids
                 }
-                # #258: accurate scoring ends here -- shadow's row genuinely
+                # Accurate scoring ends here -- shadow's row genuinely
                 # paid the complete O(pool) cost through this same line
                 # (`scoring_ids` was the whole pool for shadow, above), so
                 # its timing is real, just never comparable to pruned
@@ -5208,7 +4924,7 @@ class ProcessingStore:
 
             verdict = evaluate_work_order(candidate_scores, block_id)
 
-            # #254: derive (never re-score) the proposed Hybrid verdict by
+            # Derive (never re-score) the proposed Hybrid verdict by
             # filtering the just-computed COMPLETE map down to what real
             # Hybrid would have scored, and record the safety comparison.
             # `hybrid_scoring_ids is None` only on a gate-failed slide (never
@@ -5276,7 +4992,7 @@ class ProcessingStore:
                 )
             # `_finalize_claim`'s own docstring note on `expected_job_state`
             # for the concrete race this closes. A late completion from a
-            # job that lost this race (e.g. superseded by #256 mid-flight)
+            # job that lost this race (e.g. superseded mid-flight)
             # is a durable, non-fatal outcome, never an exception: log it
             # and return without touching top_block/near_miss_blocks/
             # job_state below, so it cannot clobber whatever the active job
@@ -5316,7 +5032,7 @@ class ProcessingStore:
                 decision=decision,
             )
             del block_img
-            # #258: taken right before the final CAS write, so "artifact
+            # Taken right before the final CAS write, so "artifact
             # write" covers everything from the end of scoring (or, on a
             # gate-failed slide, the end of preparation) through the score
             # audit, `_finalize_claim`, and the slide overlay above -- the
@@ -5571,7 +5287,7 @@ class ProcessingStore:
                    WHERE session_number=? AND success=0 ORDER BY captured_at""",
                 (session.number,),
             ).fetchall()
-            # #188: a dismissed block (operator resolved a preprocessing
+            # A dismissed block (operator resolved a preprocessing
             # failure as unusable) is not real work left to resume -- exclude
             # it so an all-dismissed session doesn't misread as "unfinished."
             blocks_captured = db.execute(
@@ -5709,7 +5425,7 @@ class ProcessingStore:
         *,
         request_id: str | None = None,
     ) -> None:
-        """Append one row to `<session_dir>/profile_summary.csv` (#168).
+        """Append one row to `<session_dir>/profile_summary.csv`.
 
         Opt-in tracer slice: called only when `PiCaptureRuntime.profile` is
         true, so profile-off sessions never create this file. One row per
@@ -5746,7 +5462,7 @@ class ProcessingStore:
             # transactional with SQLite; a crash between the atomic file
             # write and the ledger COMMIT could roll back the ledger row and
             # let a retry duplicate the row. Accepted for opt-in diagnostic
-            # profiling data (#168) -- not worth a two-phase-commit dance.
+            # profiling data -- not worth a two-phase-commit dance.
             _atomic_bytes(path, buffer.getvalue().encode("utf-8"))
             if request_id is not None:
                 self._ledger_record(
@@ -6167,7 +5883,7 @@ def default_work_order_scorer(
     block_results: Mapping[str, PreparedResult],
     slide_results: Mapping[str, PreparedResult],
 ) -> WorkOrderScoringResult:
-    """Score every slide-block pair in one work order (#149, ADR 0009).
+    """Score every slide-block pair in one work order (ADR 0009).
 
     Reuses ``pipeline.decide_claim`` (``pair_composition.compose_prepared_pair``
     under the hood) -- the same production scorer ``resolve_claim`` uses for
@@ -6175,7 +5891,7 @@ def default_work_order_scorer(
     NOT import ``tools/scoring_diagnostics/pair_diagnostics.py``: that would
     violate the ``code/`` -> ``tools/`` architecture boundary.
 
-    Per-item / per-pair boundary (ADR 0011, issue #158): the 256x256
+    Per-item / per-pair boundary (ADR 0011): the 256x256
     normalization + component-feature cache (``build_locked_score_cache``)
     depends only on one specimen, so a pre-pass builds it once per item
     (M+K) instead of once per pair (2*M*K). Cache lookup keys on object
@@ -6230,7 +5946,7 @@ def default_work_order_scorer(
 def format_profile_summary_row(
     capture_id: str, fields: Mapping[str, object]
 ) -> dict[str, object]:
-    """Pure dict-to-row shaping for `ProcessingStore.record_profile_capture` (#168).
+    """Pure dict-to-row shaping for `ProcessingStore.record_profile_capture`.
 
     `fields` is the stage-timing subset of `SuccessfulCapture.metadata`;
     only the keys present in `CAPTURE_STAGE_TIMING_KEYS` are carried over.

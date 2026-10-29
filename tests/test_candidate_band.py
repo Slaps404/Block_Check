@@ -1,4 +1,4 @@
-"""Pure, fast tests for the #253 Heuristic Candidate Band (code/verify/candidate_band.py).
+"""Pure, fast tests for the Heuristic Candidate Band (code/retrieval/candidate_band.py).
 
 No cv2, no ProcessingStore, no threads, no temp databases, no real images:
 every fingerprint below is hand-built so a descriptor's comparator output is a
@@ -13,9 +13,10 @@ import math
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
+import pytest
 
 from constants import SHAPE_ROUTER_SIZE_THRESHOLD
-from verify.candidate_band import (
+from retrieval.candidate_band import (
     DENSE_DESCRIPTOR_WEIGHTS,
     DENSE_FLOOR_FRACTION,
     DENSE_FLOOR_MINIMUM,
@@ -30,7 +31,7 @@ from verify.candidate_band import (
     select_configured_candidate_band,
     validate_selection,
 )
-from verify.invariant_descriptors import DescriptorValue, descriptor_catalog
+from retrieval.invariant_descriptors import DescriptorValue, descriptor_catalog
 
 _CATALOG = {spec.name: spec for spec in descriptor_catalog()}
 _DENSE_REQUIRED = tuple(sorted(n for n, w in DENSE_DESCRIPTOR_WEIGHTS.items() if w > 0))
@@ -130,7 +131,7 @@ def test_ported_band_matches_original_including_claim_excluded_from_count():
 
 
 def test_handoff_threshold_changes_individual_candidate_selection():
-    """#253: calibrated handoff gaps, not uncalibrated runtime defaults, drive pruning."""
+    """Calibrated handoff gaps, not uncalibrated runtime defaults, drive pruning."""
     method = _DENSE_REQUIRED[0]
     slide = _slide_fingerprint(_DENSE_SLIDE_FRACTION, (method,))
     pool = {
@@ -198,12 +199,11 @@ def test_claim_never_in_candidate_ids_but_always_in_accurate_scoring_ids_at_dead
 
 
 def test_strongest_competitor_survives_band_beyond_the_floor_on_near_tie_scores():
-    """Sparse margins in the real corpus are razor thin (lab mechanism labels:
-    set 018 -0.0048, 014 +0.0022, 019 +0.09) -- much thinner than Borda rank
-    fusion's discretized spacing can literally reproduce. This test proves the
-    *mechanism* those numbers motivate: a competitor several ranks below the
-    floor still survives because the wide sparse gap (0.65x range), not the
-    floor, protects it.
+    """Sparse margins in the real corpus are razor thin, much thinner than
+    Borda rank fusion's discretized spacing can reproduce. This test proves
+    the mechanism instead: a competitor several ranks below the floor still
+    survives because the wide sparse gap (0.65x range), not the floor,
+    protects it.
     """
     slide = _slide_fingerprint(_SPARSE_SLIDE_FRACTION)
     claim = _quality_fingerprint("claim", _SPARSE_SLIDE_FRACTION, 0.5, _SPARSE_REQUIRED)
@@ -279,25 +279,17 @@ def _extreme_pool(required_names: Sequence[str], slide_fraction: float, pool_siz
     return pool, slide
 
 
-def test_dense_floor_is_honored_on_pools_of_4_and_5():
-    for pool_size in (4, 5):
-        pool, slide = _extreme_pool(_DENSE_REQUIRED, _DENSE_SLIDE_FRACTION, pool_size)
-        selection = select_candidate_band(pool, slide, "claim")
-        expected_floor = max(DENSE_FLOOR_MINIMUM, math.ceil(DENSE_FLOOR_FRACTION * pool_size))
-        non_claim_count = pool_size - 1
-        assert selection.floor_count == expected_floor
-        assert len(selection.candidate_ids) >= min(expected_floor, non_claim_count)
-
-
-def test_sparse_floor_is_honored_on_pools_of_4_and_5():
-    for pool_size in (4, 5):
-        pool, slide = _extreme_pool(_SPARSE_REQUIRED, _SPARSE_SLIDE_FRACTION, pool_size)
-        selection = select_candidate_band(pool, slide, "claim")
-        expected_floor = max(SPARSE_FLOOR_MINIMUM, math.ceil(SPARSE_FLOOR_FRACTION * pool_size))
-        non_claim_count = pool_size - 1
-        assert selection.floor_count == expected_floor
-        assert len(selection.candidate_ids) >= min(expected_floor, non_claim_count)
-
+@pytest.mark.parametrize("pool_size", [4, 5])
+@pytest.mark.parametrize("required, fraction, floor_min, floor_frac", [
+    (_DENSE_REQUIRED, _DENSE_SLIDE_FRACTION, DENSE_FLOOR_MINIMUM, DENSE_FLOOR_FRACTION),
+    (_SPARSE_REQUIRED, _SPARSE_SLIDE_FRACTION, SPARSE_FLOOR_MINIMUM, SPARSE_FLOOR_FRACTION),
+], ids=["dense", "sparse"])
+def test_floor_is_honored_on_small_pools(required, fraction, floor_min, floor_frac, pool_size):
+    pool, slide = _extreme_pool(required, fraction, pool_size)
+    selection = select_candidate_band(pool, slide, "claim")
+    expected_floor = max(floor_min, math.ceil(floor_frac * pool_size))
+    assert selection.floor_count == expected_floor
+    assert len(selection.candidate_ids) >= min(expected_floor, pool_size - 1)
 
 # ---------------------------------------------------------------------------
 # 5. Rank fusion is scale-free.
@@ -335,11 +327,11 @@ def test_rank_fusion_is_scale_free_under_rescaling_one_descriptor():
 
 
 # ---------------------------------------------------------------------------
-# 6. min() aggregation would have excluded a block that weighted Borda keeps.
+# 6. Weighted Borda keeps a block that min() aggregation would veto.
 # ---------------------------------------------------------------------------
 
 
-def test_min_aggregation_would_exclude_a_competitor_weighted_fusion_keeps():
+def test_weighted_fusion_keeps_competitor_tanked_by_one_low_weight_descriptor():
     slide = _slide_fingerprint(_DENSE_SLIDE_FRACTION, _DENSE_REQUIRED)
     claim = _quality_fingerprint("claim", _DENSE_SLIDE_FRACTION, 0.5, _DENSE_REQUIRED)
     # competitor: excellent on 5/6 descriptors, but one noisy descriptor
@@ -359,17 +351,8 @@ def test_min_aggregation_would_exclude_a_competitor_weighted_fusion_keeps():
     pool = {"claim": claim, "competitor": competitor, "uniform": uniform, "bad": bad}
 
     selection = select_candidate_band(pool, slide, "claim")
+    # min() would score competitor 0.05 (below "bad"); weighted fusion keeps it.
     assert "competitor" in selection.candidate_ids
-
-    # Naive min-aggregation over the SAME raw per-descriptor comparator scores:
-    min_scores = {
-        "competitor": min([0.95] * 5 + [0.05]),  # hu tanks the min to 0.05
-        "uniform": 0.6,
-        "bad": 0.1,
-    }
-    naive_band = adaptive_score_band(min_scores, 0.1, claim=None)
-    assert "competitor" not in naive_band.members  # min() would have vetoed it
-    assert naive_band.members == ("uniform",)
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,10 @@
-"""Explicit, mutually exclusive session scoring mode (#247 prefactor).
+"""Explicit, mutually exclusive session scoring mode.
 
-Session scoring mode used to be a growing pile of ad hoc independent
-booleans on the Pi capture runtime (``open_retrieval``, and now ``hybrid`` /
-``hybrid_shadow`` on top). Two or more of those booleans true at once is a
-meaningless, silently-resolved state. This module replaces that pile with
-one explicit, exhaustive, four-member :class:`SessionMode` plus a pure
-resolver that rejects any conflicting combination loudly instead of picking
-a winner.
+Independent mode booleans on the Pi capture runtime (``open_retrieval``,
+``hybrid``, ``hybrid_shadow``) could be true at once, a meaningless state.
+This module expresses the mode as one explicit, exhaustive, four-member
+:class:`SessionMode` plus a pure resolver that rejects any conflicting
+combination loudly instead of picking a winner.
 
 ``--profile`` is a deliberately separate, orthogonal instrumentation axis
 (see CONTEXT.md "Profile Mode") -- it is not a scoring mode and has no
@@ -14,7 +12,7 @@ member here and no parameter on :func:`resolve_session_mode`.
 
 Pure data in, enum out -- no cv2/numpy/scipy, no I/O, no argparse
 dependency. Mirrors the ``evaluate_work_order``/``WorkOrderVerdict`` pattern
-in ``code/verify/work_order_evaluator.py``.
+in ``code/retrieval/work_order_evaluator.py``.
 """
 from __future__ import annotations
 
@@ -24,13 +22,10 @@ from enum import Enum
 class SessionMode(Enum):
     """The four mutually exclusive session-wide scoring modes.
 
-    ``NORMAL`` is closed-set per-slide verification -- the default, and the
-    only mode that existed before Open Retrieval. ``OPEN_RETRIEVAL`` is the
-    only mode with scoring behavior wired today (ADR 0009 / ADR 0016).
-    ``HYBRID`` and ``HYBRID_SHADOW`` are #247 mode plumbing only: they boot
-    into the exact same capture flow as ``NORMAL`` and score exactly as
-    normal verification does until the queue/candidate-pool/reranking
-    slices (#249+) land.
+    ``NORMAL`` is closed-set per-slide verification (the default).
+    ``OPEN_RETRIEVAL`` is work-order-scoped retrieval (ADR 0009 / ADR 0016).
+    ``HYBRID`` and ``HYBRID_SHADOW`` freeze a Hybrid Candidate Pool at
+    Finish Blocks and score slides against it.
     """
 
     NORMAL = "normal"
@@ -39,11 +34,10 @@ class SessionMode(Enum):
     HYBRID_SHADOW = "hybrid_shadow"
 
 
-# Issue #245 flags that the exact ``--hybrid-shadow`` flag NAME may be
-# revised before Hybrid Shadow behavior lands, while its mode semantics are
-# fixed. Every call site (argparse, the PowerShell launcher help text, error
-# messages) must read this constant rather than the literal string, so a
-# rename stays a one-line change here.
+# Flag NAMES may be revised while mode semantics stay fixed. Every call
+# site (argparse, the PowerShell launcher help text, error messages) must
+# read this constant rather than the literal string, so a rename stays a
+# one-line change here.
 OPEN_RETRIEVAL_FLAG = "--open-retrieval"
 HYBRID_FLAG = "--hybrid"
 HYBRID_SHADOW_FLAG = "--hybrid-shadow"

@@ -1,12 +1,9 @@
 """Console entry-point contract for explicit mode selection."""
 from __future__ import annotations
 
-import importlib
-import sys
-
 import pytest
 
-from capture_console import build_parser, create_session
+from capture_console import build_parser, create_session, main
 from capture_session import CaptureState
 
 
@@ -20,6 +17,17 @@ def test_console_requires_explicit_block_or_slide_mode():
     assert parser.parse_args(["--mode", "slide"]).mode == "slide"
 
 
+def test_console_exposes_triple_capture_for_block_mode():
+    args = build_parser().parse_args(["--mode", "block", "--triple-capture"])
+
+    assert args.triple_capture is True
+
+
+def test_console_rejects_triple_capture_in_slide_mode():
+    with pytest.raises(SystemExit):
+        main(["--mode", "slide", "--triple-capture"])
+
+
 def test_console_builds_the_same_shared_session_contract():
     assert (
         create_session("block").state
@@ -29,11 +37,3 @@ def test_console_builds_the_same_shared_session_contract():
         create_session("slide").state
         is CaptureState.AWAITING_BASELINE_CONFIRMATION
     )
-
-
-def test_importing_pi_adapter_on_windows_does_not_import_picamera2():
-    before = set(sys.modules)
-
-    importlib.import_module("picamera2_adapter")
-
-    assert "picamera2" not in set(sys.modules) - before

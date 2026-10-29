@@ -1,6 +1,6 @@
-"""Synthetic tests for the blue-paraffin-gated halo relaxation (iteration 047).
+"""Synthetic tests for the blue-paraffin-gated halo relaxation.
 
-On blue-wax blocks (brain 039/040/041) the translucent olive tissue rim sits
+On blue-wax blocks the translucent olive tissue rim sits
 below the default halo Lab-b floor and runs to greener hues, so the default gate
 (`hue<=60, Lab-b>=170`) captures only the dense core. `_grow_tissue_halo` detects
 blue paraffin from the wax region (`_is_blue_paraffin_wax`: median wax sat>=165
@@ -19,16 +19,11 @@ Covers:
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 from verify import segmentation  # noqa: E402
 from verify.segmentation import segment_tissue  # noqa: E402

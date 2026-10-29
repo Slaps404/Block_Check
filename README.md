@@ -20,7 +20,7 @@ workflow.
 | Path | What it is |
 | --- | --- |
 | `code/` | Production library: prepare -> gates -> score -> decide |
-| `tools/` | Standalone CLIs. They call `code/`; production code does not import them |
+| `tools/` | Setup check and session launchers. Production code does not import them |
 | `tests/` | Pytest suite. Default run skips image-heavy tests that need private datasets |
 | `docs/` | Public context, lessons, and ADRs |
 | `requirements.txt` | Python dependencies |
@@ -28,8 +28,9 @@ workflow.
 ### `code/` packages
 
 Data flow in short: capture/session bring images in; block/slide turn them into
-masks; verify scores the claimed pair; kiosk/store are the UI and two-machine
-boundary.
+masks; verify scores the claimed pair; retrieval ranks candidates when the claim
+is missing; kiosk is the UI; transport is the two-machine boundary; app wires it
+all together.
 
 | Package | Role |
 | --- | --- |
@@ -39,39 +40,27 @@ boundary.
 | `code/block/` | Block (paraffin cassette) prep and segmentation |
 | `code/slide/` | Slide prep and segmentation |
 | `code/verify/` | Scoring, hard gates, work-order evaluation, verdicts |
-| `code/store/` | Two-machine store / RPC boundary (Pi <-> processing PC) |
+| `code/retrieval/` | Optional candidate retrieval and Hybrid configuration |
+| `code/transport/` | Pi <-> processing PC remote store and wire encoding |
+| `code/app/` | Pi session and processing-PC receiver entry points |
 
 ### `tools/` (what you actually run)
-
-Start here:
 
 | Entry | Purpose |
 | --- | --- |
 | `tools/setup_check.py` | Pre-flight env check after install |
-| `tools/start_live_session.bat` | Launch processing PC + Pi session (Windows) |
+| `tools/run_receiver.py` | Start the processing-PC receiver |
+| `tools/run_pi_session.py` | Start the Pi capture session and kiosk |
+| `tools/start_live_session.bat` / `.ps1` | Launch processing PC + Pi session (Windows) |
 | `tools/start_pi_session.bat` | Pi-only session launcher |
-| `tools/README.md` | Full per-script table for every tools folder |
 
-Folders shipped in this public repo:
-
-| Folder | When you use it |
-| --- | --- |
-| `tools/capture/` | Launch Pi auto-capture; tag / rename capture pairs |
-| `tools/manifest/` | Build PNG manifests used by diagnostics |
-| `tools/identity/` | Decode slide QR / barcodes into label CSVs |
-| `tools/scoring_diagnostics/` | All-pairs / selected-pair numeric diagnostics (CSVs, metrics) |
-| `tools/visual_audit/` | PNG overlays and contact sheets for human review |
-| `tools/matching_corpus/` | Sync / score / freeze matching-pair rows from session DB |
-
-Rule of thumb: change behavior in `code/`; use `tools/` to exercise, audit, or
-launch that behavior.
+Research and diagnostic tools stay in the private lab repo.
 
 ## Docs
 
 - `docs/PROJECT_CONTEXT.md` - product shape, architecture, commands, key terms
 - `docs/lessons_learned.md` - condensed failed-approach lessons
 - `docs/adr/` - architecture decision records
-- `tools/README.md` - detailed tools entry-point list
 
 ## Setup
 

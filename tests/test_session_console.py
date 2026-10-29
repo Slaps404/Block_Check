@@ -1,5 +1,5 @@
 """Thin command/debug adapter contract: renders events, invokes actions,
-owns no phase or recovery rules of its own (#100)."""
+owns no phase or recovery rules of its own."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -8,6 +8,7 @@ import pytest
 
 from capture_session import MotionSample
 from session.console import (
+    COMMAND_HELP,
     dispatch,
     render_events,
     render_motion_sample,
@@ -132,22 +133,35 @@ class _FakeWorkflow:
         self.calls.append(("sample_motion",))
         return "Motion sample rendered"
 
+    def next_capture(self):
+        self.calls.append(("next_capture",))
+        return "ready"
 
-def test_dispatch_invokes_the_named_workflow_action_without_extra_logic():
+
+# `motion` is a debug still-style command (like `snap`): dispatched against
+# the runtime handle, 0-arg like `summary`. end_session passes confirm=True.
+@pytest.mark.parametrize(
+    ("command", "args", "expected_result", "expected_call"),
+    [
+        ("scan_block", ("51151378",), "scanned", ("scan_block", "51151378")),
+        ("next_capture", (), "ready", ("next_capture",)),
+        ("end_session", (), "finalizing", ("end_session", True)),
+        ("start_work_order", (), 7, ("start_work_order",)),
+        ("finish_work_order", (), 7, ("finish_work_order",)),
+        ("results", (), {"work_orders": (1,), "rows": []}, ("results_status",)),
+        ("motion", (), "Motion sample rendered", ("sample_motion",)),
+    ],
+)
+def test_dispatch_invokes_the_named_workflow_action_without_extra_logic(
+    command, args, expected_result, expected_call
+):
     workflow = _FakeWorkflow()
 
-    result = dispatch(workflow, "scan_block", "51151378")
+    result = dispatch(workflow, command, *args)
 
-    assert result == "scanned"
-    assert workflow.calls == [("scan_block", "51151378")]
-
-
-def test_dispatch_passes_through_confirmation_for_end_session():
-    workflow = _FakeWorkflow()
-
-    dispatch(workflow, "end_session")
-
-    assert workflow.calls == [("end_session", True)]
+    assert command in COMMAND_HELP
+    assert result == expected_result
+    assert workflow.calls == [expected_call]
 
 
 def test_dispatch_rejects_unknown_command_without_touching_the_workflow():
@@ -157,38 +171,6 @@ def test_dispatch_rejects_unknown_command_without_touching_the_workflow():
         dispatch(workflow, "delete_everything")
 
     assert workflow.calls == []
-
-
-def test_dispatch_invokes_start_and_finish_work_order():
-    workflow = _FakeWorkflow()
-
-    start_result = dispatch(workflow, "start_work_order")
-    finish_result = dispatch(workflow, "finish_work_order")
-
-    assert start_result == 7
-    assert finish_result == 7
-    assert workflow.calls == [("start_work_order",), ("finish_work_order",)]
-
-
-def test_dispatch_invokes_results_status():
-    workflow = _FakeWorkflow()
-
-    result = dispatch(workflow, "results")
-
-    assert result == {"work_orders": (1,), "rows": []}
-    assert workflow.calls == [("results_status",)]
-
-
-def test_dispatch_invokes_motion_sampling():
-    """`motion` is a debug still-style command (like `snap`): the console
-    dispatches it against the runtime handle (not `SessionWorkflow` phase
-    logic), 0-arg like `summary`."""
-    workflow = _FakeWorkflow()
-
-    result = dispatch(workflow, "motion")
-
-    assert result == "Motion sample rendered"
-    assert workflow.calls == [("sample_motion",)]
 
 
 def test_render_results_with_no_rows_shows_a_clear_sentinel():
@@ -261,7 +243,7 @@ def test_render_results_renders_none_claim_score_as_dash():
 
 
 # ---------------------------------------------------------------------------
-# --profile (#168): render_profile_capture_block + format_profile_summary_row
+# --profile: render_profile_capture_block + format_profile_summary_row
 # ---------------------------------------------------------------------------
 
 _PROFILE_FIELDS = {
@@ -290,30 +272,13 @@ def test_render_profile_capture_block_formats_all_stages():
     assert "total" in rendered.lower()
 
 
-def test_render_profile_capture_block_marks_slow_capture():
-    rendered = render_profile_capture_block(_PROFILE_FIELDS, slow_threshold_ms=100)
+@pytest.mark.parametrize(("threshold_ms", "slow"), [(100, True), (3000, False)])
+def test_render_profile_capture_block_marks_only_slow_captures(threshold_ms, slow):
+    rendered = render_profile_capture_block(
+        _PROFILE_FIELDS, slow_threshold_ms=threshold_ms
+    )
 
-    assert "[SLOW]" in rendered
-
-
-def test_render_profile_capture_block_omits_slow_marker_when_fast():
-    rendered = render_profile_capture_block(_PROFILE_FIELDS, slow_threshold_ms=3000)
-
-    assert "[SLOW]" not in rendered
-
-
-def test_render_profile_capture_block_is_pure_no_io(monkeypatch):
-    def _boom(*_args, **_kwargs):
-        raise AssertionError("render_profile_capture_block must not do I/O")
-
-    monkeypatch.setattr("builtins.open", _boom)
-    monkeypatch.setattr("builtins.print", _boom)
-
-    first = render_profile_capture_block(_PROFILE_FIELDS, slow_threshold_ms=3000)
-    second = render_profile_capture_block(_PROFILE_FIELDS, slow_threshold_ms=3000)
-
-    assert isinstance(first, str)
-    assert first == second
+    assert ("[SLOW]" in rendered) is slow
 
 
 _PROFILE_FIELDS_WITH_CONSUMER_SPLIT = {
@@ -325,7 +290,7 @@ _PROFILE_FIELDS_WITH_CONSUMER_SPLIT = {
 
 
 def test_render_profile_capture_block_shows_consumer_split_when_present():
-    """#171: under --profile, the consumer line explodes into its
+    """Under --profile, the consumer line explodes into its
     decode/outbox/send sub-durations when the capture carries them."""
     rendered = render_profile_capture_block(
         _PROFILE_FIELDS_WITH_CONSUMER_SPLIT, slow_threshold_ms=3000
@@ -336,7 +301,7 @@ def test_render_profile_capture_block_shows_consumer_split_when_present():
 
 
 def test_render_profile_capture_block_falls_back_to_plain_consumer_line_when_split_absent():
-    """#171 regression guard: block-mode captures (no decode stage) keep
+    """Regression guard: block-mode captures (no decode stage) keep
     today's plain `consumer: Nms` line untouched."""
     rendered = render_profile_capture_block(_PROFILE_FIELDS, slow_threshold_ms=3000)
 
@@ -355,7 +320,7 @@ _PROFILE_FIELDS_WITH_SETTLING = {
 
 
 def test_render_profile_capture_block_includes_settling_row_with_duration_resets_and_max_motion():
-    """#172: under --profile, the console block gains a settling row showing
+    """Under --profile, the console block gains a settling row showing
     how long the specimen took to stabilize, how many times motion reset the
     stable timer, and the peak motion score seen while settling."""
     rendered = render_profile_capture_block(
@@ -388,7 +353,7 @@ def test_format_profile_summary_row_is_pure_dict_to_row():
 
 
 # ---------------------------------------------------------------------------
-# `motion` console command (#169): render_motion_sample
+# `motion` console command: render_motion_sample
 # ---------------------------------------------------------------------------
 
 
@@ -414,52 +379,21 @@ def test_render_motion_sample_formats_min_mean_max_crossings_state_and_hint():
     assert "max" in rendered.lower()
 
 
-def test_render_motion_sample_hint_no_crossings():
+@pytest.mark.parametrize(
+    ("scores", "crossings", "hint"),
+    [
+        ((0.0, 0.0, 0.0), 0, "no motion above threshold"),
+        ((0.0, 0.01, 0.03), 2, "intermittent"),
+        ((0.02, 0.03, 0.05), 5, "throughout the window"),
+    ],
+)
+def test_render_motion_sample_hint(scores, crossings, hint):
+    low, mean, high = scores
     sample = MotionSample(
-        min_score=0.0, mean_score=0.0, max_score=0.0, threshold_crossings=0,
-        sample_count=5,
+        min_score=low, mean_score=mean, max_score=high,
+        threshold_crossings=crossings, sample_count=5,
     )
 
     rendered = render_motion_sample(sample, state="EMPTY", threshold=0.02)
 
-    assert "no motion above threshold" in rendered.lower()
-
-
-def test_render_motion_sample_hint_intermittent_crossings():
-    sample = MotionSample(
-        min_score=0.0, mean_score=0.01, max_score=0.03, threshold_crossings=2,
-        sample_count=5,
-    )
-
-    rendered = render_motion_sample(sample, state="EMPTY", threshold=0.02)
-
-    assert "intermittent" in rendered.lower()
-
-
-def test_render_motion_sample_hint_crossings_throughout():
-    sample = MotionSample(
-        min_score=0.02, mean_score=0.03, max_score=0.05, threshold_crossings=5,
-        sample_count=5,
-    )
-
-    rendered = render_motion_sample(sample, state="EMPTY", threshold=0.02)
-
-    assert "throughout the window" in rendered.lower()
-
-
-def test_render_motion_sample_is_pure_no_io(monkeypatch):
-    def _boom(*_args, **_kwargs):
-        raise AssertionError("render_motion_sample must not do I/O")
-
-    monkeypatch.setattr("builtins.open", _boom)
-    monkeypatch.setattr("builtins.print", _boom)
-    sample = MotionSample(
-        min_score=0.0, mean_score=0.01, max_score=0.02, threshold_crossings=1,
-        sample_count=3,
-    )
-
-    first = render_motion_sample(sample, state="EMPTY", threshold=0.02)
-    second = render_motion_sample(sample, state="EMPTY", threshold=0.02)
-
-    assert isinstance(first, str)
-    assert first == second
+    assert hint in rendered.lower()

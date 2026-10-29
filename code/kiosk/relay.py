@@ -1,4 +1,4 @@
-"""The kiosk read/write core -- HTTP-free and thread-aware (#121 / 119a).
+"""The kiosk read/write core -- HTTP-free and thread-aware.
 
 ``KioskRelay`` is the non-owning seam between the touchscreen and the live
 session. It holds the SAME handle the console uses (in production a
@@ -11,7 +11,7 @@ Two seams, deliberately asymmetric on locking:
   (``snapshot``/``summarize``/``events``) into JSON-safe values. It is
   lock-free on purpose: these are independent reads, and holding the write
   lock across a network RPC would stall taps. A dropped store link surfaces as
-  ``online: False`` rather than an exception -- the seam 119c's banner builds on.
+  ``online: False`` rather than an exception, which the offline banner builds on.
 * **Write** (:meth:`command`) routes a tap through the existing
   ``session_console.dispatch`` verbs under the relay's OWN lock, serializing
   concurrent browser taps. It must not share the runtime's lock: camera verbs
@@ -30,7 +30,7 @@ from kiosk.attention import project_attention_banner
 from kiosk.inspection import InspectionDescriptor, project_inspection
 from kiosk.results_table import project_results_table
 from kiosk.router import effective_engaged, select_screen
-from store.remote import TransportError
+from transport.remote import TransportError
 from session.console import dispatch
 from session.profile_report import profile_screen_fields
 from session.session_mode import SessionMode
@@ -84,33 +84,32 @@ class KioskRelay:
             "latest_block_id": snapshot.latest_block_id,
             "latest_block_status": snapshot.latest_block_status,
             # scanned-but-not-yet-captured block id (screens 07/18). Forwarded
-            # from capture_status (dropped pre-119c); None on a bare workflow.
+            # from capture_status; None on a bare workflow.
             "pending_block_id": capture.get("pending_block_id") if capture else None,
             # scanned slide id for the screen 12 positive scan indicator
             # ("SCANNED: <id> - place slide"); None until a slide is scanned.
             "pending_slide_id": capture.get("pending_slide_id") if capture else None,
             # "N captured" status-bar signal on screen 06.
             "captured": summary.sets_processed,
-            # #188: any block ever captured this session, regardless of verdict
+            # any block ever captured this session, regardless of verdict
             # status -- the boot chooser's "is there real work to resume" signal.
             # getattr keeps it None-safe for bare-summary test fakes (degradation
             # invariant, same pattern as missing_slides/remaining below).
             "blocks_captured": getattr(summary, "blocks_captured", 0),
             # slides ready-and-awaiting capture (screen 12 "N remaining").
             # missing_slides = blocks preprocessed but not yet verdicted; the
-            # locked WS-C decision fixes remaining = len(missing_slides). getattr
+            # design decision: remaining = len(missing_slides). getattr
             # keeps it None-safe for bare-summary test fakes (degradation invariant).
             "remaining": len(getattr(summary, "missing_slides", ()) or ()),
             "pass_count": summary.pass_count,
             "review_count": summary.review_count,
             "event_count": len(events),
             "last_event": _event_dict(last) if last is not None else None,
-            # #250 review F1: a dedicated, renderable field for "why did
-            # Finish Blocks bounce back to block capture" -- deliberately NOT
-            # overloading `last_event` (that field is consumed purely as a
-            # dedupe key for the duplicate-scan flash today, never rendered
-            # as text). Surfaces only while it IS the most recent event, so
-            # any later event (e.g. a fresh block scan) naturally clears it.
+            # a renderable "why did Finish Blocks bounce
+            # back" field. Deliberately not overloading `last_event`, which is
+            # consumed as a dedupe key and never rendered as text. Surfaces
+            # only while it is the most recent event, so any later event
+            # clears it.
             "hybrid_pool_bounce_message": (
                 last.message if last is not None
                 and last.kind == "hybrid_pool_freeze_insufficient_blocks"
@@ -118,13 +117,14 @@ class KioskRelay:
             ),
             # fine-grained capture-layer signals (None on a bare workflow)
             "capture_state": capture["capture_state"] if capture else None,
+            "led_only_blocks": capture.get("led_only_blocks", False) if capture else False,
             "capture_mode": capture["capture_mode"] if capture else None,
             "latest_verdict": latest_verdict,
             "current_capture_id": current_capture_id,
             "pending_capture_id": (
                 pending_capture.get("capture_id") if pending_capture else None
             ),
-            # #257: server-side pause state (View Results while a
+            # server-side pause state (View Results while a
             # slide-capture work order is open). Read-only projection, same
             # degrading getattr shape as open_retrieval/work_order_open --
             # never a router input, just visibility for the operator/tests.
@@ -136,75 +136,68 @@ class KioskRelay:
             # Navigation is operator-owned: ready data enables the destination,
             # but results open only after VIEW RESULTS is tapped.
             "view_results_guard": bool(ui.get("view_results_guard", False)),
-            # #256: client-owned nav flag for the attention correction-flow
+            # client-owned nav flag for the attention correction-flow
             # screen, same guard+data pattern as finish_blocks_guard/
             # view_results_guard above.
             "recapture_guard": bool(ui.get("recapture_guard", False)),
-            # results table (#150/#252): every results-ready work order's
+            # results table: every results-ready work order's
             # per-slide verdict rows this session (NORMAL/OPEN_RETRIEVAL), or
             # every Hybrid/Hybrid Shadow slide capture across every work
             # order, scored or not (`SessionWorkflow.results_status` picks
             # the source by session mode). None on a bare workflow -> () / [].
             "results_ready_work_orders": results_ready_work_orders,
             "results_rows": projected_rows,
-            # #155: plain attribute reads (not the getattr+callable method
+            # plain attribute reads (not the getattr+callable method
             # shape above) -- PiCaptureRuntime exposes these as booleans, not
             # callables. Degrades to False on a bare SessionWorkflow handle.
             "open_retrieval": bool(getattr(self._handle, "open_retrieval", False)),
             "work_order_open": work_order_open,
             "has_work_orders": self._has_work_orders(),
-            # #256: the third, non-interrupting attention layer -- a pure
-            # projection over the SAME rows already fetched above, degrading
-            # to None (no banner) rather than raising (see
-            # `_attention_banner`'s own docstring for the blast-radius
-            # guard). None for NORMAL/OPEN_RETRIEVAL and whenever no Hybrid
-            # slide currently carries an ERROR verdict.
+            # the non-interrupting attention layer, a projection over
+            # the rows already fetched above. Degrades to None (no banner)
+            # rather than raising; see `_attention_banner`'s docstring.
             "attention": self._attention_banner(
                 projected_rows, work_order_open=work_order_open,
             ),
-            # #247: the single explicit session scoring mode, JSON-safe as
-            # its string value ("normal"/"open_retrieval"/"hybrid"/
-            # "hybrid_shadow"). Degrades to "normal" on a bare workflow
-            # handle (no `.session_mode` attribute), same getattr-default
-            # shape as `open_retrieval` above. The router does not branch on
-            # this key yet -- it is exposed now so it can without new
-            # attribute lookups once Hybrid behavior lands.
+            # the session scoring mode as its JSON-safe string value.
+            # Degrades to "normal" on a bare workflow handle, same getattr
+            # shape as `open_retrieval` above.
             "mode": self._mode_value(),
         }
         state["effective_engaged"] = effective_engaged(state)
         state["screen"] = select_screen(state)
-        # #258: the queue-count/stage/timing affordance is added to `state`
-        # ONLY while `--profile` is on -- never present as an always-there
-        # key degrading to None/False like everything above. That is the
-        # enforcement for "without --profile, no queue count, stage, or
-        # timing field appears anywhere in the operator view": the key is
-        # simply absent from the JSON the touchscreen renders, not merely
-        # null.
+        # added to `state` ONLY while `--profile` is on, never as an
+        # always-there key degrading to None like everything above. Absence
+        # from the JSON is the enforcement that no queue count, stage or
+        # timing field reaches the operator view without `--profile`.
         profile_fields = self._profile_fields()
         if profile_fields is not None:
             state["profile"] = profile_fields
         return state
 
+    def _from_handle(self, name: str, *args: str) -> Any:
+        """Degrading getattr+callable read shared by the handle proxies below:
+        call ``self._handle.<name>(*args)`` when the handle exposes a callable
+        attribute of that name, else ``None`` (a bare ``SessionWorkflow`` test
+        double, or an older handle predating the method)."""
+        reader = getattr(self._handle, name, None)
+        return reader(*args) if callable(reader) else None
+
     def _capture_status(self) -> dict[str, str] | None:
         """Read the capture-layer state/mode if the handle exposes it (the Pi
         runtime does; a bare ``SessionWorkflow`` in tests does not)."""
-        reader = getattr(self._handle, "capture_status", None)
-        return cast("dict[str, str]", reader()) if callable(reader) else None
+        return cast("dict[str, str] | None", self._from_handle("capture_status"))
 
     def _pending_capture_status(self) -> dict[str, str] | None:
         """Read-only projection of the held still for the review gate."""
-        reader = getattr(self._handle, "pending_capture_status", None)
-        if not callable(reader):
-            return None
-        status = reader()
+        status = self._from_handle("pending_capture_status")
         return cast("dict[str, str]", status) if status else None
 
     def _results_status(self) -> dict[str, Any] | None:
         """Read the results-ready work orders + verdict rows if the handle
         exposes them (same degrading getattr+callable shape as
         ``capture_status``); ``None`` on a bare ``SessionWorkflow`` handle."""
-        reader = getattr(self._handle, "results_status", None)
-        return cast("dict[str, Any]", reader()) if callable(reader) else None
+        return self._from_handle("results_status")
 
     def _has_work_orders(self) -> bool:
         """Read durable work-order history; False on older/bare handles."""
@@ -224,7 +217,7 @@ class KioskRelay:
     def _attention_banner(
         self, rows: list[dict[str, Any]], *, work_order_open: bool,
     ) -> dict[str, Any] | None:
-        """#256: the third, non-interrupting attention layer.
+        """The third, non-interrupting attention layer.
 
         HYBRID/HYBRID_SHADOW only -- an explicit second gate, not merely an
         accident of what data happens to exist (NORMAL/OPEN_RETRIEVAL rows
@@ -251,27 +244,21 @@ class KioskRelay:
             return None
 
     def _profile_fields(self) -> dict[str, Any] | None:
-        """#258: the touchscreen half of the shared ``--profile`` Hybrid
-        queue/timing display -- ``None`` (never rendered) unless the LAUNCH
+        """The touchscreen half of the shared ``--profile`` Hybrid
+        queue/timing display -- ``None`` (never rendered) unless the launch
         flag itself is on.
 
-        Checks ``getattr(self._handle, "profile", False)`` directly, rather
-        than trusting ``hybrid_profile_status`` (or the store's own
-        ``profile_enabled`` row filter underneath it) to keep the affordance
-        hidden by itself -- ``.profile`` is a plain attribute
-        ``RunPiSession`` sets from its own ``--profile`` CLI flag, degrading
-        to ``False`` on a bare ``SessionWorkflow`` test handle exactly like
-        ``open_retrieval``/``work_order_open`` above. This is the SAME
-        pattern ``format_profile_console`` (console) reads via its own
-        caller's ``self.profile`` check -- two independent readers of one
-        boolean, not two decisions.
+        Checks the handle's plain ``.profile`` attribute (set from the
+        ``--profile`` CLI flag; ``False`` on a bare ``SessionWorkflow``)
+        directly rather than trusting ``hybrid_profile_status`` to hide the
+        affordance by itself. ``format_profile_console`` reads the same
+        flag on the console side: two independent readers of one boolean,
+        not two decisions.
 
         Wrapped in its own try/except (same shape as ``_attention_banner``):
-        this runs on the kiosk poll path, so any unexpected failure
-        (including one ``hybrid_profile_status`` itself failed to degrade)
-        must still leave the poll -- and the camera loop underneath it --
-        alive rather than raising up to ``_camera_loop``'s bare
-        ``except Exception``.
+        this runs on the kiosk poll path, so any unexpected failure must
+        leave the poll and the camera loop alive rather than raising up to
+        ``_camera_loop``'s bare ``except Exception``.
         """
         if not bool(getattr(self._handle, "profile", False)):
             return None
@@ -294,22 +281,20 @@ class KioskRelay:
     def _mode_value(self) -> str:
         """JSON-safe session-mode string; degrades to "normal" when the
         handle has no `.session_mode` attribute (bare `SessionWorkflow` test
-        doubles, or an older handle predating #247)."""
+        doubles, or an older handle without it)."""
         mode = getattr(self._handle, "session_mode", None)
         return mode.value if isinstance(mode, SessionMode) else SessionMode.NORMAL.value
 
     def review_still_jpeg(self) -> bytes | None:
         """Read-only JPEG bytes for ``GET /review-still`` (None when none)."""
-        reader = getattr(self._handle, "review_still_jpeg", None)
-        return reader() if callable(reader) else None
+        return self._from_handle("review_still_jpeg")
 
     def latest_preview_jpeg(self) -> bytes | None:
         """Read-only JPEG bytes for ``GET /preview-frame`` (None when none)."""
-        reader = getattr(self._handle, "latest_preview_jpeg", None)
-        return reader() if callable(reader) else None
+        return self._from_handle("latest_preview_jpeg")
 
     def inspection_descriptors(self, capture_id: str) -> list[InspectionDescriptor] | None:
-        """Ordered contact-sheet descriptors (#153) for one results-ready
+        """Ordered contact-sheet descriptors for one results-ready
         slide, via ``kiosk.inspection.project_inspection``. Looks the row up
         by ``capture_id`` from the same live ``results_status()`` rows the
         results table reads -- so the client never has to replicate the
@@ -329,19 +314,17 @@ class KioskRelay:
         return project_inspection(row)
 
     def inspection_sheet_bytes(self, path: str) -> bytes | None:
-        """Read-only contact-sheet PNG bytes for ``GET /inspection-sheet``
-        (#151): same degrading getattr+callable seam as
+        """Read-only contact-sheet PNG bytes for ``GET /inspection-sheet``.
+        Same degrading getattr+callable seam as
         ``review_still_jpeg``/``latest_preview_jpeg``. None on a bare handle
         without the method, or when the handle has nothing at ``path``."""
-        reader = getattr(self._handle, "inspection_sheet_bytes", None)
-        return reader(path) if callable(reader) else None
+        return self._from_handle("inspection_sheet_bytes", path)
 
     def results_evidence_bytes(self, path: str) -> bytes | None:
-        """Read-only claim-artifact JPEG bytes for ``GET /results-evidence``
-        (#236): same degrading getattr+callable seam as
+        """Read-only claim-artifact JPEG bytes for ``GET /results-evidence``.
+        Same degrading getattr+callable seam as
         ``inspection_sheet_bytes``."""
-        reader = getattr(self._handle, "results_evidence_bytes", None)
-        return reader(path) if callable(reader) else None
+        return self._from_handle("results_evidence_bytes", path)
 
     # -- write path --------------------------------------------------------
     def command(self, name: str, *args: str) -> object:
@@ -350,6 +333,26 @@ class KioskRelay:
         verbs raise ``ValueError`` from ``dispatch`` (nothing is mutated)."""
         with self._lock:
             return dispatch(self._handle, name, *args)
+
+    # -- capture settings (gear panel) -------------------------------------
+    def settings_status(self) -> dict[str, Any] | None:
+        """Settings rows + editability for ``GET /settings``; None on a bare handle."""
+        return self._from_handle("settings_status")
+
+    def set_setting(self, name: str, value: object) -> dict[str, Any]:
+        """Apply one setting under the tap lock; errors propagate to the server."""
+        with self._lock:
+            return self._settings_writer("set_setting")(name, value)
+
+    def reset_settings(self) -> dict[str, Any]:
+        with self._lock:
+            return self._settings_writer("reset_settings")()
+
+    def _settings_writer(self, name: str):
+        writer = getattr(self._handle, name, None)
+        if not callable(writer):
+            raise ValueError("capture settings are unavailable")
+        return writer
 
 
 def _scan_events(events) -> tuple[dict[str, Any] | None, str | None]:

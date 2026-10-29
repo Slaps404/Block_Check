@@ -4,8 +4,7 @@ The production mask supplies immutable seed components. Candidate pixels may
 expand those components, but competing labels retain a background boundary.
 Only short paths made entirely of selective dark-brown pixels can authorize a
 seed-label union. This module holds the growth CORE used by production
-block preparation (`grow_block_mask`). Historical diagnostic harnesses were
-removed in issue #206; use `docs/mvp_tuning_log/` for the promotion evidence.
+block preparation (`grow_block_mask`).
 """
 from __future__ import annotations
 

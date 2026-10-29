@@ -64,8 +64,8 @@ def radial_normalize_mask(mask: np.ndarray, mode: str = "rms") -> np.ndarray:
 
     Production uses RMS radius, so every foreground pixel contributes and a
     remote residual component pulls in proportion to its area and squared
-    distance. ``mode="max"`` preserves the previous farthest-pixel estimator
-    for reproducible diagnostics.
+    distance. ``mode="max"`` uses the farthest-pixel estimator, kept for
+    reproducible diagnostics.
     """
     if mode not in {"rms", "max"}:
         raise ValueError("normalization mode must be 'rms' or 'max'")

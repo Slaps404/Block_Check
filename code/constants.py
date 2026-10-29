@@ -1,7 +1,6 @@
 """Central tunable constants for the v2 claimed-pair pipeline.
 
 Add new MVP tuning knobs here (not inline in consumer modules).
-Log changes in docs/mvp_tuning_log.md.
 
 Pipeline order: preparation (label mask / ROI crop → segment → clip) → gates → scorer.
 """
@@ -17,7 +16,7 @@ from pathlib import Path
 MIN_CONTOUR_AREA: int = 100
 MAX_ASPECT_RATIO: float = 10.0
 MAX_MASK_COVERAGE: float = 0.95
-# Outer band zeroed on slide masks; see mvp_tuning_log 002.
+# Outer band zeroed on slide masks.
 SLIDE_BORDER_INSET_FRAC: float = 0.07
 # Opposite-tag artifact dots removed by spatial CC filter after segmentation.
 SLIDE_OPPOSITE_TAG_ARTIFACT_MAX_AREA: int = 2500
@@ -46,9 +45,9 @@ SLIVER_ASPECT_RATIO: float = 25.0
 
 BLOCK_CLOSE_KERNEL: int = 25
 BLOCK_INSET_FRAC: float = 0.13
-# CC inside-fraction clip threshold; see tuning iteration 031.
+# CC inside-fraction clip threshold.
 BLOCK_CLIP_MIN_INSIDE_FRAC: float = 0.5
-# Pre-seg crop buffer beyond cassette window; see tuning iteration 031.
+# Pre-seg crop buffer beyond cassette window.
 BLOCK_SEG_BUFFER_FRAC: float = 0.20
 
 # ---------------------------------------------------------------------------
@@ -78,24 +77,24 @@ BLOCK_DARK_YELLOW_HUE_MAX: int = 55
 BLOCK_DARK_YELLOW_SAT_MIN: int = 14
 BLOCK_DARK_YELLOW_VAL_MAX: int = 230
 
-# Near-black dense tissue (HSV value); see docs/mvp_tuning_log/028.
+# Near-black dense tissue (HSV value).
 BLOCK_DARK_TISSUE_VAL_MAX: int = 40
 
-# Seed-anchored halo grow past hue-45 cutoff; see docs/mvp_tuning_log/029.
+# Seed-anchored halo grow past hue-45 cutoff.
 BLOCK_HALO_GROW_HUE_MAX: int = 60
 BLOCK_HALO_GROW_LAB_B_MIN: int = 170
 BLOCK_HALO_GROW_SAT_MIN: int = 60
 
-# Relaxed halo gate for blue-paraffin blocks only; see docs/mvp_tuning_log § blue-paraffin halo.
+# Relaxed halo gate for blue-paraffin blocks only.
 BLOCK_HALO_GROW_BLUE_HUE_MAX: int = 95
 BLOCK_HALO_GROW_BLUE_LAB_B_MIN: int = 115
 
-# Blue-paraffin wax detector thresholds; see docs/mvp_tuning_log § blue-paraffin halo.
+# Blue-paraffin wax detector thresholds.
 BLUE_PARAFFIN_WAX_SAT_MIN: int = 165
 BLUE_PARAFFIN_WAX_LAB_B_MAX: int = 100
 BLUE_PARAFFIN_SEED_DILATE_PX: int = 30
 
-# Topology-preserving growth predicates; see tuning iteration 037.
+# Topology-preserving growth predicates.
 BLOCK_GROW_SELECTIVE_HUE_MAX: int = 12
 BLOCK_GROW_SELECTIVE_SAT_MIN: int = 100
 BLOCK_GROW_SELECTIVE_VALUE_MAX: int = 100
@@ -104,7 +103,7 @@ BLOCK_GROW_LOOSE_VALUE_MAX: int = 60
 # Component size gates
 BLOCK_AREA_MAX_FRAC: float = 0.04
 MIN_BLOCK_COMPONENT_AREA: int = 500
-# Relative speck floor vs largest block blob; see docs/mvp_tuning_log/036.
+# Relative speck floor vs largest block blob.
 BLOCK_MIN_COMPONENT_REL_AREA: float = 0.003
 
 # ---------------------------------------------------------------------------
@@ -121,16 +120,16 @@ MIN_AREA_FRACTION: float = 0.000008
 SEGMENTATION_REFERENCE_WIDTH: int = 4056  # px width the slide spatial controls were tuned at
 
 # Component size gates
-MIN_SLIDE_COMPONENT_AREA: int = 450   # absolute px floor; see mvp_tuning_log/027
+MIN_SLIDE_COMPONENT_AREA: int = 450   # absolute px floor
 # Curved, narrow tissue has low bounding-box fill despite substantial area.
 # Keep the dust guard while retaining the live 53910454 esophagus strands.
 SLIDE_FILL_MIN: float = 0.03
-# Relative speck floor; see docs/mvp_tuning_log/024_slide_relative_component_floor.md.
+# Relative speck floor.
 SLIDE_MIN_COMPONENT_REL_AREA: float = 0.01
 SLIDE_SMALL_FILL_MIN: float = 0.18
 SLIDE_CLOSE_KERNEL: int = 5
 
-# H&E stain gate (iterations 010, 017)
+# H&E stain gate
 SLIDE_SAT_FLOOR: int = 12
 SLIDE_TEXTURE_WINDOW: int = 9
 SLIDE_TEXTURE_FLOOR: float = 1.5
@@ -141,7 +140,7 @@ SLIDE_SCORE_CEILING: int = 14
 SLIDE_LAB_A_MIN: int = 130
 SLIDE_VAL_MAX: int = 252
 
-# Coverslip rainbow / green-iridescence filter (iteration 026)
+# Coverslip rainbow / green-iridescence filter
 SLIDE_IRIDESCENCE_FILTER_ENABLED: bool = True
 SLIDE_IRIDESCENCE_GREEN_MARGIN: int = 3       # g exceeds r and b by this much
 SLIDE_IRIDESCENCE_REACH_PX: int = 15          # dilation radius around green px
@@ -171,7 +170,7 @@ LABEL_MORPH_FRAC: float = 0.018
 # 9. Scorer  (scorer.py, locked_alignment.py)
 # ---------------------------------------------------------------------------
 
-# RMS-grid dense/sparse router threshold; see tuning iterations 033 and 048
+# RMS-grid dense/sparse router threshold
 SHAPE_ROUTER_SIZE_THRESHOLD: float = 0.0194
 # PASS / REVIEW decision (uncalibrated placeholder, do not use for production yet)
 PASS_THRESHOLD: float = 0.85
@@ -185,11 +184,11 @@ POINT_LAYOUT_AREA_WEIGHT: float = 0.25
 POINT_LAYOUT_SHAPE_WEIGHT: float = 0.10
 
 # ---------------------------------------------------------------------------
-# 10. Live capture profiling (--profile, #168)
+# 10. Live capture profiling (--profile)
 # ---------------------------------------------------------------------------
 
 # Total-capture-ms threshold above which the profile console block marks a
-# capture [SLOW] (uncalibrated placeholder, no field data yet -- see #168).
+# capture [SLOW] (uncalibrated placeholder, no field data yet).
 PROFILE_SLOW_CAPTURE_MS: int = 3000
 
 # Native Pi sensor/capture contract. This is deliberately separate from the
@@ -205,7 +204,7 @@ CAPTURE_DIMENSIONS: dict[str, tuple[int, int]] = {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Live capture motion sampling (`motion` console command, #169)
+# 11. Live capture motion sampling (`motion` console command)
 # ---------------------------------------------------------------------------
 
 # Duration the `motion` command polls sampled motion scores from the running
@@ -218,7 +217,7 @@ MOTION_SAMPLE_WINDOW_S: float = 3.0
 
 # Consecutive preview classifications required before a presence, absence, or
 # motion change is treated as real. At the Pi's 10 fps preview rate this is
-# roughly 200 ms; tune only from profiled hardware evidence (issue #211).
+# roughly 200 ms; tune only from profiled hardware evidence.
 SETTLING_CONFIRMATION_FRAMES: int = 2
 
 # Periodic flush cadence for `MotionCurveWriter`'s Pi-local motion_curve.csv.
@@ -226,3 +225,53 @@ SETTLING_CONFIRMATION_FRAMES: int = 2
 # per-frame motion rows, on top of whatever explicit state-change/capture
 # flushes already happened.
 MOTION_CURVE_FLUSH_INTERVAL_S: float = 2.0
+
+# ---------------------------------------------------------------------------
+# 13. Capture illumination (`capture.illumination.py`)
+# ---------------------------------------------------------------------------
+
+# PT4115 DIM is driven as a digital signal. These are provisional hardware
+# knobs, kept here as the single source of truth.
+ILLUMINATION_GPIO_PIN: int = 17
+ILLUMINATION_LEAD_DELAY_S: float = 0.010
+ILLUMINATION_TAIL_DELAY_S: float = 0.005
+ILLUMINATION_MANUAL_TIMEOUT_S: float = 30.0
+
+# Preview backlight (BCM 27), PWM-dimmed so the unlit preview still shows
+# motion. It is driven low before every coaxial block still so only the
+# coaxial LED lights the frame, then restored to the preview level.
+BACKLIGHT_GPIO_PIN: int = 27
+BACKLIGHT_PREVIEW_BRIGHTNESS: float = 0.50
+BACKLIGHT_SETTLE_DELAY_S: float = 0.030
+
+TRIPLE_CAPTURE_VARIANTS: tuple[str, ...] = (
+    "coax",
+    "backlight",
+    "neutral_oblique",
+)
+
+# Heuristic block-capture calibration from Pi striping trials.
+# These values target usable intensity separation and texture signal, not
+# visual appearance. They apply only to the opt-in triple-capture variants.
+TRIPLE_CAPTURE_EXPOSURES_US: dict[str, int] = {
+    "coax": 33333,
+    "backlight": 40000,
+    "neutral_oblique": 150000,
+}
+
+# Optional training-capture light. A MOSFET on BCM 22 drives the neutral /
+# oblique source. The MOSFET gate is PWM-driven in triple-capture mode. It is
+# only opened when the opt-in triple-capture flag is set, so ordinary sessions
+# do not require this hardware.
+NEUTRAL_OBLIQUE_GPIO_PIN: int = 22
+# Full output is the default so the neutral/oblique training image has the
+# maximum available signal unless the operator selects a lower PWM level.
+NEUTRAL_OBLIQUE_BRIGHTNESS: float = 1.0
+
+# Calibration refuses to lock a baseline whose empty-field luma median falls
+# below this (0-255). Presence and motion detection both compare live preview
+# frames against that baseline, so a dark field yields a baseline that can
+# detect nothing and strands the session. The floor only catches an
+# effectively black field -- a backlight that is off, failed, or unplugged --
+# and is deliberately far below any working exposure. Uncalibrated placeholder.
+CALIBRATION_MIN_BACKGROUND_LUMA: float = 8.0

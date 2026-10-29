@@ -1,4 +1,4 @@
-"""#258: the shared pure Hybrid ``--profile`` formatter.
+"""The shared pure Hybrid ``--profile`` formatter.
 
 Both the touchscreen (``code/kiosk/``) and the console render Hybrid queue
 count / per-slide stage timing from THIS module and nothing else, so they
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import json
 from typing import Any, Iterable, Mapping, Sequence
 
-# The five Hybrid worker stages #258 instruments, in pipeline order. This is
+# The five instrumented Hybrid worker stages, in pipeline order. This is
 # the single name authority: `ProcessingStore._score_hybrid_slide`/
 # `_persist_hybrid_profile_result` write these exact keys into
 # `slide_captures.profile_stage_ms_json`, and every reader here (and the
@@ -93,7 +93,7 @@ def _as_int(value: object) -> int | None:
 def _stage_ms_breakdown(raw: object) -> dict[str, int]:
     """Parse a persisted ``profile_stage_ms_json`` value into ints only.
 
-    Tolerates a missing/NULL column (pre-#258 row), unparsable JSON, a
+    Tolerates a missing/NULL column (older row), unparsable JSON, a
     non-mapping payload, and individual stage values that are ``null``
     (a stage that never ran, e.g. a gate-failed slide's selection/scoring)
     -- every one of those degrades to that key simply being absent from the
@@ -122,7 +122,7 @@ def project_profile_rows(
     the display-ready, internal-lifecycle-free ``ProfileRow`` shape.
 
     ``now_ns`` is the ONLY clock value this function ever sees -- it never
-    reads a clock itself. A missing/NULL ``queued_ns`` (a pre-#258 row, or
+    reads a clock itself. A missing/NULL ``queued_ns`` (an older row, or
     one that never captured a queue timestamp for any reason) degrades
     ``elapsed_ms`` to ``None`` rather than raising or fabricating a number.
     """

@@ -1,7 +1,7 @@
 """Real-image regression tests for the dark-absorbance tissue gate.
 
 Verifies that:
-  - Blocks 20 and 21 (dark-core spleen/liver & lung) now have >= 90 % of their
+  - Blocks 20 and 21 (dark-core spleen/liver & lung) have >= 90 % of their
     dark-core pixels covered by the mask.
   - Block 22 (knee, low-coverage regression guard) still has very low total
     mask coverage (< 2.5 %).
@@ -11,16 +11,12 @@ the real image dataset will not fail).
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-_CODE = Path(__file__).resolve().parent.parent / "code"
-if str(_CODE) not in sys.path:
-    sys.path.insert(0, str(_CODE))
 
 from session.preparation import prepare_specimen_from_image, PreparedSpecimen  # noqa: E402
 from block.roi_mask import find_cassette_window  # noqa: E402

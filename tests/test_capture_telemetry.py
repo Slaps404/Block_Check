@@ -1,13 +1,22 @@
-"""Status/event and calibration telemetry tests (issue #86)."""
+"""Status/event and calibration telemetry tests."""
 from __future__ import annotations
 
 import csv
 
 import numpy as np
+import pytest
 
-from capture_runtime import CaptureConfiguration, camera_settings_for
+from capture_runtime import CaptureController, camera_settings_for
 from capture_session import CaptureSession, CaptureState, FrameResult, SessionConfig
-from capture_telemetry import StatusReporter, TelemetryWriter
+from capture_storage import CaptureStore
+from capture_telemetry import (
+    MotionCurveWriter,
+    SettlingObserver,
+    SettlingSummary,
+    StatusReporter,
+    TelemetryWriter,
+)
+from constants import MOTION_CURVE_FLUSH_INTERVAL_S
 
 
 def _empty_frame() -> np.ndarray:
@@ -56,9 +65,6 @@ def test_baseline_scan_retry_error_and_saved_events_are_ui_independent(tmp_path)
     kinds = [event.kind for event in session.drain_events()]
     assert "scan_accepted" in kinds
 
-    # Events are plain data; consuming them performs no console I/O.
-    assert all(isinstance(kind, str) for kind in kinds)
-
 
 def test_per_frame_csv_contains_calibration_contract(tmp_path):
     path = tmp_path / "telemetry.csv"
@@ -95,21 +101,6 @@ def test_per_frame_csv_contains_calibration_contract(tmp_path):
     assert row["event"] == "settling"
 
 
-def test_one_configuration_surface_contains_detection_and_both_roles():
-    config = CaptureConfiguration()
-
-    assert config.session.roi == (0.1, 0.1, 0.9, 0.9)
-    assert config.session.presence_threshold > 0
-    assert config.session.motion_threshold > 0
-    assert config.session.baseline_frames == 20
-    assert config.session.stable_duration == 0.5
-    assert config.session.removal_duration == 0.5
-    assert config.role_settings["slide"].exposure_us == 8333
-    assert config.role_settings["block"].exposure_us == 33333
-    assert config.preview_fps == 10.0
-    assert config.still_dimensions == (4056, 3040)
-
-
 def test_capture_metadata_is_complete_for_both_roles(tmp_path):
     required = {
         "roi",
@@ -127,9 +118,6 @@ def test_capture_metadata_is_complete_for_both_roles(tmp_path):
         "still_dimensions",
     }
 
-    from capture_runtime import CaptureController
-    from capture_storage import CaptureStore
-
     class UnusedCamera:
         pass
 
@@ -145,116 +133,52 @@ def test_capture_metadata_is_complete_for_both_roles(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Settling observer (#172): re-derives settling wait / reset-count / peak
-# motion from the same (now, state, FrameResult) triple StatusReporter.publish
-# already consumes, mirroring summarize_motion_samples's established pattern
-# of re-deriving threshold crossings outside the state machine rather than
-# reading CaptureSession's private _stable_since.
+# Settling observer: re-derives settling wait / reset-count / peak motion
+# from the same (now, state, FrameResult) triple StatusReporter.publish
+# consumes, rather than reading CaptureSession's private _stable_since.
 # ---------------------------------------------------------------------------
 
 
-def test_settling_observer_computes_exact_wait_resets_and_max_motion_for_scripted_flicker_sequence():
-    from capture_telemetry import SettlingObserver, SettlingSummary
-
-    observer = SettlingObserver(threshold=0.02)
-
-    # Entry frame: EMPTY -> SETTLING transition. Motion at entry is below
-    # threshold and must not count as a reset.
-    assert observer.observe(
-        now=0.0,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.01),
-    ) is None
-
-    # Two consecutive motion frames confirm a genuine reset.
-    assert observer.observe(
-        now=0.3,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.05),
-    ) is None
-    assert observer.observe(
-        now=0.5,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.04),
-    ) is None
-
-    # Quiet frame after the reset; no further motion until capture.
-    assert observer.observe(
-        now=1.1,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.01, stable_elapsed=0.6),
-    ) is None
-
-    summary = observer.observe(
-        now=1.5,
-        state=CaptureState.CAPTURE_REQUESTED,
-        frame=FrameResult(
-            motion_score=0.01, stable_elapsed=1.0, capture_requested=True
+@pytest.mark.parametrize(
+    ("frames", "captured_at", "expected"),
+    [
+        # Quiet entry; one two-frame motion run is one reset.
+        (
+            [(0.0, 0.01), (0.3, 0.05), (0.5, 0.04), (1.1, 0.01)],
+            1.5,
+            (1500, 1, 0.05),
         ),
-    )
-
-    assert summary == SettlingSummary(duration_ms=1500, resets=1, max_motion=0.05)
-
-
-def test_settling_observer_flicker_frames_each_count_as_a_reset_and_entry_frame_is_excluded_from_reset_count():
-    from capture_telemetry import SettlingObserver
-
+        # Entry frame motion (the presence transition) is not a reset; two
+        # separate two-frame runs are two resets.
+        (
+            [(0.0, 0.5), (0.2, 0.03), (0.5, 0.04), (0.7, 0.0), (0.9, 0.03), (1.1, 0.04)],
+            1.7,
+            (1700, 2, 0.5),
+        ),
+    ],
+    ids=["quiet-entry", "flicker-entry"],
+)
+def test_settling_observer_computes_wait_resets_and_max_motion(
+    frames, captured_at, expected
+):
     observer = SettlingObserver(threshold=0.02)
 
-    # Entry frame carries motion above threshold (the presence transition
-    # itself) -- per CaptureSession.accept_frame this frame sets
-    # `_stable_since` directly rather than going through the `if moving:
-    # reset` branch, so the observer must not count it as a reset.
-    observer.observe(
-        now=0.0,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.5),
-    )
-
-    # The first two consecutive motion readings make one confirmed reset.
-    observer.observe(
-        now=0.2,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.03),
-    )
-    observer.observe(
-        now=0.5,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.04),
-    )
-    # A quiet frame ends that consecutive run.
-    observer.observe(
-        now=0.7,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.0),
-    )
-    # A separate two-frame run makes the second confirmed reset.
-    observer.observe(
-        now=0.9,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.03),
-    )
-    observer.observe(
-        now=1.1,
-        state=CaptureState.SETTLING,
-        frame=FrameResult(motion_score=0.04),
-    )
-
+    for now, motion in frames:
+        assert observer.observe(
+            now=now, state=CaptureState.SETTLING,
+            frame=FrameResult(motion_score=motion),
+        ) is None
     summary = observer.observe(
-        now=1.7,
+        now=captured_at,
         state=CaptureState.CAPTURE_REQUESTED,
         frame=FrameResult(motion_score=0.0, capture_requested=True),
     )
 
-    assert summary.resets == 2
-    assert summary.max_motion == 0.5
-    assert summary.duration_ms == 1700
+    assert summary == SettlingSummary(*expected)
 
 
 def test_settling_observer_discards_an_abandoned_settling_window_that_never_captures():
-    """An EMPTY->SETTLING->EMPTY round trip that never reaches
-    CAPTURE_REQUESTED must not surface a summary; the window is discarded."""
-    from capture_telemetry import SettlingObserver
+    """A SETTLING window abandoned before CAPTURE_REQUESTED is discarded."""
 
     observer = SettlingObserver(threshold=0.02)
 
@@ -287,16 +211,15 @@ def test_settling_observer_discards_an_abandoned_settling_window_that_never_capt
 
 
 # ---------------------------------------------------------------------------
-# Motion curve writer (#172): buffers per-frame rows in memory, flushed on an
+# Motion curve writer: buffers per-frame rows in memory, flushed on an
 # injectable clock's periodic interval plus explicit event-driven flush()
-# calls -- must NOT reproduce TelemetryWriter's per-record stream.flush(),
-# which is exactly the per-frame-I/O bug this issue avoids repeating.
+# calls. It must NOT flush per record, to avoid per-frame I/O.
 # ---------------------------------------------------------------------------
 
 
 def test_motion_curve_writer_buffers_rows_and_flushes_only_on_state_change_capture_or_periodic_interval(tmp_path):
-    from capture_telemetry import MotionCurveWriter
-
+    # The production interval bounds mid-session data loss to a few seconds.
+    assert 0 < MOTION_CURVE_FLUSH_INTERVAL_S <= 5
     path = tmp_path / "motion_curve.csv"
     now = {"t": 0.0}
     writer = MotionCurveWriter(path, interval=3.0, clock=lambda: now["t"])
@@ -340,47 +263,3 @@ def test_motion_curve_writer_buffers_rows_and_flushes_only_on_state_change_captu
         with path.open(newline="", encoding="utf-8") as stream:
             rows_after_interval = list(csv.DictReader(stream))
         assert len(rows_after_interval) == 4
-
-
-def test_motion_curve_is_written_pi_local_before_any_sync_and_flush_interval_bounds_loss_window(tmp_path):
-    """#172: the periodic flush interval bounds mid-session data loss to a
-    few seconds -- proven by asserting the flush cadence bounds, not by
-    simulating an actual process crash (per the epic's durability note)."""
-    from capture_telemetry import MotionCurveWriter
-    from constants import MOTION_CURVE_FLUSH_INTERVAL_S
-
-    assert 0 < MOTION_CURVE_FLUSH_INTERVAL_S <= 5
-
-    path = tmp_path / "motion_curve.csv"
-    now = {"t": 0.0}
-    writer = MotionCurveWriter(
-        path, interval=MOTION_CURVE_FLUSH_INTERVAL_S, clock=lambda: now["t"]
-    )
-
-    with writer:
-        writer.record(
-            timestamp="t0", state="SETTLING", presence_score=0.11,
-            motion_score=0.01,
-            stable_elapsed=0.0, event="",
-        )
-
-        # Simulate a power loss the instant after this record, without any
-        # explicit flush or __exit__: nothing has hit disk yet because the
-        # flush interval has not elapsed.
-        with path.open(newline="", encoding="utf-8") as stream:
-            rows_before_interval = list(csv.DictReader(stream))
-        assert rows_before_interval == []
-
-        now["t"] = MOTION_CURVE_FLUSH_INTERVAL_S
-        writer.record(
-            timestamp="t1", state="SETTLING", presence_score=0.12,
-            motion_score=0.01,
-            stable_elapsed=0.5, event="",
-        )
-
-        # Once the flush interval elapses, the buffered rows are durable on
-        # Pi-local disk without waiting for an explicit flush() -- bounding
-        # loss on a real power cut to at most one interval's worth of frames.
-        with path.open(newline="", encoding="utf-8") as stream:
-            rows_after_interval = list(csv.DictReader(stream))
-        assert len(rows_after_interval) == 2

@@ -1,12 +1,11 @@
-"""Pure inspection-sheet projection tests (#151, ADR 0009 follow-on).
+"""Pure inspection-sheet projection tests (ADR 0009).
 
 ``kiosk.inspection.project_inspection(row)`` turns one results-table row
-(already carrying ``top_block``/``contact_sheet_dir`` from #151's extended
+(already carrying ``top_block``/``contact_sheet_dir`` from the
 ``list_results_ready_work_orders`` SELECT) into the ordered contact-sheet
 descriptors the kiosk fetches when an operator expands a REVIEW row: the top
-match always, and the claimed block appended only when it disagrees --
-mirrors ``work_order_evaluator.flagged_pairs``. Dict-in/dict-out, no I/O --
-styled exactly like ``kiosk.results_table.project_results_table``.
+match always, and the claimed block appended only when it disagrees (same
+rule as ``work_order_evaluator.flagged_pairs``). Dict-in/dict-out, no I/O.
 """
 from __future__ import annotations
 
@@ -52,12 +51,12 @@ def test_project_inspection_returns_empty_for_pass_rows():
 
 
 def test_project_inspection_returns_empty_for_pending_rows():
-    # #248: PENDING (still scoring) has no verdict evidence to inspect yet.
+    # PENDING (still scoring) has no verdict evidence to inspect yet.
     assert project_inspection(_row(verdict="PENDING")) == []
 
 
 def test_project_inspection_returns_empty_for_error_rows():
-    # #248: ERROR (a system failure) has no verdict evidence either.
+    # ERROR (a system failure) has no verdict evidence either.
     assert project_inspection(_row(verdict="ERROR")) == []
 
 

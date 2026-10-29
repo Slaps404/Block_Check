@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <!--
-  119b generic kiosk renderer (ADR 0004). One data-driven screen painter that
+  Generic kiosk renderer (ADR 0004). One data-driven screen painter that
   can render EVERY screen from GET /catalog, keyed by the routed `screen` id in
-  GET /state. Replaces the 119a single hard-coded screen 06.
+  GET /state.
 
   The look is ported verbatim from the DesignSync wireframe
   (docs/kiosk/design_source/*.dc.html, distilled in docs/kiosk/design_spec.md):
@@ -12,7 +12,7 @@
   1920x1080 stage transform-scaled to fit the touchscreen -- every px is the
   design's own value, so proportions match the mock exactly at any resolution.
 
-  Contract (frozen, issue 119):
+  Contract (frozen):
     * GET /catalog -> { "screens": { "<id>": {headline, sub, sub2?, variant, bg,
       progress_bar, status_bar, buttons[], special} } }. Pure static data;
       fetched once at boot and cached. A copy is embedded below as the offline
@@ -72,7 +72,7 @@
     --bar-border: #222222;
     --bar-fill: #111111;
 
-    /* Results screen (#232, ADR 0010 open-retrieval results). A small, screen-
+    /* Results screen (ADR 0010 open-retrieval results). A small, screen-
        local token set ported verbatim from the finished redesign mock so the
        grouped results table matches it pixel-for-pixel on the 1920x1080 stage
        WITHOUT re-tinting the shared verdict colours other screens use (the
@@ -87,17 +87,13 @@
     --rt-faint: #9a9a9a;
     --rt-pass: #16834a;
     --rt-review: #c93535;
-    /* #248: ERROR (system/artifact failure, amber) and PENDING (still
+    /* ERROR (system/artifact failure, amber) and PENDING (still
        scoring, gray) join PASS/REVIEW as the four operator-visible row
        states (CONTEXT.md "Hybrid Result State"). --rt-unknown is not one of
        the four -- it is the loud, distinct fallback for a state this table
-       does not recognize, replacing the old silent REVIEW/red default.
-       #248-fix: --rt-error was #a35b00, a dark bronze (hue ~34°) that reads
-       as brown rather than amber even though it clears 4.5:1 contrast
-       against white text. #9a6700 (hue ~40°, GitHub Primer's accessible
-       "attention" amber token -- the same white-on-solid-badge use case as
-       this table's loud states) reads as genuine amber and still clears
-       4.5:1 against white. */
+       does not recognize. --rt-error #9a6700 (hue ~40°, GitHub Primer's
+       accessible "attention" amber) reads as genuine amber, not brown, and
+       still clears 4.5:1 contrast against white text. */
     --rt-error: #9a6700;
     --rt-pending: #6b6b6b;
     --rt-unknown: #7b2fb5;
@@ -201,7 +197,7 @@
     border: 1px dashed var(--text-disabled); padding: 18px 30px;
     border-radius: 16px;
   }
-  /* ---- results screen (#232) ------------------------------------------
+  /* ---- results screen ------------------------------------------------
      Ported from the redesign mock. The table variant repurposes the shared
      .content zone into a full-bleed, left-aligned scroll column: the "Results"
      title + session line live INSIDE the scroll area (#results-table) so they
@@ -283,7 +279,7 @@
     align-items: center; cursor: pointer; padding: 4px 0; min-height: 116px;
   }
   .rt-row:focus-visible { outline: 3px solid #6ea8ff; outline-offset: -3px; }
-  /* #248: four operator-visible row states (ERROR/REVIEW/PASS/PENDING) plus
+  /* Four operator-visible row states (ERROR/REVIEW/PASS/PENDING) plus
      rt-unknown, the loud fallback for a state this table does not
      recognize -- see rtStateClass. Same accent-bar/tint pattern for all. */
   .rt-row.rt-review::before, .rt-row.rt-pass::before,
@@ -379,7 +375,7 @@
     border-color: color-mix(in srgb, var(--rt-pending) 20%, transparent);
   }
   /* Loud, not disguised as REVIEW/red: a distinct color for any verdict
-     outside the four known states (should never happen -- #248). */
+     outside the four known states (should never happen). */
   .rt-cap.rt-unknown {
     color: #ffffff;
     background: var(--rt-unknown);
@@ -441,9 +437,19 @@
     border-radius: var(--radius); white-space: nowrap;
   }
   .btn-xl { font-size: 62px; padding: 40px 70px; }  /* screen 01 START SESSION */
+  .preview-toggle {
+    position: absolute;
+    top: 24px;
+    right: 24px;
+    z-index: 6;
+  }
+  /* Opens the simple Space-to-capture page (/snap). */
+  .snap-link {
+    position: absolute; top: 24px; left: 24px; z-index: 6; text-decoration: none;
+  }
   .btn-lg { font-size: 48px; padding: 30px 56px; }  /* screen 02 primary */
   .btn-sm { font-size: 32px; padding: 22px 42px; }  /* screen 02 secondary */
-  /* Disabled = a briefly-debounced command button (WS-D) OR the no-op START
+  /* Disabled = a briefly-debounced command button OR the no-op START
      NEW SESSION affordance (no in-process new-session path). */
   .btn:disabled { opacity: .4; cursor: not-allowed; }
   /* Screen 02 START NEW SESSION (btn-sm) keeps its no-op guard (still disabled,
@@ -515,7 +521,7 @@
     bottom: 18%;
   }
 
-  /* Shared camera <img> slot — capture_review (#137). Same JS shrink path. */
+  /* Shared camera <img> slot (capture_review). Same JS shrink path. */
   .kiosk-image-frame {
     position: relative;
     flex: 0 1 auto;
@@ -566,7 +572,7 @@
   .overlay .headline { color: var(--text); }
   .overlay .sub { color: var(--text-body); }
 
-  /* WS-A offline banner (design_spec §22): amber non-blocking banner layered
+  /* Offline banner (design_spec §22): amber non-blocking banner layered
      OVER the frozen last screen when state.online === false. Static copy; it
      does NOT tear down the underlying screen (render returns early, leaving the
      last painted screen intact beneath). */
@@ -578,7 +584,7 @@
   }
   .offline-banner.show { display: block; }
 
-  /* #256: THIRD layer -- a non-interrupting Hybrid attention banner, same
+  /* THIRD layer -- a non-interrupting Hybrid attention banner, same
      shape as .offline-banner immediately above (layered OVER whatever
      screen is active; does NOT tear it down). Explicitly NOT the
      screen-18 duplicate-scan overlay (a full-screen takeover). Tapping it
@@ -591,7 +597,7 @@
   }
   .attention-banner.show { display: block; }
 
-  /* #258: --profile-only Hybrid queue/timing panel. Same layered-overlay
+  /* --profile-only Hybrid queue/timing panel. Same layered-overlay
      shape as .attention-banner above (never torn down by whatever screen is
      active beneath it) but bottom-anchored so it never collides with the
      attention banner or status bar. Only ever added to the DOM's content
@@ -621,12 +627,107 @@
     font: 12px/1.4 monospace; color: #888; opacity: .8;
   }
   .dev-bar input { font: 12px monospace; padding: 2px 6px; }
+
+  /* Optional operator note on Review Capture; sent with ACCEPT. */
+  .review-note {
+    width: 640px; max-width: 100%; margin-top: 12px; padding: 8px 12px;
+    font: 18px/1.3 inherit; border-radius: 6px; border: 1px solid #888;
+  }
+
+  /* Capture-settings gear (every screen) and its full-screen panel. The panel
+     is a client overlay like screen 18, not a router screen. */
+  .settings-gear {
+    position: absolute; left: 24px; bottom: 24px; z-index: 35;
+    width: 104px; height: 104px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .settings-gear svg { width: 60px; height: 60px; fill: var(--text); }
+  .settings-panel {
+    display: none; position: absolute; inset: 0; z-index: 40;
+    flex-direction: column; padding: 40px 60px 36px;
+    background: var(--surface); color: var(--text);
+  }
+  .settings-panel.show { display: flex; }
+  .settings-head { display: flex; align-items: center; gap: 16px; }
+  .settings-title {
+    margin: 0 auto 0 0; font-size: 56px; font-weight: 800;
+    text-transform: uppercase; letter-spacing: .01em;
+  }
+  .settings-tab { font-size: 32px; padding: 20px 34px; }
+  .settings-tab.active {
+    background: var(--accent); border-color: var(--accent); color: var(--on-color);
+  }
+  .settings-role-tabs { display: flex; gap: 12px; margin-left: 28px; }
+  .settings-note {
+    margin-top: 20px; padding: 14px 24px; border-radius: 12px;
+    background: var(--warning); color: #111; font-size: 28px; font-weight: 700;
+  }
+  .settings-rows {
+    flex: 1 1 auto; overflow-y: auto; margin-top: 16px;
+    border-top: 2px solid var(--rt-line-strong);
+  }
+  .settings-row {
+    position: relative; display: grid; grid-template-columns: 1fr auto;
+    align-items: center; column-gap: 24px; min-height: 104px;
+    padding: 10px 0 10px 24px; border-bottom: 1px solid var(--rt-line);
+  }
+  .settings-row.changed::before, .settings-row.pending::before {
+    content: ""; position: absolute; left: 0; top: 10px; bottom: 10px;
+    width: 8px; border-radius: 4px; background: var(--accent);
+  }
+  .settings-row.pending::before { background: var(--warning); }
+  .settings-row.locked { opacity: .4; }
+  .settings-label { font-size: 36px; font-weight: 700; }
+  .settings-meta { margin-top: 4px; font-size: 24px; color: var(--text-faint); }
+  .settings-meta b { color: var(--text-body); letter-spacing: .04em; }
+  .settings-error { margin-top: 6px; font-size: 26px; font-weight: 700; color: var(--review); }
+  .settings-ctl { display: flex; align-items: center; gap: 14px; }
+  .settings-step { width: 100px; height: 84px; padding: 0; font-size: 56px; line-height: 1; }
+  .settings-value, .settings-toggle {
+    min-width: 280px; height: 84px; padding: 0 24px; font-size: 40px;
+    font-variant-numeric: tabular-nums;
+  }
+  .settings-value { background: var(--surface); border: 3px solid var(--bar-border); }
+  .settings-toggle.on {
+    background: var(--accent); border-color: var(--accent); color: var(--on-color);
+  }
+  .settings-status {
+    min-height: 44px; margin-top: 14px; font-size: 28px; font-weight: 600;
+    color: var(--text-body); white-space: pre-line;
+  }
+  .settings-foot { display: flex; gap: 24px; margin-top: 14px; }
+  .settings-foot .spacer { flex: 1 1 auto; }
+  .settings-dialog {
+    display: none; position: absolute; inset: 0; z-index: 45;
+    align-items: center; justify-content: center; background: rgba(0, 0, 0, .45);
+  }
+  .settings-dialog.show { display: flex; }
+  .settings-dialog-box {
+    min-width: 640px; padding: 40px; border-radius: 20px; text-align: center;
+    background: var(--surface);
+  }
+  .settings-dialog-title { font-size: 40px; font-weight: 800; }
+  .settings-dialog-hint { margin-top: 10px; font-size: 26px; color: var(--text-faint); }
+  .keypad-display {
+    margin-top: 20px; min-height: 96px; padding: 12px 24px; text-align: right;
+    font-size: 60px; font-weight: 800; font-variant-numeric: tabular-nums;
+    border: 3px solid var(--bar-border); border-radius: var(--radius);
+  }
+  .keypad {
+    display: grid; grid-template-columns: repeat(3, 160px); gap: 14px;
+    justify-content: center; margin-top: 20px;
+  }
+  .keypad .btn { padding: 22px 0; font-size: 46px; }
+  .settings-dialog-actions { display: flex; gap: 24px; justify-content: center; margin-top: 28px; }
 </style>
 </head>
 <body>
   <div class="viewport">
     <div class="stage">
       <div class="panel" id="panel">
+        <button class="btn settings-gear" id="settings-gear" aria-label="Capture settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>
+        </button>
         <div class="offline-banner" id="offline-banner">Processing computer offline</div>
         <div class="attention-banner" id="attention-banner"></div>
         <div class="profile-panel" id="profile-panel"></div>
@@ -641,6 +742,8 @@
           <div class="kiosk-image-frame" id="kiosk-image-frame" style="display:none">
             <img class="kiosk-image" id="kiosk-image" alt="">
           </div>
+          <input class="review-note" id="review-note" style="display:none"
+                 placeholder="Optional note (saved with ACCEPT)" maxlength="500">
           <div class="progress" id="progress"><div class="fill"></div></div>
           <div class="counts" id="counts"></div>
           <div class="debug-box" id="debug-box">Debug details collapsed</div>
@@ -651,6 +754,8 @@
           <img class="rt-lightbox-img" id="rt-lightbox-img" alt="">
         </div>
 
+        <button class="btn btn-sm preview-toggle" id="preview-toggle" style="display:none">PREVIEW</button>
+        <a class="btn btn-sm snap-link" href="/snap">SNAP</a>
         <div class="idle-top" id="idle-top"></div>
         <div class="idle-preview" id="idle-preview">
           <div class="idle-preview-slot">
@@ -666,6 +771,31 @@
           <div class="status-bar" id="overlay-status"></div>
           <p class="headline" id="overlay-headline"></p>
           <div class="sub sub-sm" id="overlay-sub"></div>
+        </div>
+
+        <div class="settings-panel" id="settings-panel">
+          <div class="settings-head">
+            <p class="settings-title">Settings</p>
+            <button class="btn settings-tab" id="settings-tab-camera">CAMERA</button>
+            <button class="btn settings-tab" id="settings-tab-detection">DETECTION</button>
+            <button class="btn settings-tab" id="settings-tab-lights">LIGHTS</button>
+            <div class="settings-role-tabs" id="settings-role-tabs">
+              <button class="btn settings-tab" id="settings-tab-block">BLOCK</button>
+              <button class="btn settings-tab" id="settings-tab-slide">SLIDE</button>
+            </div>
+          </div>
+          <div class="settings-note" id="settings-note" style="display:none"></div>
+          <div class="settings-rows" id="settings-rows"></div>
+          <div class="settings-status" id="settings-status"></div>
+          <div class="settings-foot">
+            <button class="btn btn-sm" id="settings-reset">RESET TO DEFAULTS</button>
+            <span class="spacer"></span>
+            <button class="btn btn-lg" id="settings-close">CLOSE</button>
+            <button class="btn btn-lg" id="settings-save">SAVE</button>
+          </div>
+          <div class="settings-dialog" id="settings-dialog">
+            <div class="settings-dialog-box" id="settings-dialog-box"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -684,11 +814,14 @@
   const $ = (id) => document.getElementById(id);
 
   // ---- embedded catalog (offline fallback) -----------------------------
-  // Verbatim copy of the frozen 119 contract, keyed by screen id. GET /catalog
+  // Verbatim copy of the frozen catalog contract, keyed by screen id. GET /catalog
   // (kiosk.screens.CATALOG) supersedes this once fetched; the copy keeps the
   // renderer working before that route exists. "Scan Block" (screen 06) is the
-  // string the 119a E2E server test asserts is served.
+  // string the E2E server test asserts is served.
   const FALLBACK_CATALOG = { screens: {
+    "led_calibration_place": {"headline":"Check LED Placement Detection","sub":"Place a test block, then withdraw your hand. No photo is saved.","variant":"place","bg":"default","progress_bar":false,"status_bar":false,"buttons":[]},
+    "led_calibration_remove": {"headline":"Remove Test Block","sub":"Clear the tray to finish the LED detection check.","variant":"place","bg":"default","progress_bar":false,"status_bar":false,"buttons":[]},
+    "led_calibration_failed": {"headline":"LED Setup Needs Retry","sub":"Clear the tray. Check the LED and retry setup.","variant":"error","bg":"default","progress_bar":false,"status_bar":false,"buttons":[{"label":"RETRY","action":"dispatch","verb":"confirm_empty","size":"lg"}]},
     "01": { headline: "LJI Block Check", sub: "Preview", variant: "idle",
             bg: "default", progress_bar: false, status_bar: false,
             buttons: [{ label: "START SESSION", action: "engage" }] },
@@ -707,14 +840,17 @@
             bg: "default", progress_bar: true, status_bar: false, buttons: [] },
     "06": { headline: "Scan Block", sub: "{hybrid_pool_bounce_message}", variant: "capture",
             bg: "default", progress_bar: false, status_bar: true,
-            buttons: [{ label: "FINISH BLOCKS", action: "guard",
+            buttons: [{ label: "RECALIBRATE", action: "dispatch", verb: "confirm_empty" },
+                      { label: "FINISH BLOCKS", action: "guard",
                         target: "finish_blocks_guard" }] },
     "07": { headline: "Place Block", sub: "BLOCK ID: {latest_block_id}",
             variant: "place", bg: "default", progress_bar: false, status_bar: true,
-            buttons: [] },
+            buttons: [{ label: "CAPTURE NOW", action: "dispatch",
+                        verb: "capture_now" }] },
     "hold_still": { headline: "Hold Still", sub: "BLOCK ID: {latest_block_id}",
             variant: "place", bg: "default", progress_bar: false, status_bar: true,
-            buttons: [] },
+            buttons: [{ label: "CAPTURE NOW", action: "dispatch",
+                        verb: "capture_now" }] },
     "capture_review": { headline: "Review Capture", sub: "BLOCK ID: {latest_block_id}",
             variant: "still", bg: "default", progress_bar: false, status_bar: true,
             buttons: [{ label: "RETAKE", action: "dispatch", verb: "retry_capture" },
@@ -724,7 +860,8 @@
             buttons: [] },
     "09": { headline: "Remove Block", sub: "BLOCK ID: {latest_block_id}",
             variant: "reposition", bg: "default", progress_bar: false, status_bar: true,
-            buttons: [] },
+            buttons: [{ label: "NEXT CAPTURE", action: "dispatch",
+                        verb: "next_capture" }] },
     "10": { headline: "Finish Block Capture?", sub: "",
             variant: "confirm", bg: "default", progress_bar: false, status_bar: false,
             buttons: [{ label: "GO BACK", action: "back", target: "finish_blocks_guard" },
@@ -735,12 +872,22 @@
     "13": { headline: "Capturing…", sub: "", variant: "capture",
             bg: "default", progress_bar: false, status_bar: true, buttons: [] },
     "14": { headline: "Verifying…", sub: "Remove Slide", variant: "verify",
-            bg: "default", progress_bar: false, status_bar: true, buttons: [] },
+            bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "NEXT CAPTURE", action: "dispatch",
+                        verb: "next_capture" }] },
+    "hybrid_slide_queued": { headline: "Slide Captured", sub: "Remove Slide - scoring queued",
+            variant: "verify", bg: "default", progress_bar: false, status_bar: true,
+            buttons: [{ label: "NEXT CAPTURE", action: "dispatch",
+                        verb: "next_capture" }] },
     "15": { headline: "PASS", sub: "Remove Slide", variant: "pass",
-            bg: "pass-full", progress_bar: false, status_bar: true, buttons: [] },
+            bg: "pass-full", progress_bar: false, status_bar: true,
+            buttons: [{ label: "NEXT CAPTURE", action: "dispatch",
+                        verb: "next_capture" }] },
     "16": { headline: "REVIEW", sub: "{latest_verdict.reason}", sub2: "Remove Slide",
             variant: "review", bg: "review-full", progress_bar: false,
-            status_bar: true, buttons: [] },
+            status_bar: true,
+            buttons: [{ label: "NEXT CAPTURE", action: "dispatch",
+                        verb: "next_capture" }] },
     "17": { headline: "Reposition Slide", sub: "Code could not be read",
             variant: "reposition", bg: "default", progress_bar: false, status_bar: true,
             buttons: [{ label: "RETAKE SLIDE", action: "dispatch", verb: "retry_capture" },
@@ -769,7 +916,8 @@
                       { label: "END SESSION", action: "dispatch", verb: "end_session" }] },
     "block_scan_work_order": { headline: "Scan Block", sub: "", variant: "capture",
             bg: "default", progress_bar: false, status_bar: true,
-            buttons: [{ label: "FINISH BLOCKS", action: "guard", target: "finish_blocks_guard" }] },
+            buttons: [{ label: "RECALIBRATE", action: "dispatch", verb: "confirm_empty" },
+                      { label: "FINISH BLOCKS", action: "guard", target: "finish_blocks_guard" }] },
     "slide_capture_work_order": { headline: "Place Slide", sub: "{pending_slide_label}",
             variant: "place", bg: "default", progress_bar: false, status_bar: true,
             buttons: [{ label: "FINISH WORK ORDER", action: "dispatch", verb: "finish_work_order" },
@@ -843,7 +991,7 @@
     return (tpl || "").replace(/\{([^}]+)\}/g, (_, expr) => resolvePath(expr, state));
   }
 
-  // #258: the five Hybrid worker stages, in pipeline order -- mirrors
+  // The five Hybrid worker stages, in pipeline order -- mirrors
   // `session.profile_report.PROFILE_STAGE_ORDER` (the Python name authority
   // this client cannot import directly). Display-label-only; not a second
   // source of the underlying numbers, which all come from
@@ -930,9 +1078,9 @@
 
   // ---- status-bar text: mode picks BLOCK/SLIDE wording ------------------
   // Built from live state, so one catalog `status_bar` flag drives both phases.
-  // work_order is deliberately deferred (119c WS-F) so it stays an em-dash; the
-  // WO slot is kept as the future seam. `remaining` is projected by the relay
-  // (WS-C) but still falls back to an em-dash when absent (bare workflow).
+  // work_order is deliberately deferred so it stays an em-dash; the WO slot is
+  // kept as the future seam. `remaining` is projected by the relay but still
+  // falls back to an em-dash when absent (bare workflow).
   function statusText(state) {
     const wo = state.work_order || "—";
     const mode = state.capture_mode || (state.phase === "slides" ? "slide" : "block");
@@ -989,7 +1137,7 @@
   }
   function hideOverlay() { $("overlay").classList.remove("show"); }
 
-  // ---- shared <img> render path (#137 review still; #139 boot preview) ----
+  // ---- shared <img> render path (review still; boot preview) -------------
   // Layout is done in JS (not CSS object-fit): size a true 4:3 border box,
   // then set the <img> pixel size to natural*scale so the FULL frame is
   // visible and shrunk — never clipped by the border.
@@ -1132,10 +1280,26 @@
   // confirm_empty (engage auto-cal and screen-04 RETRY) before the POST returns.
   let lastStateSnapshot = null;
 
+  // A temporary camera view, independent of the session's routing flags.
+  let sessionPreviewOpen = false;
+  const SESSION_PREVIEW_ENTRY = {
+    variant: "idle", bg: "default", sub: "Preview · capture continues",
+    buttons: [],
+  };
+  function canShowSessionPreview(state) {
+    return !!state.effective_engaged && state.phase !== "finalized";
+  }
+  function setSessionPreview(open) {
+    sessionPreviewOpen = open;
+    hideOverlay();
+    if (lastStateSnapshot) render(lastStateSnapshot);
+  }
+
   // ---- render one catalog entry from one /state snapshot ----------------
   function render(state) {
     const online = state.online !== false;
     $("conn").textContent = online ? "online" : "offline";
+    $("preview-toggle").disabled = !online;
 
     // WS-A: amber banner keyed purely off state.online === false. When offline
     // the relay returns a bare {online:false} (no screen/counts), so we show the
@@ -1147,7 +1311,7 @@
       return;
     }
 
-    // #256: THIRD layer, same shape as the offline banner above -- toggled
+    // THIRD layer, same shape as the offline banner above -- toggled
     // purely off state.attention, layered over whatever screen paints
     // below, never torn down by it.
     const attentionBanner = $("attention-banner");
@@ -1156,7 +1320,7 @@
       attentionBanner.textContent = state.attention.message || "Slide needs attention";
     }
 
-    // #258: --profile-only Hybrid queue/timing panel, same layered shape as
+    // --profile-only Hybrid queue/timing panel, same layered shape as
     // the attention banner above. `state.profile` is entirely ABSENT (not
     // merely falsy) whenever the launch flag is off -- see
     // KioskRelay._profile_fields -- so hiding on its absence here is a
@@ -1166,11 +1330,16 @@
     profilePanel.innerHTML = state.profile ? renderProfilePanel(state.profile) : "";
 
     lastStateSnapshot = state;
-    let id = state.screen || lastScreenId || "01";
-    lastScreenId = id;
+    const routedId = state.screen || lastScreenId || "01";
+    lastScreenId = routedId;
+    if (!canShowSessionPreview(state)) sessionPreviewOpen = false;
+    const id = sessionPreviewOpen ? "session_preview" : routedId;
+    $("preview-toggle").style.display =
+      canShowSessionPreview(state) && !sessionPreviewOpen ? "" : "none";
     $("screen-id").textContent = "screen " + id;
 
-    const entry = getScreen(id) || getScreen("01") || {};
+    const entry = sessionPreviewOpen ? SESSION_PREVIEW_ENTRY
+      : getScreen(id) || getScreen("01") || {};
     const variant = entry.variant || "";
     const view = viewFor(id, state);
 
@@ -1242,13 +1411,22 @@
       );  // block-id line is 38px
     }
 
-    // still-image variant (capture_review; reused by boot preview in #139)
+    // still-image variant (capture_review; reused by boot preview)
     applyKioskImage(
       $("kiosk-image-frame"),
       $("kiosk-image"),
       variant === "still" ? reviewStillUrl(state) : null,
       variant === "still"
     );
+
+    // optional note box (capture_review only); cleared whenever we leave it
+    const noteBox = $("review-note");
+    if (id === "capture_review") {
+      noteBox.style.display = "";
+    } else if (noteBox.style.display !== "none") {
+      noteBox.style.display = "none";
+      noteBox.value = "";
+    }
 
     // secondary sub (screen 16 "Remove Slide" under the reason)
     const sub2Text = fillTemplate(entry.sub2, view);
@@ -1278,9 +1456,10 @@
     }
 
     renderButtons(entry, view);
-    handleDuplicate(id, state);
+    if (!sessionPreviewOpen) handleDuplicate(id, state);
     syncBootPreview(entry);
     maybeAutoCalibrate(state);
+    if (settingsOpen) loadSettings();  // keep editability in step with state
   }
 
   // Auto-start empty-backlight calibration when engaged and the capture
@@ -1319,15 +1498,15 @@
     }
   }
 
-  // ---- results screen (#232): grouped, expandable results table ---------
+  // ---- results screen: grouped, expandable results table ----------------
   // Rebuilt from the redesign mock. `rows` is project_results_table's output
   // (ERROR/REVIEW/PASS/PENDING-ordered, each row carrying work_order /
-  // block_id / verdict / claim_reason / color / capture_id -- #248). We
+  // block_id / verdict / claim_reason / color / capture_id). We
   // RE-group it by work_order into one section per WO, same order WITHIN
   // each section, then render a chevron-expandable row per slide. The
   // reason + the reserved thumbnail/metadata seam live in each row's
   // dropdown; real thumbnails and candidate ranking Evidence thumbs load
-  // from row.evidence; display tiles load on expand (#236).
+  // from row.evidence; display tiles load on expand.
   //
   // Poll-safe: render() calls this on every /state poll (~750ms). We
   // fingerprint the rows and SKIP the rebuild when they are unchanged, so the
@@ -1340,15 +1519,14 @@
   const RT_ICON_PASS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.2l2.6 2.6L16 9"/></svg>';
   const RT_ICON_REVIEW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5"/><path d="M12 16.2h.01"/></svg>';
 
-  // #248: the four operator-visible row states (CONTEXT.md "Hybrid Result
+  // The four operator-visible row states (CONTEXT.md "Hybrid Result
   // State"), mirroring kiosk.results_table's _COLOR_BY_VERDICT /
   // _SORT_RANK_BY_VERDICT. Explicit lookups, not a binary PASS/REVIEW
   // ternary, so an unrecognized verdict falls through to a distinct
-  // "rt-unknown" bucket instead of being silently disguised as REVIEW/red
-  // (the bug #248 fixed).
+  // "rt-unknown" bucket instead of being silently disguised as REVIEW/red.
   const RT_STATE_COLOR = { ERROR: "rt-error", REVIEW: "rt-review", PASS: "rt-pass", PENDING: "rt-pending" };
   const RT_STATE_RANK = { ERROR: 0, REVIEW: 1, PASS: 2, PENDING: 3 };
-  // #248-fix: the unknown-row fallback must sort AT OR ABOVE ERROR (never
+  // The unknown-row fallback must sort AT OR ABOVE ERROR (never
   // after PENDING) so a leaked internal state can never hide at the bottom
   // of a long table. Mirrors kiosk.results_table._UNKNOWN_SORT_RANK.
   const RT_UNKNOWN_RANK = -1;
@@ -1372,7 +1550,7 @@
   function rtGroupByWorkOrder(rows) {
     // First-seen order of work orders; ERROR/REVIEW/PASS/PENDING order
     // within each (the input is already in that order globally, so a
-    // stable partition keeps it -- #248).
+    // stable partition keeps it).
     const groups = new Map();
     for (const row of rows) {
       const wo = row.work_order == null ? "" : String(row.work_order);
@@ -1402,7 +1580,7 @@
     const icon = RT_SHOW_CAP_ICONS
       ? (verdict === "PASS" ? RT_ICON_PASS : verdict === "REVIEW" ? RT_ICON_REVIEW : "")
       : "";
-    // #248: no silent default to "REVIEW" -- an unrecognized verdict shows
+    // No silent default to "REVIEW" -- an unrecognized verdict shows
     // its own (unexpected) text, loud rather than disguised as a match
     // failure.
     cap.innerHTML = icon + (verdict != null ? verdict : "UNKNOWN");
@@ -1513,7 +1691,7 @@
     const ev = row.evidence || {};
     imgs.appendChild(rtDisplayTile(ev.block_display));
     imgs.appendChild(rtDisplayTile(ev.slide_display));
-    // Spec #236: pending/error never show a third tile (no fake alignment).
+    // Pending/error never show a third tile (no fake alignment).
     if (ev.overlay_display) {
       imgs.appendChild(rtDisplayTile(ev.overlay_display));
     }
@@ -1591,8 +1769,8 @@
 
     // Only the FIRST row needing attention (ERROR or REVIEW, across all
     // sections) starts open; every PASS/PENDING and any later ERROR/REVIEW
-    // starts collapsed, honouring "one open at a time" (#248: ERROR now
-    // outranks REVIEW, so this can no longer be "REVIEW-only").
+    // starts collapsed, honouring "one open at a time" (ERROR outranks
+    // REVIEW, so this is not "REVIEW-only").
     let firstAttentionOpened = false;
     const thumbQueue = [];
     const deferredExpand = [];
@@ -1683,6 +1861,14 @@
     primary.onclick = null;
 
     if (variant === "idle") {
+      if (sessionPreviewOpen) {
+        const back = document.createElement("button");
+        back.className = "btn btn-xl";
+        back.textContent = "BACK TO SESSION";
+        back.addEventListener("click", () => setSessionPreview(false));
+        idleTop.appendChild(back);
+        return;
+      }
       for (const b of buttons) idleTop.appendChild(makeButton(b, "btn btn-xl", view));
       return;
     }
@@ -1722,7 +1908,7 @@
     }
   }
 
-  // #257: tracks whether THIS client paused capture via the VIEW RESULTS
+  // Tracks whether THIS client paused capture via the VIEW RESULTS
   // entry point on the open slide-capture screen, so GO BACK only resumes
   // capture it itself paused. Deliberately NOT part of `ui` (which only ever
   // holds router-input flags echoed to /state) -- this is local bookkeeping
@@ -1749,11 +1935,10 @@
           }));
         }
         if (b.verb === "finish_blocks") {
-          // Guard-latch fix (#250 review F1): finish_blocks_guard was only
-          // ever cleared by the "back" action, never by dispatching the
-          // confirm itself. A Hybrid <2-usable-blocks bounce returns phase
-          // to "blocks" -- if the guard were still true, select_screen()
-          // would route straight back to screen 10 (Finish Blocks Confirm)
+          // Clear finish_blocks_guard on dispatch, not only on "back". A
+          // Hybrid <2-usable-blocks bounce returns phase to "blocks" -- if
+          // the guard were still true, select_screen() would route straight
+          // back to screen 10 (Finish Blocks Confirm)
           // with no explanation, and every re-tap would re-drain and bounce
           // forever with GO BACK the only escape. Clearing it here (whether
           // the freeze proceeds or bounces) always lands the operator back
@@ -1761,8 +1946,8 @@
           ui.finish_blocks_guard = false;
         }
         if (b.verb === "retry_hybrid_slide" || b.verb === "arm_hybrid_recapture") {
-          // #256 (RETRY) / #256 follow-up (RECAPTURE): the attention item's
-          // capture_id lives client-side on the last state snapshot
+          // RETRY / RECAPTURE: the attention item's capture_id lives
+          // client-side on the last state snapshot
           // (state.attention.capture_id) -- no catalog button carries args,
           // so this is passed as a special case, mirroring confirm_empty/
           // pause_capture's special cases above.
@@ -1772,7 +1957,7 @@
           break;
         }
         if (b.verb === "pause_capture") {
-          // #257: VIEW RESULTS on the open slide-capture screen both pauses
+          // VIEW RESULTS on the open slide-capture screen both pauses
           // automatic capture (the dispatch below, a real server-side side
           // effect) and opens Results (the client-owned guard flag) in the
           // SAME tap -- mirrors the finish_blocks special case above. The
@@ -1781,12 +1966,20 @@
           ui.view_results_guard = true;
           viewResultsPausedCapture = true;
         }
+        if (b.verb === "accept_capture") {
+          // Optional Review Capture note rides along as the verb's text arg.
+          const note = $("review-note").value.trim();
+          $("review-note").value = "";
+          (note ? command(b.verb, note) : command(b.verb))
+            .finally(() => { if (el) el.disabled = false; });
+          break;
+        }
         command(b.verb).finally(() => { if (el) el.disabled = false; });
         break;
       case "guard":     setFlag(b.target, true); break;   // -> confirm screen
       case "back":
         if (b.target === "view_results_guard" && viewResultsPausedCapture) {
-          // #257: only resume capture when THIS client is the one that
+          // Only resume capture when THIS client is the one that
           // paused it (the open slide-capture entry point). Open
           // Retrieval's between_orders VIEW RESULTS never sets this flag
           // (it never dispatches pause_capture), so its GO BACK stays the
@@ -1817,15 +2010,23 @@
     return "/state?" + p.toString();
   }
 
-  // WS-E ordering guard: refresh() is triggered from three uncoordinated
-  // sources (the 750ms poll, post-command, post-flag-tap) with no request
-  // cancellation. A slower in-flight response for a stale screen can land
-  // after a faster, newer response already rendered -- repainting the
-  // previous slide's verdict for one poll cycle. Track the highest sequence
-  // number rendered so far and drop any response older than that.
+  // WS-E: refresh() is triggered from three sources (the 750ms poll,
+  // post-command, post-flag-tap). Only allow one /state request at a time.
+  // Before this guard, a slow response caused the interval and tap-triggered
+  // refreshes to pile up; the sequence check could discard stale paints but
+  // did not stop the request backlog that made the UI increasingly laggy.
+  // A queued boolean preserves one immediate refresh without allowing an
+  // unbounded chain of duplicate requests.
   let refreshSeq = 0;
   let renderedSeq = 0;
+  let statePollInFlight = false;
+  let statePollQueued = false;
   async function refresh() {
+    if (statePollInFlight) {
+      statePollQueued = true;
+      return;
+    }
+    statePollInFlight = true;
     const mySeq = ++refreshSeq;
     try {
       const state = await (await fetch(stateUrl(), { cache: "no-store" })).json();
@@ -1834,6 +2035,12 @@
       render(state);
     } catch (err) {
       $("conn").textContent = "offline";
+    } finally {
+      statePollInFlight = false;
+      if (statePollQueued) {
+        statePollQueued = false;
+        void refresh();
+      }
     }
   }
 
@@ -1870,6 +2077,8 @@
   // digits-only filter would silently drop.
   let scanBuffer = "";
   document.addEventListener("keydown", (e) => {
+    // Typing in a text box (review note, dev id) is not a scanner burst.
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
     if (e.key === "Enter") {
       if (scanBuffer) { command("scan_qr", scanBuffer); scanBuffer = ""; }
       return;
@@ -1877,7 +2086,9 @@
     if (e.key.length === 1) { scanBuffer += e.key; }  // printable char (skips Shift/Tab/…)
   });
 
-  // #256: tapping the passive attention banner is the "direct route into
+  $("preview-toggle").addEventListener("click", () => setSessionPreview(true));
+
+  // Tapping the passive attention banner is the "direct route into
   // the correction flow" -- sets recapture_guard, routing to
   // hybrid_attention on the next poll (mirrors every other guard-nav
   // button's setFlag call).
@@ -1888,12 +2099,339 @@
   $("dev-scan").addEventListener("click", () =>
     command("scan_qr", $("dev-block-id").value.trim()));
 
-  // ---- boot: fetch catalog once, then poll /state on the 119a cadence ---
+  // ---- capture-settings gear panel (client overlay, not a router screen) --
+  // GET /settings supplies every row plus the runtime's own editable /
+  // locked_reason, so this panel never re-derives the state rules.
+  const SETTINGS_LABELS = {
+    exposure_us: "Exposure (µs)", analogue_gain: "Analogue gain",
+    colour_gain_red: "Red colour gain", colour_gain_blue: "Blue colour gain",
+    contrast: "Contrast", sharpness: "Sharpness",
+    presence_threshold: "Presence threshold", motion_threshold: "Motion threshold",
+    stable_duration: "Stable time (s)", removal_duration: "Removal time (s)",
+    backlight_level: "Backlight level (%)", neutral_level: "Neutral light level (%)",
+    led_auto: "LED auto",
+  };
+  let settingsOpen = false;
+  let settingsData = null;      // last GET /settings body
+  let settingsSig = null;       // repaint only when the server rows change
+  let settingsSection = "camera";
+  let settingsRole = "block";
+  let settingsPending = {};     // name -> unsaved value
+  let settingsErrors = {};      // name -> server rejection message
+  let settingsBusy = false;
+  let settingsFetchInFlight = false;
+
+  async function loadSettings(force) {
+    if (settingsFetchInFlight || (settingsBusy && !force)) return;
+    settingsFetchInFlight = true;
+    try {
+      const resp = await fetch("/settings", { cache: "no-store" });
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.error || "unavailable");
+      const sig = JSON.stringify(body);
+      if (sig === settingsSig && !force) return;
+      settingsData = body;
+      settingsSig = sig;
+    } catch (err) {
+      settingsData = null;
+      settingsSig = null;
+      setSettingsStatus("Settings unavailable: " + err.message);
+    } finally {
+      settingsFetchInFlight = false;
+    }
+    renderSettings();
+  }
+
+  async function openSettings() {
+    settingsOpen = true;
+    settingsPending = {};
+    settingsErrors = {};
+    setSettingsStatus("");
+    $("settings-panel").classList.add("show");
+    await loadSettings(true);
+    if (settingsData) settingsRole = settingsData.active_role || "block";
+    renderSettings();
+  }
+
+  function closeSettings() {
+    if (settingsBusy) return;
+    settingsOpen = false;
+    settingsPending = {};  // unsaved edits are discarded
+    settingsErrors = {};
+    closeSettingsDialog();
+    $("settings-panel").classList.remove("show");
+    refresh();  // back to whatever screen the router says now
+  }
+
+  function setSettingsStatus(text) { $("settings-status").textContent = text; }
+
+  function settingsRow(name) {
+    return ((settingsData && settingsData.settings) || []).find(r => r.name === name);
+  }
+
+  function settingsLabel(row) {
+    const field = row.name.split(".").slice(1).join(".");
+    return SETTINGS_LABELS[field] || row.name;
+  }
+
+  function formatSettingValue(row, value) {
+    if (row.type === "bool") return value ? "ON" : "OFF";
+    return String(value);
+  }
+
+  function stepSettingValue(row, value, direction) {
+    const text = String(row.step);
+    const decimals = text.includes(".") ? text.split(".")[1].length : 0;
+    const next = Math.min(row.max, Math.max(row.min, Number(value) + direction * row.step));
+    return Number(next.toFixed(decimals));
+  }
+
+  // A camera change recalibrates only for the active role on Scan Block.
+  function settingRecalibrates(row) {
+    return row.applies === "camera" && settingsData
+      && row.group === settingsData.active_role && lastStateSnapshot
+      && lastStateSnapshot.capture_state === "WAITING_FOR_SCAN";
+  }
+
+  function setPendingSetting(row, value) {
+    if (value === row.value) delete settingsPending[row.name];
+    else settingsPending[row.name] = value;
+    delete settingsErrors[row.name];
+    renderSettings();
+  }
+
+  function settingsButton(cls, text, onClick, disabled) {
+    const el = document.createElement("button");
+    el.className = cls;
+    el.textContent = text;
+    el.disabled = !!disabled;
+    el.addEventListener("click", onClick);
+    return el;
+  }
+
+  function settingsRowEl(row) {
+    const pending = row.name in settingsPending;
+    const value = pending ? settingsPending[row.name] : row.value;
+    const locked = !row.editable || settingsBusy;
+    const el = document.createElement("div");
+    el.className = "settings-row" + (row.changed ? " changed" : "")
+      + (pending ? " pending" : "") + (row.editable ? "" : " locked");
+
+    const info = document.createElement("div");
+    const label = document.createElement("div");
+    label.className = "settings-label";
+    label.textContent = settingsLabel(row);
+    info.appendChild(label);
+    const meta = document.createElement("div");
+    meta.className = "settings-meta";
+    meta.textContent = "Default " + formatSettingValue(row, row.default);
+    const tag = pending ? "UNSAVED" : row.changed ? "CHANGED" : "";
+    if (tag) {
+      const mark = document.createElement("b");
+      mark.textContent = " · " + tag;
+      meta.appendChild(mark);
+    }
+    info.appendChild(meta);
+    if (settingsErrors[row.name]) {
+      const error = document.createElement("div");
+      error.className = "settings-error";
+      error.textContent = settingsErrors[row.name];
+      info.appendChild(error);
+    }
+    el.appendChild(info);
+
+    const ctl = document.createElement("div");
+    ctl.className = "settings-ctl";
+    if (row.type === "bool") {
+      ctl.appendChild(settingsButton(
+        "btn settings-toggle" + (value ? " on" : ""), value ? "ON" : "OFF",
+        () => setPendingSetting(row, !value), locked));
+    } else {
+      ctl.appendChild(settingsButton("btn settings-step", "\u2212",
+        () => setPendingSetting(row, stepSettingValue(row, value, -1)), locked));
+      ctl.appendChild(settingsButton("btn settings-value", String(value),
+        () => openKeypad(row, value), locked));
+      ctl.appendChild(settingsButton("btn settings-step", "+",
+        () => setPendingSetting(row, stepSettingValue(row, value, 1)), locked));
+    }
+    el.appendChild(ctl);
+    return el;
+  }
+
+  function renderSettings() {
+    if (!settingsOpen) return;
+    const sections = ["camera", "detection", "lights"];
+    for (const name of sections) {
+      $("settings-tab-" + name).className =
+        "btn settings-tab" + (settingsSection === name ? " active" : "");
+    }
+    for (const role of ["block", "slide"]) {
+      $("settings-tab-" + role).className =
+        "btn settings-tab" + (settingsRole === role ? " active" : "");
+    }
+    $("settings-role-tabs").style.display = settingsSection === "camera" ? "" : "none";
+
+    const group = settingsSection === "camera" ? settingsRole : settingsSection;
+    const rows = ((settingsData && settingsData.settings) || [])
+      .filter(row => row.group === group);
+    const notes = [...new Set(
+      rows.filter(row => !row.editable).map(row => row.locked_reason))];
+    $("settings-note").textContent = notes.join(" · ");
+    $("settings-note").style.display = notes.length ? "" : "none";
+
+    const list = $("settings-rows");
+    list.replaceChildren();
+    for (const row of rows) list.appendChild(settingsRowEl(row));
+
+    $("settings-save").disabled = settingsBusy || !Object.keys(settingsPending).length;
+    $("settings-reset").disabled = settingsBusy || !settingsData;
+    $("settings-close").disabled = settingsBusy;
+  }
+
+  async function postSettings(path, body) {
+    try {
+      const resp = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return await resp.json();
+    } catch (err) {
+      return { ok: false, error: "kiosk server unreachable" };
+    }
+  }
+
+  async function saveSettings() {
+    const names = Object.keys(settingsPending);
+    if (settingsBusy || !names.length) return;
+    settingsBusy = true;
+    renderSettings();
+    const lines = [];
+    for (const name of names) {
+      const row = settingsRow(name);
+      setSettingsStatus(row && settingRecalibrates(row) ? "Recalibrating…" : "Saving…");
+      const reply = await postSettings("/settings", { name, value: settingsPending[name] });
+      if (reply.ok) {
+        delete settingsPending[name];
+        lines.push(reply.result.message);
+      } else {
+        settingsErrors[name] = reply.error;
+        lines.push("Not saved: " + reply.error);
+      }
+    }
+    settingsBusy = false;
+    await loadSettings(true);
+    setSettingsStatus(lines.join("\n"));
+    refresh();
+  }
+
+  async function resetSettings() {
+    closeSettingsDialog();
+    if (settingsBusy) return;
+    settingsBusy = true;
+    settingsPending = {};
+    settingsErrors = {};
+    const recalibrates = ((settingsData && settingsData.settings) || [])
+      .some(row => row.changed && settingRecalibrates(row));
+    setSettingsStatus(recalibrates ? "Recalibrating…" : "Resetting…");
+    renderSettings();
+    const reply = await postSettings("/settings/reset", {});
+    settingsBusy = false;
+    await loadSettings(true);
+    setSettingsStatus(reply.ok ? reply.result.message : "Reset refused: " + reply.error);
+    refresh();
+  }
+
+  function openSettingsDialog(build) {
+    const box = $("settings-dialog-box");
+    box.replaceChildren();
+    build(box);
+    $("settings-dialog").classList.add("show");
+  }
+
+  function closeSettingsDialog() { $("settings-dialog").classList.remove("show"); }
+
+  function settingsDialogText(box, cls, text) {
+    const el = document.createElement("div");
+    el.className = cls;
+    el.textContent = text;
+    box.appendChild(el);
+    return el;
+  }
+
+  // On-screen number pad: the Pi kiosk has no physical keyboard.
+  function openKeypad(row, value) {
+    let text = String(value);
+    openSettingsDialog((box) => {
+      settingsDialogText(box, "settings-dialog-title", settingsLabel(row));
+      settingsDialogText(box, "settings-dialog-hint",
+        "Range " + row.min + " – " + row.max + " · default " + row.default);
+      const display = settingsDialogText(box, "keypad-display", text);
+      const pad = document.createElement("div");
+      pad.className = "keypad";
+      const BACKSPACE = "\u232b";
+      const keys = ["7", "8", "9", "4", "5", "6", "1", "2", "3", ".", "0", BACKSPACE];
+      for (const key of keys) {
+        pad.appendChild(settingsButton("btn", key, () => {
+          text = key === BACKSPACE ? text.slice(0, -1) : text + key;
+          display.textContent = text;
+        }));
+      }
+      box.appendChild(pad);
+      const actions = document.createElement("div");
+      actions.className = "settings-dialog-actions";
+      actions.appendChild(settingsButton("btn btn-sm", "CLEAR", () => {
+        text = "";
+        display.textContent = text;
+      }));
+      actions.appendChild(settingsButton("btn btn-sm", "CANCEL", closeSettingsDialog));
+      actions.appendChild(settingsButton("btn btn-sm", "OK", () => {
+        const number = Number(text);
+        if (text === "" || !Number.isFinite(number)) return;
+        closeSettingsDialog();
+        setPendingSetting(row, number);  // the server validates range on SAVE
+      }));
+      box.appendChild(actions);
+    });
+  }
+
+  function confirmResetSettings() {
+    openSettingsDialog((box) => {
+      settingsDialogText(box, "settings-dialog-title", "Reset every setting to its default?");
+      settingsDialogText(box, "settings-dialog-hint",
+        "Camera settings for the current role recalibrate from Scan Block.");
+      const actions = document.createElement("div");
+      actions.className = "settings-dialog-actions";
+      actions.appendChild(settingsButton("btn btn-lg", "CANCEL", closeSettingsDialog));
+      actions.appendChild(settingsButton("btn btn-lg", "RESET", resetSettings));
+      box.appendChild(actions);
+    });
+  }
+
+  $("settings-gear").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-save").addEventListener("click", saveSettings);
+  $("settings-reset").addEventListener("click", confirmResetSettings);
+  for (const section of ["camera", "detection", "lights"]) {
+    $("settings-tab-" + section).addEventListener("click", () => {
+      settingsSection = section;
+      renderSettings();
+    });
+  }
+  for (const role of ["block", "slide"]) {
+    $("settings-tab-" + role).addEventListener("click", () => {
+      settingsRole = role;
+      renderSettings();
+    });
+  }
+
+  // ---- boot: fetch catalog once, then poll /state ------------------------
   (async () => {
     fit();
     await loadCatalog();
     refresh();
-    setInterval(refresh, 750);
+    const STATE_POLL_MS = 750;
+    setInterval(refresh, STATE_POLL_MS);
   })();
 </script>
 </body>

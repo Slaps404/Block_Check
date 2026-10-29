@@ -1,4 +1,4 @@
-"""Unit tests for the Pi workflow action logger (Track B)."""
+"""Unit tests for the Pi workflow action logger."""
 from __future__ import annotations
 
 import re

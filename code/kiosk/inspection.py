@@ -1,7 +1,7 @@
-"""Pure inspection-sheet projection (#151, ADR 0009 follow-on).
+"""Pure inspection-sheet projection (ADR 0009 follow-on).
 
 ``project_inspection(row)`` turns one results-table row (already carrying
-``top_block``/``contact_sheet_dir`` from #151's extended
+``top_block``/``contact_sheet_dir`` from the
 ``list_results_ready_work_orders`` SELECT) into the ordered contact-sheet
 descriptors the kiosk fetches when an operator expands a REVIEW row: the top
 match always, and the claimed block appended only when it disagrees --

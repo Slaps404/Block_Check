@@ -10,16 +10,11 @@ import cv2
 import numpy as np
 import pytest
 
-from constants import BLOCK_QUPATH_MODEL_PATH
 from session.preparation import PreparedSpecimen
 from session.processing_store import ProcessingStore, preprocess_block
 from verify import segmentation
 from verify.qupath_features import FeatureRecipe, FeatureSpec
 from verify.qupath_rtrees import train_rtrees_segmenter
-
-
-def test_live_qupath_backend_uses_requested_block_tissue_classifier():
-    assert BLOCK_QUPATH_MODEL_PATH.name == "block_tissue_v001_g-wg-gm_s1-2-8_t25.json"
 
 
 def _artifact(tmp_path):

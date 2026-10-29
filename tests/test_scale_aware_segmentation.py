@@ -36,19 +36,35 @@ def test_scaled_min_area_uses_experiment_rounding(monkeypatch):
     captured = {}
     real_postprocess = seg._postprocess
 
-    def spy(mask, *, min_area, role, close_ksize=5, area_reference=None):
+    def spy(mask, *, min_area, role, close_ksize=5, area_reference=None, pixel_scale=1.0):
         captured["min_area"] = min_area
-        captured["close_ksize"] = close_ksize
+        captured["close_length"] = scale_odd_length(close_ksize, pixel_scale)
+        captured["pixel_scale"] = pixel_scale
         return real_postprocess(
-            mask, min_area=min_area, role=role,
-            close_ksize=close_ksize, area_reference=area_reference,
+            mask, min_area=min_area, role=role, close_ksize=close_ksize,
+            area_reference=area_reference, pixel_scale=pixel_scale,
         )
 
     monkeypatch.setattr(seg, "_postprocess", spy)
     img = _synthetic_slide(2028, 1520)
     seg.segment_tissue(img, "slide", pixel_scale=0.5)
     assert captured["min_area"] == scale_area_min(seg.MIN_SLIDE_COMPONENT_AREA, 0.5)
-    assert captured["close_ksize"] == scale_odd_length(seg.SLIDE_CLOSE_KERNEL, 0.5)
+    assert captured["close_length"] == scale_odd_length(seg.SLIDE_CLOSE_KERNEL, 0.5)
+    # the component filter must see the scale too (slide_017 dot regression)
+    assert captured["pixel_scale"] == 0.5
+
+
+def test_slide_absolute_component_floor_scales_with_resolution():
+    """A fragment above the scaled 450 px floor survives at half resolution.
+
+    Mirrors slide_017: at 2028 px width its real esophagus dot is ~405 px,
+    the full-resolution equivalent of ~1600 px.
+    """
+    mask = np.zeros((200, 200), dtype=np.uint8)
+    cv2.rectangle(mask, (10, 10), (69, 69), 255, -1)  # 3600 px largest
+    cv2.rectangle(mask, (80, 80), (99, 99), 255, -1)  # 400 px ~= 1600 px native
+    out = seg._component_filter(mask, min_area=1, role="slide", pixel_scale=0.5)
+    assert out[90, 90] == 255
 
 
 def test_prepare_scales_opposite_tag_cap(monkeypatch):

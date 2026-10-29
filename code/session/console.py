@@ -117,7 +117,7 @@ def render_results(status: dict) -> str:
 
 def render_motion_sample(sample: MotionSample, *, state: str, threshold: float) -> str:
     """Pure min/mean/max/crossings/state block plus a one-line diagnosis hint
-    for the `motion` console command (#169). No I/O -- caller prints the
+    for the `motion` console command. No I/O -- caller prints the
     result."""
     if sample.threshold_crossings <= 0:
         hint = "No motion above threshold during the sample window"
@@ -138,6 +138,20 @@ def render_motion_sample(sample: MotionSample, *, state: str, threshold: float) 
     return "\n".join(lines)
 
 
+def render_settings(rows: list[dict]) -> str:
+    """Aligned `name  current  (default, min..max)` table; `*` marks changes."""
+    width = max(len(row["name"]) for row in rows)
+    lines = []
+    for row in rows:
+        span = "" if row["min"] is None else f", {row['min']:g}..{row['max']:g}"
+        marker = "*" if row["changed"] else " "
+        lines.append(
+            f"{marker} {row['name'].ljust(width)}  {row['value']!s:>8}  "
+            f"(default {row['default']}{span})"
+        )
+    return "\n".join(lines)
+
+
 _COMMANDS: dict[str, Callable[[SessionWorkflow, tuple[str, ...]], object]] = {
     "scan_block": lambda workflow, args: workflow.scan_block(args[0]),
     # Handheld-scanner front door via PiCaptureRuntime.scan_qr (not
@@ -147,7 +161,14 @@ _COMMANDS: dict[str, Callable[[SessionWorkflow, tuple[str, ...]], object]] = {
     "scan_qr": lambda workflow, args: workflow.scan_qr(args[0]),
     "confirm_empty": lambda workflow, args: workflow.confirm_empty(),
     "retry_capture": lambda workflow, args: workflow.retry_capture(),
-    "accept_capture": lambda workflow, args: workflow.accept_capture(),
+    "accept_capture": lambda workflow, args: workflow.accept_capture(
+        " ".join(args) or None
+    ),
+    # Manual capture trigger via PiCaptureRuntime.capture_now (not
+    # SessionWorkflow); console dispatches against the runtime handle in
+    # run_pi_session.
+    "capture_now": lambda workflow, args: workflow.capture_now(),
+    "next_capture": lambda workflow, args: workflow.next_capture(),
     "skip_slide": lambda workflow, args: workflow.skip_unreadable_slide(),
     "finish_blocks": lambda workflow, args: workflow.finish_blocks(),
     "poll_status": lambda workflow, args: workflow.poll_status(),
@@ -158,24 +179,48 @@ _COMMANDS: dict[str, Callable[[SessionWorkflow, tuple[str, ...]], object]] = {
     "poll_finalization": lambda workflow, args: workflow.poll_finalization(),
     # Debug still via PiCaptureRuntime.snap (not SessionWorkflow); console
     # dispatches against the runtime handle in run_pi_session.
-    "snap": lambda workflow, args: workflow.snap(),
+    "snap": lambda workflow, args: workflow.snap(" ".join(args) or None),
+    "snap_3": lambda workflow, args: workflow.snap_3(" ".join(args) or None),
+    # Kiosk snap page: same still, saved without opening a laptop viewer.
+    "snap_quiet": lambda workflow, args: workflow.snap(
+        " ".join(args) or None, open_image=False
+    ),
+    "deskew": lambda workflow, args: workflow.deskew(),
+    "deskew_quiet": lambda workflow, args: workflow.deskew(
+        " ".join(args) or None, open_image=False
+    ),
+    "led_auto_on": lambda workflow, args: workflow.led_auto_on(),
+    "led_auto_off": lambda workflow, args: workflow.led_auto_off(),
+    "led_on": lambda workflow, args: workflow.led_on(
+        None if not args else args[0]
+    ),
+    "led_off": lambda workflow, args: workflow.led_off(),
+    "led_status": lambda workflow, args: workflow.led_status(),
+    "backlight_on": lambda workflow, args: workflow.backlight_on(),
+    "backlight_off": lambda workflow, args: workflow.backlight_off(),
+    "backlight_level": lambda workflow, args: workflow.set_backlight_level(args[0]),
+    "neutral_on": lambda workflow, args: workflow.neutral_on(),
+    "neutral_off": lambda workflow, args: workflow.neutral_off(),
+    "neutral_level": lambda workflow, args: workflow.set_neutral_level(args[0]),
     # Motion diagnostic via PiCaptureRuntime.sample_motion (not
     # SessionWorkflow); console dispatches against the runtime handle in
     # run_pi_session.
     "motion": lambda workflow, args: workflow.sample_motion(),
+    # Manual lens-focus aid via PiCaptureRuntime.focus (not SessionWorkflow).
+    "focus": lambda workflow, args: workflow.focus(*args),
     "start_work_order": lambda workflow, args: workflow.start_work_order(),
     "finish_work_order": lambda workflow, args: workflow.finish_work_order(),
     "results": lambda workflow, args: workflow.results_status(),
-    # #257: View Results while a slide-capture work order is open pauses
+    # View Results while a slide-capture work order is open pauses
     # automatic capture only (no store/job side effects).
     "pause_capture": lambda workflow, args: workflow.pause_capture(),
     "resume_capture": lambda workflow, args: workflow.resume_capture(),
-    # #256: operator-triggered retry of a Hybrid Processing Error, dispatched
+    # Operator-triggered retry of a Hybrid Processing Error, dispatched
     # from the attention banner's correction-flow screen with the errored
     # capture's id (client-supplied, mirrors scan_block/scan_qr's own single
     # client-supplied arg).
     "retry_hybrid_slide": lambda workflow, args: workflow.retry_hybrid_slide(args[0]),
-    # #256 follow-up: arm the runtime so the NEXT captured slide supersedes
+    # Arm the runtime so the NEXT captured slide supersedes
     # a Hybrid attention item, dispatched from the same correction-flow
     # screen's own new button, with the errored capture's id (client-
     # supplied, mirrors retry_hybrid_slide's own single client-supplied arg).
@@ -185,6 +230,10 @@ _COMMANDS: dict[str, Callable[[SessionWorkflow, tuple[str, ...]], object]] = {
     "disarm_hybrid_recapture": (
         lambda workflow, args: workflow.disarm_hybrid_recapture()
     ),
+    # Live capture settings via PiCaptureRuntime (not SessionWorkflow).
+    "settings": lambda workflow, args: workflow.settings_snapshot(),
+    "set": lambda workflow, args: workflow.set_setting(args[0], args[1]),
+    "reset_settings": lambda workflow, args: workflow.reset_settings(),
 }
 
 # One-line descriptions, keyed identically to `_COMMANDS` -- the single
@@ -199,6 +248,8 @@ COMMAND_HELP: dict[str, str] = {
         "reposition retake"
     ),
     "accept_capture": "Accept the held still and commit it to the session",
+    "capture_now": "Capture the placed specimen now, without waiting to settle",
+    "next_capture": "Override removal and make the next capture eligible",
     "skip_slide": "Skip the current unreadable slide (durably)",
     "finish_blocks": "Close block intake and begin draining to slides",
     "poll_status": "One presentation-loop poll; also drains reconnects",
@@ -207,8 +258,24 @@ COMMAND_HELP: dict[str, str] = {
     "events": "Show the session event log",
     "end_session": "Confirm and begin finalization",
     "poll_finalization": "Poll finalization progress to completion",
-    "snap": "Debug still -> laptop Desktop/pi_captures; delete Pi temp",
+    "snap": "One debug still with current lights (LED on if none are lit)",
+    "snap_3": "Multi-light debug stills (backlight + LED, + neutral if triple)",
+    "snap_quiet": "Like snap, but the laptop does not open the image",
+    "deskew": "Debug still + deskewed copy from saved grid calibration",
+    "deskew_quiet": "Like deskew, with a note; the laptop does not open the images",
+    "led_auto_on": "Enable automatic LED bracketing for block captures",
+    "led_auto_off": "Disable automatic LED bracketing and force LED off",
+    "led_on": "Manual LED on for N seconds (default: safety timeout)",
+    "led_off": "Manual LED off",
+    "led_status": "Show LED mode and logical/driver-reported output state",
+    "backlight_on": "Preview backlight on at its remembered level (default 50%)",
+    "backlight_off": "Preview backlight off, including after captures",
+    "backlight_level": "Set and remember the preview backlight level, 0-100 percent",
+    "neutral_on": "Manual neutral/oblique light on at its remembered level (default 100%, BCM 22)",
+    "neutral_off": "Manual neutral/oblique light off (BCM 22)",
+    "neutral_level": "Set and remember the neutral/oblique light level, 0-100 percent",
     "motion": "Sample motion for a few seconds and report min/mean/max",
+    "focus": "Live center sharpness under the LED for N seconds (default 30)",
     "start_work_order": "Open a work order: everything captured next belongs to it",
     "finish_work_order": "Close the open work order and score it in the background",
     "results": "Show scored work-order verdicts (PASS/REVIEW rows) for this session",
@@ -219,18 +286,41 @@ COMMAND_HELP: dict[str, str] = {
         "Arm the next captured slide to supersede a Hybrid attention item"
     ),
     "disarm_hybrid_recapture": "Cancel a pending Hybrid recapture arm",
+    "settings": "List capture settings: current, default, range (* = changed)",
+    "set": "Change and save one capture setting (camera: Scan Block only, recalibrates)",
+    "reset_settings": "Restore every capture setting to its default",
 }
 
 # Argument hints shown next to the command name for commands that take args.
+# Bracketed hints are optional (arity 0..1); bare hints are required (arity 1).
 _COMMAND_ARGS: dict[str, str] = {
     "scan_block": "<id>",
     "scan_qr": "<payload>",
     "retry_hybrid_slide": "<capture_id>",
     "arm_hybrid_recapture": "<capture_id>",
+    "led_on": "[seconds]",
+    "focus": "[seconds]",
+    "backlight_level": "<percent>",
+    "neutral_level": "<percent>",
+    "snap": "[note...]",
+    "accept_capture": "[note...]",
+    "snap_3": "[note...]",
+    "snap_quiet": "[note...]",
+    "deskew_quiet": "[note...]",
+    "set": "<name> <value>",
 }
 
-COMMAND_ARITY: dict[str, int] = {
-    name: (1 if name in _COMMAND_ARGS else 0) for name in _COMMANDS
+COMMAND_ARITY: dict[str, int | tuple[int, int]] = {
+    name: (
+        # "[note...]" takes the rest of the line as free text.
+        (0, 10_000)
+        if _COMMAND_ARGS.get(name, "").endswith("...]")
+        else (0, 1)
+        if _COMMAND_ARGS.get(name, "").startswith("[")
+        # One required argument per bare hint token.
+        else len(_COMMAND_ARGS.get(name, "").split())
+    )
+    for name in _COMMANDS
 }
 
 
@@ -253,8 +343,16 @@ def dispatch(workflow: SessionWorkflow, command: str, *args: str) -> object:
     except KeyError:
         raise ValueError(f"unknown command: {command}") from None
     expected = COMMAND_ARITY[command]
-    if len(args) != expected:
+    received = len(args)
+    if isinstance(expected, tuple):
+        low, high = expected
+        ok = low <= received <= high
+        expected_text = f"{low}..{high}"
+    else:
+        ok = received == expected
+        expected_text = str(expected)
+    if not ok:
         raise ValueError(
-            f"{command} expects {expected} argument(s); received {len(args)}"
+            f"{command} expects {expected_text} argument(s); received {received}"
         )
     return handler(workflow, args)

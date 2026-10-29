@@ -1,104 +1,55 @@
-"""TDD coverage for #252's follow-up: `ProcessingStore.list_hybrid_results`.
+"""`ProcessingStore.list_hybrid_results`.
 
 `list_results_ready_work_orders` can never surface a Hybrid row --
 `finish_work_order` deliberately skips `_score_work_order` (the only thing
 that ever sets `lifecycle_state='results_ready'`) for HYBRID/HYBRID_SHADOW,
-parking those work orders at `finalized` forever. This file drives a NEW,
+parking those work orders at `finalized` forever. This file drives a
 separate read (`list_hybrid_results`) that surfaces in-flight and resolved
 Hybrid rows across every work order in a Hybrid session, projecting the
 row's internal `job_state` into a durable-safe `verdict` the caller sees:
 `ERROR` / `PENDING` / the real `PASS`/`REVIEW`.
 
-Mirrors `tests/test_hybrid_slide_queue.py`'s store-only harness: synthetic
-captures, an injected slide preprocessor, and an injected
+Store-only harness: synthetic captures, an injected slide preprocessor, and an injected
 `score_cache_builder` -- no camera, no network, `Event`-based blocking
 stands in for "the job is genuinely still running" wherever a test needs
 that proof.
 """
 from __future__ import annotations
 
-import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
-import cv2
-import numpy as np
 import pytest
 
-from session.processing_store import ProcessingStore
 from session.session_mode import SessionMode
 from session.workflow import HttpCaptureClient, LoopbackCaptureReceiver, PiOutbox, SessionWorkflow
-from session.preparation import PreparedResult, PreparedSpecimen
-from slide.qr import DecodeCandidate, select_slide_identity
-from store.remote import RemoteProcessingStore
-from verify.invariant_descriptors import DescriptorValue
-from verify.scorer import LockedScoreCache, _ComponentFeatures
+from session.preparation import PreparedSpecimen
+from slide.qr import select_slide_identity
+from transport.remote import RemoteProcessingStore
+from verify.scorer import LockedScoreCache
+from store_harness import (  # noqa: F401
+    lightweight_qc_artifacts,
+    capture_block as _capture_block,
+    freeze_hybrid_session as _freeze_hybrid_session,
+    DESCRIPTOR_NAMES as _DESCRIPTOR_NAMES,
+    STARTED_AT,
+    capture_png as _capture_png,
+    drain as _drain,
+    score_cache_builder as _score_cache_builder,
+    valid_slide_result as _valid_slide_result,
+    write_slide_png as _write_slide_png,
+    _make_store,
+)
 
-
-STARTED_AT = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
-_DESCRIPTOR_NAMES = ("fake_descriptor_v1",)
 
 # Internal lifecycle strings that must NEVER leak past the projection.
 _INTERNAL_LIFECYCLE_STRINGS = {"queued", "preparing", "scoring", "superseded"}
 
 
 @pytest.fixture(autouse=True)
-def lightweight_qc_artifacts(monkeypatch):
-    """The real QC panel renderer assumes the mask matches the capture's
-    dimensions, which these tests' small synthetic masks deliberately do not
-    (mirrors tests/test_hybrid_slide_queue.py's fixture of the same name)."""
-    def write_qc(capture, mask, destination):
-        panel = np.full((8, 24, 3), (0, 128, 0), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    def write_failure_qc(capture, reason, destination):
-        panel = np.full((8, 8, 3), (0, 0, 180), dtype=np.uint8)
-        assert cv2.imwrite(str(destination), panel)
-
-    monkeypatch.setattr(ProcessingStore, "_write_qc", staticmethod(write_qc))
-    monkeypatch.setattr(
-        ProcessingStore, "_write_failure_qc", staticmethod(write_failure_qc)
-    )
-
-
-class _FixedMaskPreprocessor:
-    """Every block prepares to the SAME fully-filled mask regardless of
-    pixel content (mirrors tests/test_hybrid_slide_queue.py's fixture)."""
-
-    def __call__(self, capture_path: Path):
-        return np.full((8, 8), 255, dtype=np.uint8), {"role": "block", "roi_ok": True}
-
-
-class _FixedSlidePreprocessor:
-    """Every slide prepares to the SAME fully-filled specimen."""
-
-    def __call__(self, image: np.ndarray) -> PreparedResult:
-        return PreparedSpecimen(
-            role="slide", mask=np.full((8, 8), 255, dtype=np.uint8),
-            roi_ok=True, roi_reason="",
-        )
-
-
-class _IdenticalFingerprintBuilder:
-    """Every block gets the IDENTICAL fingerprint vector -- only distinct
-    block_ids separate them (mirrors #269/#251/#252 test fixtures)."""
-
-    def __call__(self, mask):
-        return {
-            "fake_descriptor_v1": DescriptorValue(
-                vector=np.array([1.0, 2.0, 3.0]), construction_ns=1
-            )
-        }
-
-
-def _score_cache_builder(specimen: PreparedSpecimen) -> LockedScoreCache:
-    return LockedScoreCache(
-        normalized_mask=specimen.mask,
-        component_features=_ComponentFeatures(
-            points=np.zeros((0, 2)), areas=np.zeros(0), shapes=np.zeros((0, 3)),
-        ),
-    )
+def _lightweight_qc(lightweight_qc_artifacts):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into the shared harness fixture."""
 
 
 class _StubWorkOrderScorer:
@@ -114,69 +65,6 @@ class _StubWorkOrderScorer:
             capture_id: dict(self.scores_by_slide.get(capture_id, {}))
             for capture_id in slide_results
         }
-
-
-def _make_store(tmp_path: Path, **kwargs) -> ProcessingStore:
-    kwargs.setdefault("preprocessor", _FixedMaskPreprocessor())
-    kwargs.setdefault("slide_preprocessor", _FixedSlidePreprocessor())
-    kwargs.setdefault("fingerprint_builder", _IdenticalFingerprintBuilder())
-    kwargs.setdefault("score_cache_builder", _score_cache_builder)
-    return ProcessingStore(tmp_path / "processing", **kwargs)
-
-
-def _capture_png(value: int) -> bytes:
-    image = np.full((32, 32, 3), value, dtype=np.uint8)
-    success, png = cv2.imencode(".png", image)
-    assert success
-    return png.tobytes()
-
-
-def _capture_block(
-    store: ProcessingStore, session_number: int, block_id: str, value: int = 0
-) -> None:
-    assert store.scan_block(session_number, block_id).accepted
-    body = _capture_png(value)
-    checksum = hashlib.sha256(body).hexdigest()
-    store.receive_capture(
-        session_number, capture_id=f"cap-{block_id}", block_id=block_id,
-        checksum=checksum, body=body,
-    )
-
-
-def _drain(store: ProcessingStore, session_number: int) -> None:
-    store.wait_for_jobs()
-    store.begin_block_drain(session_number)
-
-
-def _valid_slide_result(block_id: str):
-    return select_slide_identity((
-        DecodeCandidate("zxing", "QRCode", "raw", f"12080_{block_id}_01_HE"),
-    ))
-
-
-def _write_slide_png(path: Path, value: int = 200) -> Path:
-    image = np.full((24, 24, 3), value, dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
-    return path
-
-
-def _freeze_hybrid_session(
-    store: ProcessingStore, session_mode: str, block_ids: tuple[str, ...],
-) -> tuple[int, int]:
-    """Start a Hybrid session, capture/freeze ``block_ids`` into one pool.
-
-    Returns (session_number, work_order_id).
-    """
-    session = store.start_session(started_at=STARTED_AT, session_mode=session_mode)
-    work_order_id = store.start_work_order(session.number)
-    for index, block_id in enumerate(block_ids):
-        _capture_block(store, session.number, block_id, index + 1)
-    _drain(store, session.number)
-    freeze_result = store.freeze_hybrid_pool(
-        session.number, descriptor_names=_DESCRIPTOR_NAMES
-    )
-    assert freeze_result.frozen is True
-    return session.number, work_order_id
 
 
 def _row_for(rows: tuple[dict, ...], capture_id: str) -> dict:
@@ -205,41 +93,8 @@ def test_unresolved_hybrid_capture_is_not_a_results_row(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 1. A queued-but-unscored Hybrid slide projects PENDING.
-# ---------------------------------------------------------------------------
-
-
-def test_queued_hybrid_slide_projects_pending(tmp_path):
-    entered = Event()
-    release = Event()
-
-    def score_cache_builder(specimen: PreparedSpecimen) -> LockedScoreCache:
-        if specimen.role == "slide":
-            entered.set()
-            assert release.wait(timeout=5), "test did not release the scoring job"
-        return _score_cache_builder(specimen)
-
-    store = _make_store(tmp_path, score_cache_builder=score_cache_builder)
-    session_number, _ = _freeze_hybrid_session(
-        store, "hybrid", ("11111111", "22222222"),
-    )
-
-    capture_id = store.record_slide_capture(
-        session_number, _write_slide_png(tmp_path / "slide.png"),
-        captured_at=STARTED_AT, result=_valid_slide_result("11111111"),
-        duration_ms=5.0,
-    )
-    assert entered.wait(timeout=5), "background job never started"
-
-    rows = store.list_hybrid_results(session_number)
-    assert _row_for(rows, capture_id)["verdict"] == "PENDING"
-
-    release.set()
-    store.wait_for_jobs()
-
-
-# ---------------------------------------------------------------------------
-# 2. Resolves IN PLACE after wait_for_jobs(): same row identity, new verdict.
+# 1-2. A queued Hybrid slide projects PENDING, then resolves IN PLACE after
+#      wait_for_jobs(): same row identity, new verdict.
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +136,7 @@ def test_hybrid_slide_resolves_in_place_after_wait_for_jobs(tmp_path):
 
 
 def test_completed_hybrid_worker_writes_projected_jpeg_evidence(tmp_path):
-    """#252: projected evidence paths must exist after the real worker completes."""
+    """Projected evidence paths must exist after the real worker completes."""
     store = _make_store(tmp_path)
     session_number, _ = _freeze_hybrid_session(
         store, "hybrid", ("11111111", "22222222"),
@@ -356,7 +211,7 @@ def test_rows_from_multiple_work_orders_all_project_including_outstanding_job(tm
     genuinely outstanding (stuck mid-scoring, on the single-worker
     executor); work order 2 is opened afterward and is still `capturing`
     -- never `finalized`, never `results_ready` -- yet its own row
-    (resolved via #251's synchronous, executor-free Out-of-Pool Claim path,
+    (resolved via the synchronous, executor-free Out-of-Pool Claim path,
     so it cannot get stuck queued behind work order 1's blocked job) still
     projects. Proves both halves of the acceptance criterion at once: an
     earlier work order's outstanding job does not hide a later work order's
@@ -396,8 +251,7 @@ def test_rows_from_multiple_work_orders_all_project_including_outstanding_job(tm
     )
 
     # `start_work_order` resets the session phase back to `blocks` for a
-    # fresh bracket (mirrors `test_starting_the_next_work_order_returns_the
-    # _session_to_block_capture` in test_session_workflow.py) -- re-enter
+    # fresh bracket -- re-enter
     # `slides` directly, WITHOUT `wait_for_jobs()` (job 1 is still stuck,
     # and there are zero blocks pending for work order 2 anyway, so nothing
     # here needs to wait on the executor).
@@ -407,7 +261,7 @@ def test_rows_from_multiple_work_orders_all_project_including_outstanding_job(tm
     assert store.try_enter_slides(session_number)
 
     # Work order 2's pool is deliberately never frozen -- claiming ANY
-    # block_id is therefore an Out-of-Pool Claim (#251), decided
+    # block_id is therefore an Out-of-Pool Claim, decided
     # synchronously inside `record_slide_capture`'s own transaction with
     # NO job submitted to the (currently occupied) single-worker executor.
     # Submitting a real job here would queue it FIFO behind work order 1's

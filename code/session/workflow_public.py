@@ -1,13 +1,13 @@
-"""Canonical public import surface for ``session.workflow`` (#201 slice 1).
+"""Canonical public import surface for ``session.workflow``.
 
-``session.workflow`` remains the stable façade. Later extraction slices may
-move implementations into sibling modules, but every name listed here must stay
+``session.workflow`` remains the stable façade. Implementations may move
+into sibling modules, but every name listed here must stay
 importable via ``from session.workflow import <name>`` unless a deliberate,
 versioned breaking change is made.
 """
 from __future__ import annotations
 
-# Production + test imports (repo AST scan, 2026-07-25).
+# Names imported by production code and tests.
 _PUBLIC_NAMES: tuple[str, ...] = (
     "BlockReadiness",
     "ClaimOutcome",

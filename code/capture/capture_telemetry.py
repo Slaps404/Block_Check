@@ -96,13 +96,9 @@ class TelemetryWriter:
         self._stream.flush()
 
 
-# ---------------------------------------------------------------------------
-# Settling observer (#172): re-derives the settling wait / reset count / peak
-# motion from the same (now, state, FrameResult) triple StatusReporter.publish
-# already consumes, mirroring summarize_motion_samples's established pattern
-# of re-deriving threshold crossings outside the state machine rather than
-# reading CaptureSession's private _stable_since.
-# ---------------------------------------------------------------------------
+# Settling observer: re-derives settling wait / reset count / peak motion from
+# the (now, state, FrameResult) triples StatusReporter.publish consumes, rather
+# than reading CaptureSession's private _stable_since.
 
 
 @dataclass(frozen=True)
@@ -176,12 +172,8 @@ class SettlingObserver:
         self._consecutive_motion_frames = 0
 
 
-# ---------------------------------------------------------------------------
-# Motion curve writer (#172): buffers per-frame rows in memory, flushed on an
-# injectable clock's periodic interval plus explicit event-driven flush()
-# calls -- must NOT reproduce TelemetryWriter's per-record stream.flush(),
-# which is exactly the per-frame-I/O bug this issue avoids repeating.
-# ---------------------------------------------------------------------------
+# Motion curve writer: must NOT flush per record like TelemetryWriter does;
+# per-frame disk I/O is too costly at preview rate.
 
 MOTION_CURVE_COLUMNS = (
     "timestamp",

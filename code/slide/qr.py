@@ -28,10 +28,7 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Guarded imports — degrade gracefully if engine is missing
-# ---------------------------------------------------------------------------
-
+# Optional imports: degrade gracefully if an engine is missing.
 try:
     import zxingcpp as _zxingcpp
     _HAS_ZXING = True
@@ -48,10 +45,6 @@ except Exception as _exc:
     _HAS_LABEL_MASK = False
     log.info("slide_label_mask not available: %s", _exc)
 
-# ---------------------------------------------------------------------------
-# Module-level detector (cv2) — instantiated once
-# ---------------------------------------------------------------------------
-
 _det = cv2.QRCodeDetector()
 
 # Rotation angles for the fallback sweep
@@ -64,10 +57,6 @@ _UPSCALE_TARGET = 600
 # interrupted mid-call, so this deadline is checked between bounded routes.
 DECODE_BUDGET_SECONDS = 1.5
 
-
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DecodeCandidate:
@@ -197,10 +186,6 @@ class SlideQRResult:
         """
         return self.work_order
 
-
-# ---------------------------------------------------------------------------
-# Payload parsing
-# ---------------------------------------------------------------------------
 
 def parse_qr_payload(payload: str) -> dict:
     """Parse a slide QR payload into named fields. Never raises.
@@ -643,10 +628,6 @@ def decode_slide_identity(
     return _with_label_debug(bgr_image, select_slide_identity(candidates))
 
 
-# ---------------------------------------------------------------------------
-# Internal decode helpers
-# ---------------------------------------------------------------------------
-
 def _engines(
     gray: np.ndarray,
     *,
@@ -692,12 +673,10 @@ def _try_variants(
 
     Returns (engine_name, payload_str, preprocessing_label) on first hit.
     """
-    # raw
     hit = _engines(gray, use_zxing=use_zxing, use_cv2=use_cv2)
     if hit:
         return (hit[0], hit[1], "raw")
 
-    # Otsu binarization
     try:
         _, otsu = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -708,7 +687,6 @@ def _try_variants(
     except Exception:
         pass
 
-    # CLAHE normalization
     try:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
@@ -785,7 +763,6 @@ def _label_rect_crop(bgr: np.ndarray) -> Optional[np.ndarray]:
         rect = _find_label_rect(bgr)
         if not rect.found:
             return None
-        # Build a tight axis-aligned bounding box from the box_pts corners
         pts = rect.box_pts
         x0 = int(max(0, pts[:, 0].min()))
         y0 = int(max(0, pts[:, 1].min()))
@@ -820,7 +797,6 @@ def _try_crop_with_rotations(
     if hit:
         return hit
 
-    # Rotation fallback
     ch, cw = crop.shape[:2]
     cx = cw / 2.0
     cy = ch / 2.0
@@ -871,10 +847,6 @@ def _try_decode_pipeline(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def decode_slide_qr(bgr_image: np.ndarray) -> SlideQRResult:
     """Decode the slide-side identity QR code from a BGR image.
 
@@ -887,7 +859,6 @@ def decode_slide_qr(bgr_image: np.ndarray) -> SlideQRResult:
 
     Returns a frozen SlideQRResult. Never raises.
     """
-    # Input guard
     if not isinstance(bgr_image, np.ndarray) or bgr_image.size == 0:
         return SlideQRResult(
             success=False, reason="invalid image input",
@@ -931,9 +902,6 @@ def decode_slide_qr(bgr_image: np.ndarray) -> SlideQRResult:
                 email=None, genotype=None, engine=None, preprocessing=None,
             )
 
-    # ------------------------------------------------------------------
-    # No decode at all
-    # ------------------------------------------------------------------
     if engine_hit is None:
         return SlideQRResult(
             success=False, reason="no QR code decoded",
@@ -944,9 +912,6 @@ def decode_slide_qr(bgr_image: np.ndarray) -> SlideQRResult:
 
     engine_name, payload, preprocessing = engine_hit
 
-    # ------------------------------------------------------------------
-    # Parse payload
-    # ------------------------------------------------------------------
     parsed = parse_qr_payload(payload)
     if not parsed["success"]:
         return SlideQRResult(

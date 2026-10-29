@@ -1,10 +1,10 @@
-"""Event-driven screen->state router for the kiosk (#122 / 119b, ADR 0004).
+"""Event-driven screen->state router for the kiosk (ADR 0004).
 
 `select_screen(state)` maps one state snapshot to exactly one screen id. It is a
 pure function -- no I/O, no deck navigation -- so the active screen is a
 deterministic consequence of workflow signals plus the client's own UI flags.
 Rules are ordered; the FIRST match wins, and the ordering encodes the precedence
-decided for kiosk 119b (lifecycle before capture; guards gated on an idle
+decided for the kiosk (lifecycle before capture; guards gated on an idle
 capture state; id-matched verdict before the generic removal screen).
 
 State keys consumed (all optional; absent capture_* => degraded phase-only mode):
@@ -13,7 +13,7 @@ State keys consumed (all optional; absent capture_* => degraded phase-only mode)
   finish_blocks_guard, finish_slides_guard, captured (sets_processed),
   blocks_captured (any block captured this session, regardless of verdict),
   view_results_guard, results_ready_work_orders, recapture_guard, attention
-  (#256's non-interrupting Hybrid attention-banner projection, or None).
+  (the non-interrupting Hybrid attention-banner projection, or None).
 """
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ _WORK_ORDER_BRACKET_MODES = ("hybrid", "hybrid_shadow")
 
 def _has_work_order_bracket(state: Mapping) -> bool:
     """True when this session uses a real work-order bracket: Open Retrieval,
-    or Hybrid/Hybrid Shadow reusing Open Retrieval's screens (#269, ADR gives
-    Hybrid the same start_work_order/finish_work_order lifecycle). Reads the
+    or Hybrid/Hybrid Shadow reusing Open Retrieval's screens (Hybrid has the
+    same start_work_order/finish_work_order lifecycle). Reads the
     `mode` string relay.py publishes (KioskRelay._mode_value), never an
     inferred/artifact-based signal. `.get` throughout: this runs on every
     /state poll, so a state dict missing either key must degrade, not raise."""
@@ -80,7 +80,7 @@ def select_screen(state: Mapping) -> str:
         if cstate == "WAITING_FOR_REMOVAL":
             return "hybrid_slide_queued"
 
-    # --- Open Retrieval (#155): the work-order bracket gates the boot latch.
+    # --- Open Retrieval: the work-order bracket gates the boot latch.
     # The first work order uses the original startup-preview layout. After any
     # durable work-order row exists, a closed bracket uses between_orders.
     # Once one is open, the closed-set boot latch is treated as satisfied.
@@ -88,11 +88,9 @@ def select_screen(state: Mapping) -> str:
         if not state.get("work_order_open", False):
             if not state.get("has_work_orders", False):
                 return "first_work_order"
-            # ADR 0016 decision #2: between-orders must be able to reach the
-            # already-built results_table. The ordinary results gate sits below
-            # this early return, so re-check it here (same guard+data condition)
-            # before falling through to the chooser -- otherwise the N^2 results
-            # are unreachable once every bracket is closed.
+            # ADR 0016 decision #2: the ordinary results gate sits below this
+            # early return, so re-check it here or the results table becomes
+            # unreachable once every bracket is closed.
             if (state.get("view_results_guard")
                     and state.get("results_ready_work_orders")):
                 return "results_table"
@@ -106,11 +104,9 @@ def select_screen(state: Mapping) -> str:
             return "01"  # Startup Preview
         if phase == "finalized":
             return "01"  # nothing to resume -> start fresh
-        # Empty attached session (launcher just created N, no sets yet): treat
-        # as Start, not Resume. captured == sets_processed (verdicted-only) --
-        # #188: that alone misreads "blocks captured, none scored yet" as no
-        # session, so also check blocks_captured (any block ever captured,
-        # regardless of verdict status).
+        # Empty attached session (launcher just created N): Start, not Resume.
+        # `captured` counts verdicted sets only, so it alone misreads
+        # "blocks captured, none scored yet" as no session.
         try:
             captured = int(state.get("captured") or 0)
         except (TypeError, ValueError):
@@ -129,24 +125,17 @@ def select_screen(state: Mapping) -> str:
     if phase in _TRANSITIONAL_PHASES:
         return PROCESSING  # generic progress screen (screen 11 was excluded)
 
-    # --- results table (#150/#252): client-owned guard gated on results data
-    # Mirrors finish_blocks_guard/finish_slides_guard's guard+data-condition
-    # pattern, but the guard flag alone is a no-op -- there must be at least
-    # one work order with rows for the table to be shown. NORMAL remains
-    # `results_ready`-gated. Retrieval modes source this key from every live
-    # Retrieval Slide Job, scored or not, so the same key admits the table
-    # when a work order has any row. No
-    # separate gate needed here, only `SessionWorkflow.results_status`'s
-    # per-mode row source (see its docstring).
+    # --- results table: guard+data, like the finish_* guards.
+    # The guard flag alone is a no-op; a work order must have rows. The
+    # per-mode row source lives in `SessionWorkflow.results_status`, so no
+    # mode branch is needed here.
     if state.get("view_results_guard") and state.get("results_ready_work_orders"):
         return "results_table"
 
-    # --- #256 attention correction flow: guard+data pattern, mirrors
-    # results_table/finish_blocks_guard immediately above/below. Reached
-    # only by an explicit operator tap (setting recapture_guard) on the
-    # banner's own nav button -- the passive banner itself is a
-    # client-rendered overlay layer, never a router-driven screen swap, so
-    # it never automatically takes over whatever screen is active.
+    # --- attention correction flow: guard+data, like the gates around
+    # it. Reached only by an operator tap on the banner's nav button; the
+    # banner itself is a client-rendered overlay, never a screen swap, so it
+    # never takes over the active screen on its own.
     if state.get("recapture_guard") and state.get("attention"):
         return "hybrid_attention"
 
@@ -160,6 +149,8 @@ def select_screen(state: Mapping) -> str:
     if cstate == "CAPTURE_ERROR":
         return "19"  # Capture Error (RETRY)
     if cstate == "CALIBRATION_FAILED":
+        if state.get("led_only_blocks") and cmode == "block":
+            return "led_calibration_failed"
         return "04"  # Clear Backlight for Calibration (RETRY)
     if cstate == "REPOSITION_SLIDE":
         return "17"  # Unreadable Code
@@ -170,6 +161,10 @@ def select_screen(state: Mapping) -> str:
     # already engaged (slide-phase rebuild). CALIBRATION_FAILED → screen 04.
     if cstate in ("AWAITING_BASELINE_CONFIRMATION", "BUILDING_BASELINE"):
         return "05"  # Calibrating…
+    if cstate == "PLACE_CALIBRATION_BLOCK":
+        return "led_calibration_place"
+    if cstate == "REMOVE_CALIBRATION_BLOCK":
+        return "led_calibration_remove"
 
     # --- capture review gate (before removal / verdict screens) ------------
     if cstate == "AWAITING_ACCEPT":

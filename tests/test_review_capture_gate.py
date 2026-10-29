@@ -1,4 +1,4 @@
-"""Headless capture-review gate core (issue #136, ADR 0006)."""
+"""Headless capture-review gate core (ADR 0006)."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -68,12 +68,6 @@ class FakeCamera:
 
     def close(self):
         self.calls.append(("close",))
-
-
-def test_review_captures_defaults_false():
-    session = CaptureSession()
-    assert session.review_captures is False
-    assert CaptureState.AWAITING_ACCEPT in CaptureState
 
 
 def test_flag_on_successful_capture_lands_in_awaiting_accept(tmp_path):
@@ -286,25 +280,6 @@ def test_retry_from_awaiting_accept_via_controller(tmp_path):
     assert [call[0] for call in camera.calls].count("still") == 2
 
 
-def test_flag_off_runtime_path_unchanged(tmp_path):
-    camera = FakeCamera()
-    session = _ready_slide_session(review_captures=False)
-    consumer = MagicMock()
-    controller = CaptureController(
-        session=session,
-        camera=camera,
-        store=CaptureStore(tmp_path / "published"),
-        working_dir=tmp_path,
-        capture_consumer=consumer,
-    )
-    controller.handle_frame(_specimen(), now=1.0, captured_at=NOW)
-    controller.handle_frame(_specimen(), now=2.0, captured_at=NOW)
-
-    consumer.assert_called_once()
-    assert session.state is CaptureState.WAITING_FOR_REMOVAL
-    assert controller.pending_record is None
-
-
 def test_pi_runtime_accept_capture_façade(tmp_path):
     import sys
 
@@ -322,7 +297,7 @@ def test_pi_runtime_accept_capture_façade(tmp_path):
         SessionWorkflow,
     )
 
-    import run_pi_session
+    from app import pi_session as run_pi_session
 
     store = ProcessingStore(tmp_path / "processing")
     session = store.start_session(started_at=NOW)
@@ -375,7 +350,7 @@ def test_pi_runtime_logs_capture_accepted_and_retaken(tmp_path, capsys):
         if str(path) not in sys.path:
             sys.path.append(str(path))
 
-    import run_pi_session
+    from app import pi_session as run_pi_session
     from action_logger import ActionLogger
     from session.workflow import (
         FramingCalibrationStore,

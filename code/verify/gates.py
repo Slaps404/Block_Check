@@ -10,11 +10,11 @@ run_quality_gates(block_result, slide_result)   ← pipeline entry
     Prep failures, mask coverage, block ROI.
 check_block_quality(block_result)
     Block-only subset of the above, for judging a block before any slide
-    exists to pair it with (#250 Hybrid Candidate Pool usability).
+    exists to pair it with (Hybrid Candidate Pool usability).
 _check_mask_quality
     Per-side mask sanity.
 _is_sliver_like
-    Archived (ADR 0011, issue #158): thin/low-coverage shape detector, no
+    Archived (ADR 0011): thin/low-coverage shape detector, no
     longer wired into run_quality_gates. Kept for reversibility; sliverness
     was a proxy for indiscriminability, which open retrieval detects
     directly. Do not re-wire without revisiting that ADR.
@@ -48,13 +48,12 @@ class GateResult:
 
 
 def check_block_quality(block_result: PreparedResult) -> GateResult:
-    """Judge a block's own usability, independent of any slide (#250).
+    """Judge a block's own usability, independent of any slide.
 
     Finish Blocks must decide whether a Hybrid block is usable before any
     slide exists to pair it with, so the block-side checks `run_quality_gates`
-    normally runs alongside a slide are also exposed standalone here. This is
-    additive: `run_quality_gates`'s own inline block checks (and its existing,
-    tested block-vs-slide failure-ordering) are untouched by this function.
+    runs alongside a slide are exposed standalone here. `run_quality_gates`
+    keeps its own inline block checks and block-vs-slide failure ordering.
     """
     if isinstance(block_result, PreparationFailure):
         return GateResult(

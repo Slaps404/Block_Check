@@ -7,17 +7,28 @@ import numpy as np
 
 from session.workflow import ProcessingStore
 from session.preparation import PreparationFailure
-from tests.test_session_workflow import (  # noqa: F401 -- fixture import
-    STARTED_AT,
+import pytest
+
+from store_harness import (  # noqa: F401
+    WORKFLOW_STARTED_AT as STARTED_AT,
     FastPreprocessor,
     StubWorkOrderScorer,
-    _capture,
     _drain_to_slides,
     _evaluable_block,
     _identical_mask_slide_preprocessor,
-    _valid_slide_result,
-    lightweight_qc_artifacts,
 )
+from store_harness import (  # noqa: F401
+    full_res_capture as _capture,
+    lightweight_qc_artifacts,
+    valid_slide_result as _valid_slide_result,
+    lightweight_slide_qc,
+)
+
+
+@pytest.fixture(autouse=True)
+def _lightweight_qc(lightweight_qc_artifacts, lightweight_slide_qc):  # noqa: F811
+    """Autouse shims do not cross module boundaries, so opt this
+    module into both shared harness QC fixtures."""
 
 
 def _assert_slide_artifacts(session_dir: Path, capture_id: str) -> None:
